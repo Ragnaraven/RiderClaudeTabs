@@ -1,0 +1,19 @@
+<idea-plugin>
+    <id>com.claudetabs.rider-claude-tabs</id>
+    <name>Claude Terminal Tab Namer</name>
+    <version>1.0.0</version>
+    <vendor>claudetabs</vendor>
+
+    <description><![CDATA[
+    Auto-renames Rider/IntelliJ terminal tabs to match the active Claude Code chat name.
+    Detects Claude Code processes in terminal tabs, reads the conversation topic from
+    session files, and updates tab titles. Supports multiple concurrent Claude sessions.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.terminal</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <postStartupActivity implementation="com.claudetabs.ClaudeTabWatcherStartup"/>
+    </extensions>
+</idea-plugin>
