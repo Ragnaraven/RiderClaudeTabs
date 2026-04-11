@@ -38,7 +38,11 @@ At the **start of every conversation**, rename your Rider terminal tab by runnin
 bash ~/.claude/rider-plugin/rename-tab.sh "Short Topic Name"
 \```
 Pick a concise name (3-5 words) that describes the conversation's purpose.
-Update it if the topic shifts significantly.
+Update it if the topic shifts significantly. The Rider plugin auto-detects Claude sessions,
+applies the name, and restores sessions on Rider restart.
+
+This applies to **new chats, resumed chats** (`--resume`), **and `/resume`**.
+On resume, re-use the previous tab name if the topic hasn't changed.
 ```
 
 ## Installation
