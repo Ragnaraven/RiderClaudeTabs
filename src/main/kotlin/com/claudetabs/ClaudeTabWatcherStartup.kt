@@ -1,12 +1,13 @@
 package com.claudetabs
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.StartupActivity
 import com.intellij.openapi.util.Disposer
-import com.intellij.openapi.util.Key
+import com.intellij.terminal.ui.TerminalWidget
 import com.intellij.ui.content.Content
 import com.jediterm.terminal.ProcessTtyConnector
 import kotlinx.coroutines.*
@@ -14,7 +15,6 @@ import org.jetbrains.plugins.terminal.TerminalToolWindowManager
 import java.io.BufferedReader
 import java.io.File
 import java.io.FileReader
-import java.lang.reflect.Method
 import java.nio.file.*
 
 class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
@@ -26,14 +26,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private val SESSIONS_DIR = File(CLAUDE_HOME, "sessions")
         private val TABS_DIR = File(CLAUDE_HOME, "rider-plugin/tabs")
         private val STATE_DIR = File(CLAUDE_HOME, "rider-plugin")
-        private val SHELL_PID_KEY = Key.create<Long>("claudetabs.shellPid")
-        private val REWORKED_TAB_ID_KEY = Key.create<Int>("claudetabs.reworkedTabId")
-        private val LAST_NAME_KEY = Key.create<String>("claudetabs.lastName")
     }
 
-    private var tabsManager: Any? = null
-    private var renameMethod: Method? = null
     private var pollCount = 0
+    private val renamedSessions = mutableSetOf<String>()
+    private val pendingRestores = mutableListOf<SavedSession>()
 
     override fun runActivity(project: Project) {
         LOG.info("[ClaudeTabs] Started for: ${project.name}")
@@ -41,314 +38,463 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         deployClaudeIntegration()
 
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-
-        // Cancel scope when project closes
         Disposer.register(project as Disposable, Disposable {
             LOG.info("[ClaudeTabs] Project closing")
-            // Save state from the last known good snapshot (saved by poll loop)
             scope.cancel()
         })
 
-        // File watcher — reacts instantly when rename files appear
-        // Runs independently so a crash here doesn't kill the poll loop
+        // File watcher for instant renames
         scope.launch {
             delay(2_000)
-            try {
-                watchTabsDirectory(project)
-            } catch (e: Exception) {
-                LOG.warn("[ClaudeTabs] Watcher crashed (polling will handle renames): ${e.message}")
-            }
+            try { watchTabsDirectory(project) } catch (_: Exception) {}
         }
 
-        // Main loop — restore, poll for state save, renames
+        // Main poll loop
         scope.launch {
-            delay(2_000)
-            withContext(Dispatchers.Main) { restoreSessions(project) }
+            delay(3_000)
 
+            // Load restore file
+            withContext(Dispatchers.Main) { loadRestoreFile(project) }
+
+            val startupTime = System.currentTimeMillis()
             while (isActive) {
                 try {
                     withContext(Dispatchers.Main) {
                         processPendingRestores(project)
                         poll(project)
                     }
-                } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
-                    LOG.info("[ClaudeTabs] Project disposed, stopping poll")
-                    break
-                } catch (e: Exception) {
-                    if (e.message?.contains("disposed") == true) {
-                        LOG.info("[ClaudeTabs] Project disposed, stopping poll")
-                        break
-                    }
+                } catch (_: ProcessCanceledException) { break }
+                catch (e: Exception) {
+                    if (e.message?.contains("disposed") == true) break
                     if (pollCount % 12 == 0) LOG.warn("[ClaudeTabs] Poll: ${e.message}")
                 }
-                delay(if (pendingRestores.isNotEmpty()) 2_000L else POLL_INTERVAL_MS)
+                val inBurst = System.currentTimeMillis() - startupTime < 60_000
+                delay(if (inBurst || pendingRestores.isNotEmpty()) 2_000L else POLL_INTERVAL_MS)
                 pollCount++
             }
         }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // FILE WATCHER — instant rename on file creation
+    // TERMINAL TAB ACCESS — stable API, all panels
     // ══════════════════════════════════════════════════════════════
 
-    private suspend fun watchTabsDirectory(project: Project) {
+    data class TabInfo(
+        val content: Content?,              // null for reworked API tabs (split panels)
+        val widget: TerminalWidget?,        // null when using reworked API
+        val pid: Long,
+        val reworkedSession: Any? = null,   // reworked session for PID/command access
+        val reworkedTabId: Int? = null,      // for renameTerminalTab()
+        val tabName: String = ""            // current tab name
+    )
+
+    private fun getAllTabs(project: Project): List<TabInfo> {
+        val result = mutableListOf<TabInfo>()
+
+        // Step 1: Get frontend views (name → TerminalView + Content) for visual rename
+        val frontendViews = mutableMapOf<String, Pair<Any, Content?>>() // name → (view, content)
         try {
-            val dir = TABS_DIR.toPath()
-            val watcher = FileSystems.getDefault().newWatchService()
-            dir.register(watcher, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_MODIFY)
-            LOG.info("[ClaudeTabs] File watcher active on ${TABS_DIR.absolutePath}")
+            val feMgrCls = Class.forName("com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager")
+            val feMgr = feMgrCls.getMethod("getInstance", Project::class.java).invoke(null, project)
+            val feTabs = feMgr?.javaClass?.getMethod("getTabs")?.invoke(feMgr) as? List<*>
+            LOG.info("[ClaudeTabs] STEP 1: Frontend has ${feTabs?.size ?: 0} tabs")
 
-            while (currentCoroutineContext().isActive) {
-                // poll with timeout so we can check cancellation
-                val key = watcher.poll(2, java.util.concurrent.TimeUnit.SECONDS) ?: continue
-                for (event in key.pollEvents()) {
-                    val filename = (event.context() as? Path)?.toString() ?: continue
-                    if (!filename.endsWith(".json")) continue
-                    val sessionId = filename.removeSuffix(".json")
-
-                    // Small delay for file to finish writing
-                    delay(100)
-
-                    try {
-                        val renameFile = File(TABS_DIR, filename)
-                        if (!renameFile.exists()) continue
-                        val name = extractJsonString(renameFile.readText(), "name") ?: continue
-
-                        LOG.info("[ClaudeTabs] Watcher: rename request '$name' for session $sessionId")
-
-                        // Reverse lookup: sessionId → Claude PID → shell PID → tab
-                        withContext(Dispatchers.Main) {
-                            handleInstantRename(project, sessionId, name)
-                        }
-                    } catch (e: Exception) {
-                        LOG.warn("[ClaudeTabs] Watcher error: ${e.message}")
-                    }
-                }
-                key.reset()
+            feTabs?.forEach { feTab ->
+                feTab ?: return@forEach
+                try {
+                    val content = feTab.javaClass.getMethod("getContent").invoke(feTab) as? Content
+                    val view = feTab.javaClass.getMethod("getView").invoke(feTab) ?: return@forEach
+                    val name = content?.displayName ?: try {
+                        val title = view.javaClass.getMethod("getTitle").invoke(view)
+                        title?.javaClass?.getMethod("buildTitle")?.invoke(title) as? String ?: "Local"
+                    } catch (_: Exception) { "Local" }
+                    frontendViews[name] = Pair(view, content)
+                } catch (_: Exception) {}
             }
-        } catch (e: Exception) {
-            LOG.warn("[ClaudeTabs] Watcher failed, falling back to polling: ${e.message}")
-        }
+            LOG.info("[ClaudeTabs] STEP 2: Frontend views: ${frontendViews.keys}")
+        } catch (_: ClassNotFoundException) {}
+        catch (_: Exception) {}
+
+        // Step 2: Get backend tabs (name → PID + session) for process detection
+        try {
+            val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
+            val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
+            val tabs = tm?.let { invokeSuspend(it, tmCls.methods.find { m -> m.name == "getTerminalTabs" }!!) as? List<*> }
+            LOG.info("[ClaudeTabs] STEP 3: Backend has ${tabs?.size ?: 0} tabs")
+
+            val smCls = Class.forName("com.intellij.terminal.backend.TerminalSessionsManager")
+            val sm = smCls.getMethod("getInstance").invoke(null)
+            val getSess = sm?.let { smCls.methods.find { m -> m.name == "getSession" && m.parameterCount == 1 } }
+
+            val backendNames = mutableListOf<String>()
+            val backendWithPids = mutableListOf<String>()
+            val backendNoSession = mutableListOf<String>()
+
+            tabs?.forEach { tab ->
+                tab ?: return@forEach
+                try {
+                    val name = tab.javaClass.getMethod("getName").invoke(tab) as? String ?: return@forEach
+                    val tabId = tab.javaClass.getMethod("getId").invoke(tab) as? Int ?: return@forEach
+                    backendNames.add(name)
+
+                    val sessIdObj = tab.javaClass.getMethod("getSessionId").invoke(tab)
+                    if (sessIdObj == null) { backendNoSession.add(name); return@forEach }
+                    val session = getSess?.invoke(sm, sessIdObj)
+                    if (session == null) { backendNoSession.add("$name(no-sess)"); return@forEach }
+                    val pid = extractPidFromSession(session)
+                    if (pid == null) { backendNoSession.add("$name(no-pid)"); return@forEach }
+
+                    backendWithPids.add("$name→PID$pid")
+
+                    // Merge: find matching frontend view by name
+                    val fe = frontendViews[name]
+                    val view = fe?.first
+                    val content = fe?.second
+                    val hasFrontend = fe != null
+
+                    result.add(TabInfo(
+                        content = content,
+                        widget = null,
+                        pid = pid,
+                        reworkedSession = view ?: session,
+                        reworkedTabId = tabId,
+                        tabName = name
+                    ))
+
+                    if (!hasFrontend) {
+                        LOG.info("[ClaudeTabs] Backend tab '$name' has NO frontend view match!")
+                    }
+                } catch (_: Exception) {}
+            }
+            LOG.info("[ClaudeTabs] STEP 3a: Backend all names: $backendNames")
+            LOG.info("[ClaudeTabs] STEP 3b: Backend with PIDs: $backendWithPids")
+            if (backendNoSession.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 3c: Backend no session/pid: $backendNoSession")
+        } catch (_: ClassNotFoundException) {}
+        catch (_: Exception) {}
+
+        LOG.info("[ClaudeTabs] STEP 4: Total: ${result.size} → ${result.map { "'${it.tabName}'→PID${it.pid}" }}")
+        return result
     }
 
     /**
-     * Instant rename via reverse PID lookup.
-     * sessionId → find Claude PID from ~/.claude/sessions/ → walk UP to shell → match tab.
+     * Recursively walk a Swing component tree to find TerminalWidget instances
+     * that aren't already in our result list. This catches split panel terminals.
      */
-    private fun handleInstantRename(project: Project, sessionId: String, name: String) {
-        // Step 1: Find Claude PID that has this sessionId
-        val claudePid = findClaudePidForSession(sessionId) ?: run {
-            LOG.info("[ClaudeTabs] No alive Claude process found for session $sessionId")
-            return
-        }
+    private fun findTerminalWidgetsInTree(
+        component: java.awt.Component?,
+        contents: Array<Content>,
+        result: MutableList<TabInfo>,
+        foundPids: MutableSet<Long>
+    ) {
+        if (component == null) return
 
-        // Step 2: Walk UP from Claude PID to find the shell ancestor
-        val shellPid = findShellAncestor(claudePid) ?: run {
-            LOG.info("[ClaudeTabs] Could not find shell ancestor for Claude PID $claudePid")
-            return
-        }
-
-        // Step 3: Find the Content tab with this shell PID
-        val manager = TerminalToolWindowManager.getInstance(project)
-        val toolWindow = manager.toolWindow ?: return
-        val contents = toolWindow.contentManager.contents
-
-        // Check cached PIDs first
-        var matchedContent: Content? = null
-        for (content in contents) {
-            if (content.getUserData(SHELL_PID_KEY) == shellPid) {
-                matchedContent = content
-                break
-            }
-        }
-
-        // If no cached match, discover PIDs and try again
-        if (matchedContent == null) {
-            val reworkedData = getReworkedTabData(project)
-            for (content in contents) {
-                val contentName = content.displayName ?: continue
-                val data = reworkedData[contentName]
-                if (data != null) {
-                    content.putUserData(SHELL_PID_KEY, data.first)
-                    content.putUserData(REWORKED_TAB_ID_KEY, data.second)
-                    if (data.first == shellPid) {
-                        matchedContent = content
-                    }
-                }
-            }
-        }
-
-        if (matchedContent == null) {
-            LOG.info("[ClaudeTabs] No tab found for shell PID $shellPid (may not be initialized yet)")
-            return
-        }
-
-        // Step 4: Rename
-        val tabId = matchedContent.getUserData(REWORKED_TAB_ID_KEY)
-        renameTab(project, TabMapping(matchedContent, shellPid, tabId), name)
-        matchedContent.putUserData(LAST_NAME_KEY, name)
-    }
-
-    /**
-     * Scan ~/.claude/sessions/ for an alive process with the given sessionId.
-     */
-    private fun findClaudePidForSession(sessionId: String): Long? {
-        val files = SESSIONS_DIR.listFiles() ?: return null
-        for (f in files) {
-            if (!f.name.endsWith(".json")) continue
+        // Check if this component IS a TerminalWidget
+        if (component is TerminalWidget) {
             try {
-                val text = f.readText()
-                val sid = extractJsonString(text, "sessionId") ?: continue
-                if (sid != sessionId) continue
-                val pid = f.nameWithoutExtension.toLongOrNull() ?: continue
-                // Verify alive
-                if (ProcessHandle.of(pid).map { it.isAlive }.orElse(false)) {
-                    return pid
+                val tty = component.ttyConnectorAccessor.ttyConnector
+                if (tty is ProcessTtyConnector) {
+                    val pid = tty.process.pid()
+                    if (pid !in foundPids) {
+                        // Find or create a Content association
+                        val content = contents.firstOrNull { result.none { r -> r.content == it } }
+                        if (content != null) {
+                            result.add(TabInfo(content, component, pid))
+                            foundPids.add(pid)
+                            if (pollCount % 6 == 0) LOG.info("[ClaudeTabs] Tree-found widget PID=$pid")
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Check if component has TerminalWidget as a data key (TERMINAL_WIDGET_DATA_KEY)
+        try {
+            val dataKey = Class.forName("org.jetbrains.plugins.terminal.ui.TerminalContainer")
+                .getField("TERMINAL_WIDGET_DATA_KEY").get(null)
+            if (component is com.intellij.openapi.actionSystem.DataProvider) {
+                val widget = component.getData(dataKey.toString())
+                if (widget is TerminalWidget) {
+                    val tty = widget.ttyConnectorAccessor.ttyConnector
+                    if (tty is ProcessTtyConnector) {
+                        val pid = tty.process.pid()
+                        if (pid !in foundPids) {
+                            val content = contents.firstOrNull { result.none { r -> r.content == it } }
+                            if (content != null) {
+                                result.add(TabInfo(content, widget, pid))
+                                foundPids.add(pid)
+                                if (pollCount % 6 == 0) LOG.info("[ClaudeTabs] DataKey-found widget PID=$pid")
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Recurse into children
+        if (component is java.awt.Container) {
+            for (child in component.components) {
+                findTerminalWidgetsInTree(child, contents, result, foundPids)
+            }
+        }
+    }
+
+    // Reworked API helpers
+    private fun extractPidFromSession(session: Any): Long? {
+        val targets = mutableListOf(session)
+        try { val f = session.javaClass.getDeclaredField("delegate"); f.isAccessible = true; f.get(session)?.let { targets.add(0, it) } } catch (_: Exception) {}
+        for (t in targets) {
+            try {
+                for (field in t.javaClass.declaredFields) {
+                    if (!field.name.contains("ttyConnector", true)) continue
+                    field.isAccessible = true
+                    val c = field.get(t) ?: continue
+                    if (c is ProcessTtyConnector) return c.process.pid()
+                    try { (c.javaClass.getMethod("getProcess").invoke(c) as? Process)?.let { return it.pid() } } catch (_: Exception) {}
+                    for (cf in c.javaClass.declaredFields) { cf.isAccessible = true; val v = cf.get(c); if (v is ProcessTtyConnector) return v.process.pid(); if (v is Process) return v.pid() }
                 }
             } catch (_: Exception) {}
         }
         return null
     }
 
-    /**
-     * Walk UP the process tree from a Claude PID to find the shell ancestor.
-     * Claude's process tree: shell (bash/pwsh) → node → claude
-     * We want the shell PID (same as what the terminal tab owns).
-     */
-    private fun findShellAncestor(claudePid: Long): Long? {
-        var current = ProcessHandle.of(claudePid).orElse(null) ?: return null
-        // Walk up, keeping track of the last PID before we lose the parent
-        // The shell is typically 1-3 levels up from claude
-        var depth = 0
-        while (depth < 5) {
-            val parent = current.parent().orElse(null) ?: break
-            current = parent
-            depth++
-            // Check if this looks like a terminal shell
-            val cmd = current.info().command().orElse("")
-            if (cmd.contains("bash", true) || cmd.contains("pwsh", true) ||
-                cmd.contains("powershell", true) || cmd.contains("cmd.exe", true) ||
-                cmd.contains("zsh", true) || cmd.contains("fish", true) ||
-                cmd.contains("sh", true)
-            ) {
-                return current.pid()
-            }
-        }
-        // Fallback: return the grandparent (usually the shell)
-        val handle = ProcessHandle.of(claudePid).orElse(null) ?: return null
-        return handle.parent().flatMap { it.parent() }.map { it.pid() }.orElse(null)
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // POLL — detect Claude, apply renames (fallback), save state
-    // ══════════════════════════════════════════════════════════════
-
-    data class TabMapping(val content: Content, val shellPid: Long, val reworkedTabId: Int?)
-
-    private fun poll(project: Project) {
-        val mappings = buildTabMappings(project)
-        val activeSessions = mutableListOf<SavedSession>()
-
-        for (m in mappings) {
-            val claudeProcess = findClaudeChild(m.shellPid) ?: continue
-            val claudePid = claudeProcess.pid()
-
-            val sessionFile = File(SESSIONS_DIR, "$claudePid.json")
-            if (!sessionFile.exists()) continue
-            val sessionText = try { sessionFile.readText() } catch (_: Exception) { continue }
-            val sessionId = extractJsonString(sessionText, "sessionId") ?: continue
-            val cwd = extractJsonString(sessionText, "cwd") ?: continue
-
-            // Fallback rename check (watcher handles the fast path)
-            val renameFile = File(TABS_DIR, "$sessionId.json")
-            if (renameFile.exists()) {
-                val name = try { extractJsonString(renameFile.readText(), "name") } catch (_: Exception) { null }
-                if (name != null && name != m.content.getUserData(LAST_NAME_KEY)) {
-                    renameTab(project, m, name)
-                    m.content.putUserData(LAST_NAME_KEY, name)
-                }
-            }
-
-            val bypass = readPermissionMode(cwd, sessionId)
-            activeSessions.add(SavedSession(sessionId, cwd, m.content.displayName ?: "Claude", bypass))
-        }
-
-        saveState(project, activeSessions)
-    }
-
-    private fun renameTab(project: Project, m: TabMapping, name: String) {
-        val oldName = m.content.displayName
-        if (m.reworkedTabId != null) {
+    private fun extractConnectorFromSession(session: Any): com.jediterm.terminal.TtyConnector? {
+        val targets = mutableListOf(session)
+        try { val f = session.javaClass.getDeclaredField("delegate"); f.isAccessible = true; f.get(session)?.let { targets.add(0, it) } } catch (_: Exception) {}
+        for (t in targets) {
             try {
-                val rm = getRenameMethod(project)
-                if (rm != null && tabsManager != null) {
-                    invokeSuspend3(tabsManager!!, rm, m.reworkedTabId, name, true)
+                for (field in t.javaClass.declaredFields) {
+                    if (!field.name.contains("ttyConnector", true)) continue
+                    field.isAccessible = true
+                    val c = field.get(t)
+                    if (c is com.jediterm.terminal.TtyConnector) return c
                 }
             } catch (_: Exception) {}
         }
-        m.content.displayName = name
-        LOG.info("[ClaudeTabs] Renamed '$oldName' → '$name'")
+        return null
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // TAB MAPPING
-    // ══════════════════════════════════════════════════════════════
+    private fun invokeSuspend(target: Any, method: java.lang.reflect.Method): Any? = kotlinx.coroutines.runBlocking {
+        val d = CompletableDeferred<Any?>()
+        val cont = object : kotlin.coroutines.Continuation<Any?> {
+            override val context = kotlin.coroutines.EmptyCoroutineContext
+            override fun resumeWith(r: Result<Any?>) { d.complete(r.getOrNull()) }
+        }
+        val r = method.invoke(target, cont)
+        if (r == kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) d.await() else r
+    }
 
-    private fun buildTabMappings(project: Project): List<TabMapping> {
-        val result = mutableListOf<TabMapping>()
-        val manager = TerminalToolWindowManager.getInstance(project)
-        val toolWindow = manager.toolWindow ?: return result
-        val contents = toolWindow.contentManager.contents
-        val reworkedTabs = getReworkedTabData(project)
+    private fun renameTab(tab: TabInfo, name: String) {
+        // Path 1: Frontend TerminalView.title (primary — updates UI directly)
+        val view = tab.reworkedSession
+        if (view != null) {
+            try {
+                val title = view.javaClass.getMethod("getTitle").invoke(view)
+                if (title != null) {
+                    // Set userDefinedTitle field directly
+                    for (f in title.javaClass.declaredFields) {
+                        if (f.name.contains("userDefinedTitle", true)) {
+                            f.isAccessible = true
+                            f.set(title, name)
+                            // Fire change notification
+                            for (m in title.javaClass.declaredMethods) {
+                                if (m.name.contains("fireTitleChanged") && m.parameterCount == 0) {
+                                    m.isAccessible = true; m.invoke(title); break
+                                }
+                            }
+                            LOG.info("[ClaudeTabs] Renamed via TerminalTitle field")
+                            break
+                        }
+                    }
+                    // Also try change() method via reflection
+                    try {
+                        val changeMethod = title.javaClass.methods.find { it.name == "change" }
+                        if (changeMethod != null) {
+                            // Can't easily create kotlin Function1, so skip this path
+                        }
+                    } catch (_: Exception) {}
+                }
+            } catch (e: Exception) {
+                LOG.warn("[ClaudeTabs] TerminalTitle rename failed: ${e.message}")
+            }
+        }
 
-        for (content in contents) {
-            var shellPid = content.getUserData(SHELL_PID_KEY)
-            var tabId = content.getUserData(REWORKED_TAB_ID_KEY)
-            if (shellPid == null) {
-                val name = content.displayName ?: continue
-                val data = reworkedTabs[name]
-                if (data != null) {
-                    shellPid = data.first; tabId = data.second
-                    content.putUserData(SHELL_PID_KEY, shellPid)
-                    content.putUserData(REWORKED_TAB_ID_KEY, tabId)
+        // Path 2: Content.displayName (visual tab label)
+        tab.content?.displayName = name
+
+        // Path 3: Stable TerminalWidget API (classic terminal)
+        tab.widget?.terminalTitle?.change { userDefinedTitle = name }
+    }
+
+    /**
+     * Extract shell PID from a frontend TerminalView.
+     * The view's startupOptions or backing session has the ttyConnector.
+     */
+    private fun extractPidFromView(view: Any): Long? {
+        // Try to get the session from the view via sessionState or similar
+        // The TerminalView doesn't directly expose ttyConnector, but the
+        // backing BackendTerminalSession (accessible via the session system) does.
+
+        // Strategy: get all alive session PIDs and match by checking the view's
+        // component tree for any process info
+        // Actually, let's try getting it from the backend session system
+        try {
+            val smCls = Class.forName("com.intellij.terminal.backend.TerminalSessionsManager")
+            val sm = smCls.getMethod("getInstance").invoke(null) ?: return null
+
+            // The SessionsManager has a sessionsMap — reflect into it
+            for (f in sm.javaClass.declaredFields) {
+                if (f.name.contains("session", true) && f.type.name.contains("Map")) {
+                    f.isAccessible = true
+                    val map = f.get(sm) as? Map<*, *> ?: continue
+                    // Each entry: TerminalSessionId → BackendTerminalSession
+                    for ((_, session) in map) {
+                        if (session == null) continue
+                        // Check if this session's coroutineScope matches the view's
+                        // This is a heuristic — match by checking if the PID is unique
+                        val pid = extractPidFromSession(session)
+                        if (pid != null) {
+                            // We can't directly match view to session without more info
+                            // Return PIDs that we'll match externally
+                        }
+                    }
                 }
             }
-            if (shellPid != null) result.add(TabMapping(content, shellPid, tabId))
-        }
-        return result
-    }
-
-    private fun getReworkedTabData(project: Project): Map<String, Pair<Long, Int>> {
-        val result = mutableMapOf<String, Pair<Long, Int>>()
-        try {
-            val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
-            val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project) ?: return result
-            tabsManager = tm
-            val tabs = invokeSuspend(tm, tmCls.methods.find { it.name == "getTerminalTabs" }!!) as? List<*> ?: return result
-            val smCls = Class.forName("com.intellij.terminal.backend.TerminalSessionsManager")
-            val sm = smCls.getMethod("getInstance").invoke(null) ?: return result
-            val getSess = smCls.methods.find { it.name == "getSession" && it.parameterCount == 1 } ?: return result
-            for (tab in tabs) {
-                tab ?: continue
-                try {
-                    val name = tab.javaClass.getMethod("getName").invoke(tab) as? String ?: continue
-                    val tabId = tab.javaClass.getMethod("getId").invoke(tab) as? Int ?: continue
-                    val sid = tab.javaClass.getMethod("getSessionId").invoke(tab) ?: continue
-                    val sess = getSess.invoke(sm, sid) ?: continue
-                    extractPidFromSession(sess)?.let { result[name] = Pair(it, tabId) }
-                } catch (_: Exception) {}
-            }
-        } catch (_: ClassNotFoundException) {}
-        return result
-    }
-
-    private fun getRenameMethod(project: Project): Method? {
-        if (renameMethod != null) return renameMethod
-        try {
-            renameMethod = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
-                .methods.find { it.name == "renameTerminalTab" }
         } catch (_: Exception) {}
-        return renameMethod
+
+        // Simpler approach: traverse the view's component to find something with PID
+        try {
+            val component = view.javaClass.getMethod("getComponent").invoke(view) as? java.awt.Component
+            return findPidInComponentTree(component)
+        } catch (_: Exception) {}
+
+        return null
+    }
+
+    private fun findPidInComponentTree(component: java.awt.Component?): Long? {
+        if (component == null) return null
+        // Check if this component is or contains a TerminalWidget
+        if (component is TerminalWidget) {
+            try {
+                val tty = component.ttyConnectorAccessor.ttyConnector
+                if (tty is ProcessTtyConnector) return tty.process.pid()
+            } catch (_: Exception) {}
+        }
+        // Check for any object with getTtyConnector/getTtyConnectorAccessor
+        try {
+            for (m in component.javaClass.methods) {
+                if (m.name == "getTtyConnectorAccessor" && m.parameterCount == 0) {
+                    val accessor = m.invoke(component) ?: continue
+                    val tty = accessor.javaClass.getMethod("getTtyConnector").invoke(accessor)
+                    if (tty is ProcessTtyConnector) return tty.process.pid()
+                }
+                if (m.name == "getTtyConnector" && m.parameterCount == 0) {
+                    val tty = m.invoke(component)
+                    if (tty is ProcessTtyConnector) return tty.process.pid()
+                }
+            }
+        } catch (_: Exception) {}
+        // Recurse
+        if (component is java.awt.Container) {
+            for (child in component.components) {
+                val pid = findPidInComponentTree(child)
+                if (pid != null) return pid
+            }
+        }
+        return null
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // FILE WATCHER — instant rename
+    // ══════════════════════════════════════════════════════════════
+
+    private suspend fun watchTabsDirectory(project: Project) {
+        val watcher = FileSystems.getDefault().newWatchService()
+        TABS_DIR.toPath().register(watcher, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_MODIFY)
+        LOG.info("[ClaudeTabs] Watcher active")
+
+        while (currentCoroutineContext().isActive) {
+            val key = watcher.poll(2, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+            for (event in key.pollEvents()) {
+                val filename = (event.context() as? Path)?.toString() ?: continue
+                if (!filename.endsWith(".json")) continue
+                val sessionId = filename.removeSuffix(".json")
+                delay(100)
+                try {
+                    val f = File(TABS_DIR, filename)
+                    if (!f.exists()) continue
+                    val name = extractJsonString(f.readText(), "name") ?: continue
+                    LOG.info("[ClaudeTabs] Watcher: '$name' for $sessionId")
+                    withContext(Dispatchers.Main) { handleRename(project, sessionId, name) }
+                } catch (e: Exception) {
+                    LOG.warn("[ClaudeTabs] Watcher: ${e.message}")
+                }
+            }
+            key.reset()
+        }
+    }
+
+    private fun handleRename(project: Project, sessionId: String, name: String) {
+        val claudePid = findClaudePidForSession(sessionId)
+        if (claudePid == null) { LOG.info("[ClaudeTabs] RENAME: no alive Claude for session $sessionId"); return }
+        val shellPid = findShellAncestor(claudePid)
+        if (shellPid == null) { LOG.info("[ClaudeTabs] RENAME: no shell ancestor for Claude PID $claudePid"); return }
+        LOG.info("[ClaudeTabs] RENAME: session=$sessionId → Claude PID=$claudePid → shell PID=$shellPid")
+
+        val tabs = getAllTabs(project)
+        val match = tabs.find { it.pid == shellPid }
+        if (match != null) {
+            LOG.info("[ClaudeTabs] RENAME: '${match.tabName}' → '$name'")
+            renameTab(match, name)
+            renamedSessions.add(sessionId)
+        } else {
+            LOG.info("[ClaudeTabs] RENAME: FAILED — shell PID $shellPid not in tabs: ${tabs.map { it.pid }}")
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // POLL — fallback rename + state save
+    // ══════════════════════════════════════════════════════════════
+
+    private fun poll(project: Project) {
+        val tabs = getAllTabs(project)
+        val activeSessions = mutableListOf<SavedSession>()
+        val claudeSessions = mutableListOf<String>()
+
+        for (tab in tabs) {
+            val claudeProcess = findClaudeChild(tab.pid) ?: continue
+            val claudePid = claudeProcess.pid()
+
+            val sf = File(SESSIONS_DIR, "$claudePid.json")
+            if (!sf.exists()) continue
+            val st = try { sf.readText() } catch (_: Exception) { continue }
+            val sessionId = extractJsonString(st, "sessionId") ?: continue
+            val cwd = extractJsonString(st, "cwd") ?: continue
+
+            claudeSessions.add("'${tab.tabName}'→session:${sessionId.take(8)}")
+
+            // Fallback rename
+            if (sessionId !in renamedSessions) {
+                val renameFile = File(TABS_DIR, "$sessionId.json")
+                if (renameFile.exists()) {
+                    val name = try { extractJsonString(renameFile.readText(), "name") } catch (_: Exception) { null }
+                    if (name != null) {
+                        LOG.info("[ClaudeTabs] POLL RENAME: '${tab.tabName}' → '$name'")
+                        renameTab(tab, name)
+                        renamedSessions.add(sessionId)
+                    }
+                }
+            }
+
+            val title = tab.widget?.terminalTitle?.buildTitle() ?: tab.tabName ?: "Claude"
+            val bypass = readPermissionMode(cwd, sessionId)
+            activeSessions.add(SavedSession(sessionId, cwd, title, bypass))
+        }
+
+        if (claudeSessions.isNotEmpty()) {
+            LOG.info("[ClaudeTabs] STEP 6: Claude sessions found: $claudeSessions")
+        }
+        LOG.info("[ClaudeTabs] STEP 7: Saving ${activeSessions.size} active session(s)")
+        saveState(project, activeSessions)
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -376,9 +522,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         } catch (_: Exception) {}
     }
 
-    private val pendingRestores = mutableListOf<SavedSession>()
-
-    private fun restoreSessions(project: Project) {
+    private fun loadRestoreFile(project: Project) {
         val f = getStateFile(project)
         if (!f.exists()) return
         try {
@@ -393,47 +537,72 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     o.contains("\"bypassPermissions\":true")
                 ))
             }
-            if (pendingRestores.isNotEmpty()) LOG.info("[ClaudeTabs] ${pendingRestores.size} session(s) queued for restore")
-            f.delete()
-        } catch (e: Exception) { LOG.warn("[ClaudeTabs] Restore read error: ${e.message}") }
+            if (pendingRestores.isNotEmpty()) LOG.info("[ClaudeTabs] ${pendingRestores.size} session(s) to restore")
+            // Don't delete yet — delete after all restores complete
+        } catch (_: Exception) {}
     }
 
     private fun processPendingRestores(project: Project) {
         if (pendingRestores.isEmpty()) return
-        val mgr = TerminalToolWindowManager.getInstance(project)
-        val toolWindow = mgr.toolWindow ?: return
-        val cm = toolWindow.contentManager
-        val reworkedData = getReworkedTabData(project)
+
+        val tabs = getAllTabs(project)
+        if (tabs.isEmpty()) {
+            LOG.info("[ClaudeTabs] Restore waiting — no tabs with PIDs yet")
+            return
+        }
+
         val restored = mutableListOf<SavedSession>()
+        val usedPids = mutableSetOf<Long>()
 
         for (s in pendingRestores) {
-            val content = cm.contents.firstOrNull { it.displayName == s.tabName }
-            if (content == null) {
-                try {
-                    @Suppress("DEPRECATION")
-                    val w = mgr.createLocalShellWidget(s.cwd, s.tabName)
-                    w.executeCommand(buildResumeCmd(s))
-                    LOG.info("[ClaudeTabs] Restored (new tab): ${s.tabName}")
-                    restored.add(s)
-                } catch (e: Exception) {
-                    LOG.warn("[ClaudeTabs] Fallback restore failed: ${e.message}")
-                    restored.add(s)
-                }
-                continue
+            // Find a matching tab: by name first, then any idle tab
+            var match = tabs.find { it.tabName == s.tabName && it.pid !in usedPids }
+            if (match == null) {
+                match = tabs.find { findClaudeChild(it.pid) == null && it.pid !in usedPids }
             }
-            val tabData = reworkedData[s.tabName] ?: continue
-            val connector = getConnectorForPid(tabData.first, project) ?: continue
-            try {
-                connector.write(buildResumeCmd(s).toByteArray())
-                connector.write("\r\n".toByteArray())
-                LOG.info("[ClaudeTabs] Claimed tab '${s.tabName}' → resumed ${s.sessionId}")
+
+            if (match != null) {
+                val cmd = buildResumeCmd(s)
+                renameTab(match, s.tabName)
+
+                // Send command via TerminalView.sendText or widget API or tty fallback
+                val view = match.reworkedSession
+                val w = match.widget
+                if (view != null) {
+                    try {
+                        val sendText = view.javaClass.getMethod("sendText", String::class.java)
+                        sendText.invoke(view, cmd + "\n")
+                        LOG.info("[ClaudeTabs] Sent command via TerminalView.sendText")
+                    } catch (_: Exception) {
+                        // Fallback: write to ttyConnector
+                        try {
+                            val connector = extractConnectorFromSession(view)
+                            connector?.write(cmd.toByteArray())
+                            connector?.write("\r\n".toByteArray())
+                        } catch (_: Exception) {}
+                    }
+                } else if (w != null) {
+                    ApplicationManager.getApplication().invokeLater {
+                        w.sendCommandToExecute(cmd)
+                    }
+                }
+
+                usedPids.add(match.pid)
+                LOG.info("[ClaudeTabs] Restored '${s.tabName}' in '${match.tabName}' → ${s.sessionId}")
                 restored.add(s)
-            } catch (e: Exception) {
-                LOG.warn("[ClaudeTabs] Write to tty failed: ${e.message}")
-                restored.add(s)
+            } else {
+                LOG.info("[ClaudeTabs] Restore pending '${s.tabName}' — no idle tab available")
             }
         }
         pendingRestores.removeAll(restored)
+
+        // Delete restore file only when ALL sessions have been restored
+        if (pendingRestores.isEmpty() && restored.isNotEmpty()) {
+            try {
+                val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+                if (project != null) getStateFile(project).delete()
+            } catch (_: Exception) {}
+        }
     }
 
     private fun buildResumeCmd(s: SavedSession): String = buildString {
@@ -442,135 +611,119 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     private fun shouldAlwaysBypass(): Boolean {
-        val f = File(System.getProperty("user.home"), ".claude/settings.json")
+        val f = File(CLAUDE_HOME, "settings.json")
         if (!f.exists()) return false
-        return try { val t = f.readText(); t.contains("\"skipDangerousModePermissionPrompt\":true") || t.contains("\"skipDangerousModePermissionPrompt\": true") }
+        return try { f.readText().let { it.contains("\"skipDangerousModePermissionPrompt\":true") || it.contains("\"skipDangerousModePermissionPrompt\": true") } }
         catch (_: Exception) { false }
-    }
-
-    private fun getConnectorForPid(shellPid: Long, project: Project): com.jediterm.terminal.TtyConnector? {
-        try {
-            val smCls = Class.forName("com.intellij.terminal.backend.TerminalSessionsManager")
-            val sm = smCls.getMethod("getInstance").invoke(null) ?: return null
-            val getSess = smCls.methods.find { it.name == "getSession" && it.parameterCount == 1 } ?: return null
-            val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
-            val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project) ?: return null
-            val tabs = invokeSuspend(tm, tmCls.methods.find { it.name == "getTerminalTabs" }!!) as? List<*> ?: return null
-            for (tab in tabs) {
-                tab ?: continue
-                try {
-                    val sid = tab.javaClass.getMethod("getSessionId").invoke(tab) ?: continue
-                    val session = getSess.invoke(sm, sid) ?: continue
-                    if (extractPidFromSession(session) == shellPid) return extractConnectorFromSession(session)
-                } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
-        return null
-    }
-
-    private fun extractConnectorFromSession(session: Any): com.jediterm.terminal.TtyConnector? {
-        val targets = mutableListOf(session)
-        try { val f = session.javaClass.getDeclaredField("delegate"); f.isAccessible = true; f.get(session)?.let { targets.add(0, it) } } catch (_: Exception) {}
-        for (t in targets) { try { for (field in t.javaClass.declaredFields) { if (!field.name.contains("ttyConnector", true)) continue; field.isAccessible = true; val c = field.get(t); if (c is com.jediterm.terminal.TtyConnector) return c } } catch (_: Exception) {} }
-        return null
     }
 
     private fun readPermissionMode(cwd: String, sessionId: String): Boolean {
         val h = cwd.replace("\\", "/").replace(":/", "--").replace("/", "-")
         val f = File(File(CLAUDE_HOME, "projects/$h"), "$sessionId.jsonl")
         if (!f.exists()) return false
-        return try { BufferedReader(FileReader(f)).use { r -> repeat(5) { val l = r.readLine() ?: return@use false; if (l.contains("\"type\":\"permission-mode\"") || l.contains("\"type\": \"permission-mode\"")) return@use extractJsonString(l, "permissionMode") == "bypassPermissions" }; false } } catch (_: Exception) { false }
+        return try {
+            BufferedReader(FileReader(f)).use { r ->
+                repeat(5) {
+                    val l = r.readLine() ?: return@use false
+                    if (l.contains("\"permission-mode\"")) return@use extractJsonString(l, "permissionMode") == "bypassPermissions"
+                }; false
+            }
+        } catch (_: Exception) { false }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // PID EXTRACTION + CLAUDE DETECTION
+    // CLAUDE DETECTION
     // ══════════════════════════════════════════════════════════════
 
-    private fun extractPidFromSession(session: Any): Long? {
-        val targets = mutableListOf(session)
-        try { val f = session.javaClass.getDeclaredField("delegate"); f.isAccessible = true; f.get(session)?.let { targets.add(0, it) } } catch (_: Exception) {}
-        for (t in targets) { try { for (field in t.javaClass.declaredFields) { if (!field.name.contains("ttyConnector", true)) continue; field.isAccessible = true; val c = field.get(t) ?: continue; if (c is ProcessTtyConnector) return c.process.pid(); try { (c.javaClass.getMethod("getProcess").invoke(c) as? Process)?.let { return it.pid() } } catch (_: Exception) {}; for (cf in c.javaClass.declaredFields) { cf.isAccessible = true; val v = cf.get(c); if (v is ProcessTtyConnector) return v.process.pid(); if (v is Process) return v.pid() } } } catch (_: Exception) {} }
+    private fun findClaudePidForSession(sessionId: String): Long? {
+        for (f in SESSIONS_DIR.listFiles() ?: emptyArray()) {
+            if (!f.name.endsWith(".json")) continue
+            try {
+                if (extractJsonString(f.readText(), "sessionId") != sessionId) continue
+                val pid = f.nameWithoutExtension.toLongOrNull() ?: continue
+                if (ProcessHandle.of(pid).map { it.isAlive }.orElse(false)) return pid
+            } catch (_: Exception) {}
+        }
         return null
     }
 
+    private fun findShellAncestor(claudePid: Long): Long? {
+        var current = ProcessHandle.of(claudePid).orElse(null) ?: return null
+        for (i in 0 until 5) {
+            val parent = current.parent().orElse(null) ?: break
+            current = parent
+            val cmd = current.info().command().orElse("")
+            if (cmd.contains("bash", true) || cmd.contains("pwsh", true) ||
+                cmd.contains("powershell", true) || cmd.contains("cmd.exe", true) ||
+                cmd.contains("zsh", true) || cmd.contains("fish", true) || cmd.contains("sh", true)
+            ) return current.pid()
+        }
+        return ProcessHandle.of(claudePid).flatMap { it.parent() }.flatMap { it.parent() }.map { it.pid() }.orElse(null)
+    }
+
     private fun findClaudeChild(pid: Long): ProcessHandle? {
-        val h = ProcessHandle.of(pid).orElse(null) ?: return null; return findClaudeRec(h)
+        val h = ProcessHandle.of(pid).orElse(null) ?: return null
+        return findClaudeRec(h)
     }
 
     private fun findClaudeRec(h: ProcessHandle): ProcessHandle? {
         for (c in h.children().toList()) {
             val cmd = c.info().command().orElse(""); val line = c.info().commandLine().orElse("")
-            if ((cmd.contains("claude", true) || line.contains("claude", true)) && (cmd.endsWith("claude") || cmd.endsWith("claude.exe") || cmd.endsWith("claude.cmd") || line.contains("@anthropic", true) || line.contains("claude-code", true) || (cmd.contains("node", true) && line.contains("claude", true)))) return c
+            if ((cmd.contains("claude", true) || line.contains("claude", true)) &&
+                (cmd.endsWith("claude") || cmd.endsWith("claude.exe") || cmd.endsWith("claude.cmd") ||
+                        line.contains("@anthropic", true) || line.contains("claude-code", true) ||
+                        (cmd.contains("node", true) && line.contains("claude", true)))) return c
             findClaudeRec(c)?.let { return it }
-        }; return null
+        }
+        return null
     }
 
     // ══════════════════════════════════════════════════════════════
-    // AUTO-DEPLOY Claude integration files on first run
+    // AUTO-DEPLOY
     // ══════════════════════════════════════════════════════════════
 
     private val CLAUDE_MD_MARKER = "<!-- rider-claude-tabs-plugin -->"
+    private val PERMISSION_ENTRY = "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)"
 
     private fun deployClaudeIntegration() {
         try {
-            // 1. Deploy rename-tab.sh
-            val scriptFile = File(CLAUDE_HOME, "rider-plugin/rename-tab.sh")
-            deployResource("claude-integration/rename-tab.sh", scriptFile)
+            deployResource("claude-integration/rename-tab.sh", File(CLAUDE_HOME, "rider-plugin/rename-tab.sh"))
+            File(CLAUDE_HOME, "commands").mkdirs()
+            deployResource("claude-integration/tab.md", File(CLAUDE_HOME, "commands/tab.md"))
 
-            // 2. Deploy /tab command
-            val cmdDir = File(CLAUDE_HOME, "commands")
-            cmdDir.mkdirs()
-            deployResource("claude-integration/tab.md", File(cmdDir, "tab.md"))
-
-            // 3. Add instruction to global CLAUDE.md (idempotent)
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
             if (!existing.contains(CLAUDE_MD_MARKER)) {
-                val section = """
-                    |
-                    |$CLAUDE_MD_MARKER
-                    |## Terminal Tab Naming (Rider Plugin)
-                    |At the **start of every conversation**, rename your Rider terminal tab by running:
-                    |```bash
-                    |bash ~/.claude/rider-plugin/rename-tab.sh "Short Topic Name"
-                    |```
-                    |Pick a concise name (3-5 words) that describes the conversation's purpose. Update it if the topic shifts significantly. The Rider plugin auto-detects Claude sessions, applies the name, and restores sessions on Rider restart.
-                    |
-                    |This applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.
-                    |$CLAUDE_MD_MARKER
-                """.trimMargin()
-                claudeMd.appendText(section)
-                LOG.info("[ClaudeTabs] Added instruction to CLAUDE.md")
+                claudeMd.appendText("\n$CLAUDE_MD_MARKER\n## Terminal Tab Naming (Rider Plugin)\nAt the **start of every conversation**, rename your Rider terminal tab by running:\n```bash\nbash ~/.claude/rider-plugin/rename-tab.sh \"Short Topic Name\"\n```\nPick a concise name (3-5 words) that describes the conversation's purpose. Update it if the topic shifts significantly.\n\nThis applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.\n$CLAUDE_MD_MARKER\n")
             }
 
-            LOG.info("[ClaudeTabs] Integration files deployed")
-        } catch (e: Exception) {
-            LOG.warn("[ClaudeTabs] Deploy failed: ${e.message}")
-        }
+            addPermission()
+        } catch (_: Exception) {}
     }
 
-    private fun deployResource(resourcePath: String, target: File) {
-        // Always overwrite to keep in sync with plugin version
+    private fun addPermission() {
+        val sf = File(CLAUDE_HOME, "settings.json")
+        if (!sf.exists()) return
         try {
-            val stream = javaClass.classLoader.getResourceAsStream(resourcePath) ?: return
-            target.parentFile?.mkdirs()
-            target.writeBytes(stream.readBytes())
+            val text = sf.readText()
+            if (text.contains(PERMISSION_ENTRY)) return
+            if (text.contains("\"allow\"")) {
+                sf.writeText(text.replace(Regex(""""allow"\s*:\s*\["""), "\"allow\": [\"$PERMISSION_ENTRY\", "))
+            } else if (text.contains("\"permissions\"")) {
+                // permissions exists but no allow
+            } else {
+                sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  \"permissions\": {\n    \"allow\": [\"$PERMISSION_ENTRY\"]\n  }\n}")
+            }
         } catch (_: Exception) {}
+    }
+
+    private fun deployResource(path: String, target: File) {
+        try { javaClass.classLoader.getResourceAsStream(path)?.let { target.parentFile?.mkdirs(); target.writeBytes(it.readBytes()) } } catch (_: Exception) {}
     }
 
     // ══════════════════════════════════════════════════════════════
     // UTILITIES
     // ══════════════════════════════════════════════════════════════
-
-    private fun invokeSuspend(target: Any, method: Method): Any? = runBlocking {
-        val d = CompletableDeferred<Any?>(); val cont = object : kotlin.coroutines.Continuation<Any?> { override val context = kotlin.coroutines.EmptyCoroutineContext; override fun resumeWith(r: Result<Any?>) { d.complete(r.getOrNull()) } }
-        val r = method.invoke(target, cont); if (r == kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) d.await() else r
-    }
-
-    private fun invokeSuspend3(target: Any, method: Method, a1: Any, a2: Any, a3: Any): Any? = runBlocking {
-        val d = CompletableDeferred<Any?>(); val cont = object : kotlin.coroutines.Continuation<Any?> { override val context = kotlin.coroutines.EmptyCoroutineContext; override fun resumeWith(r: Result<Any?>) { d.complete(r.getOrNull()) } }
-        val r = method.invoke(target, a1, a2, a3, cont); if (r == kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) d.await() else r
-    }
 
     private fun extractJsonString(json: String, key: String): String? {
         val m = Regex(""""$key"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""").find(json) ?: return null
