@@ -91,8 +91,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun getAllTabs(project: Project): List<TabInfo> {
         val result = mutableListOf<TabInfo>()
 
-        // Step 1: Get frontend views (name → TerminalView + Content) for visual rename
-        val frontendViews = mutableMapOf<String, Pair<Any, Content?>>() // name → (view, content)
+        // Step 1: Get frontend views keyed by Content identity (stable across renames)
+        val frontendByContent = mutableMapOf<Content, Any>() // Content → TerminalView
+        val frontendOrphanViews = mutableListOf<Any>() // views without Content (split panels)
         try {
             val feMgrCls = Class.forName("com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager")
             val feMgr = feMgrCls.getMethod("getInstance", Project::class.java).invoke(null, project)
@@ -104,14 +105,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 try {
                     val content = feTab.javaClass.getMethod("getContent").invoke(feTab) as? Content
                     val view = feTab.javaClass.getMethod("getView").invoke(feTab) ?: return@forEach
-                    val name = content?.displayName ?: try {
-                        val title = view.javaClass.getMethod("getTitle").invoke(view)
-                        title?.javaClass?.getMethod("buildTitle")?.invoke(title) as? String ?: "Local"
-                    } catch (_: Exception) { "Local" }
-                    frontendViews[name] = Pair(view, content)
+                    if (content != null) {
+                        frontendByContent[content] = view
+                    } else {
+                        frontendOrphanViews.add(view)
+                    }
                 } catch (_: Exception) {}
             }
-            LOG.info("[ClaudeTabs] STEP 2: Frontend views: ${frontendViews.keys}")
+            LOG.info("[ClaudeTabs] STEP 2: Frontend: ${frontendByContent.size} with Content, ${frontendOrphanViews.size} orphans")
         } catch (_: ClassNotFoundException) {}
         catch (_: Exception) {}
 
@@ -146,11 +147,20 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
                     backendWithPids.add("$name→PID$pid")
 
-                    // Merge: find matching frontend view by name
-                    val fe = frontendViews[name]
-                    val view = fe?.first
-                    val content = fe?.second
-                    val hasFrontend = fe != null
+                    // Merge: find frontend view via Content identity (stable across renames)
+                    // Get Content from ContentManager by matching backend tab name or ID
+                    val mgr = TerminalToolWindowManager.getInstance(project)
+                    val allContents = mgr.toolWindow?.contentManager?.contents ?: emptyArray()
+                    // Try to find content by name (backend name = original name)
+                    var content: Content? = allContents.firstOrNull { it.displayName == name }
+                    // If not found by backend name, try by tab ID stored in userData
+                    if (content == null) {
+                        // Match by elimination: contents not yet used
+                        val usedContents = result.mapNotNull { it.content }.toSet()
+                        content = allContents.firstOrNull { it !in usedContents }
+                    }
+                    val view = if (content != null) frontendByContent[content] else null
+                    val hasFrontend = view != null
 
                     result.add(TabInfo(
                         content = content,
@@ -749,7 +759,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
             if (!existing.contains(CLAUDE_MD_MARKER)) {
-                claudeMd.appendText("\n$CLAUDE_MD_MARKER\n## Terminal Tab Naming (Rider Plugin)\nAt the **start of every conversation**, rename your Rider terminal tab by running:\n```bash\nbash ~/.claude/rider-plugin/rename-tab.sh \"Short Topic Name\" \"YOUR_SESSION_ID\"\n```\nPick a concise name (3-5 words) that describes the conversation's purpose. Update it if the topic shifts significantly.\n\nThis applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.\n\n**You MUST pass your session ID as the second argument.** Find your session ID from the conversation metadata. Do NOT omit it.\n$CLAUDE_MD_MARKER\n")
+                claudeMd.appendText("\n$CLAUDE_MD_MARKER\n## Terminal Tab Naming (Rider Plugin)\nAt the **start of every conversation**, rename your Rider terminal tab by running:\n```bash\nbash ~/.claude/rider-plugin/rename-tab.sh \"Short Topic Name\"\n```\nIf the user explicitly tells you what to name the tab, use EXACTLY what they said. Otherwise, pick a concise name (3-5 words) that describes the conversation's purpose.\n\nThis applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.\n$CLAUDE_MD_MARKER\n")
             }
 
             addPermission()
