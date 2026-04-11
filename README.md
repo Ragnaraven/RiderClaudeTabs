@@ -45,6 +45,16 @@ This applies to **new chats, resumed chats** (`--resume`), **and `/resume`**.
 On resume, re-use the previous tab name if the topic hasn't changed.
 ```
 
+### `/tab` Slash Command
+
+For legacy or missed chats, users can manually rename with:
+
+```
+/tab My Topic Name
+```
+
+If no name is given, Claude picks one based on the conversation. Install by copying `commands/tab.md` to `~/.claude/commands/tab.md`.
+
 ## Installation
 
 ### Build from Source
@@ -68,6 +78,7 @@ Output: `build/distributions/rider-claude-tabs-1.0.0.zip`
 
 1. Copy `rename-tab.sh` to `~/.claude/rider-plugin/rename-tab.sh`
 2. Add the Claude Code integration snippet to `~/.claude/CLAUDE.md`
+3. Copy `commands/tab.md` to `~/.claude/commands/tab.md` for the `/tab` slash command
 
 ## Compatibility
 

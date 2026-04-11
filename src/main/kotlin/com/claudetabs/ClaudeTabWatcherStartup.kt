@@ -2,6 +2,7 @@ package com.claudetabs
 
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.StartupActivity
 import com.intellij.openapi.util.Disposer
@@ -37,41 +38,29 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     override fun runActivity(project: Project) {
         LOG.info("[ClaudeTabs] Started for: ${project.name}")
         TABS_DIR.mkdirs()
+        deployClaudeIntegration()
 
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-        // Cancel scope when project closes — prevents stale polling + ensures state is saved
+        // Cancel scope when project closes
         Disposer.register(project as Disposable, Disposable {
-            LOG.info("[ClaudeTabs] Project closing, saving state and stopping")
-            // Do a final state save before shutdown
-            try {
-                val mappings = buildTabMappings(project)
-                val sessions = mutableListOf<SavedSession>()
-                for (m in mappings) {
-                    val cp = findClaudeChild(m.shellPid) ?: continue
-                    val sf = File(SESSIONS_DIR, "${cp.pid()}.json")
-                    if (!sf.exists()) continue
-                    val st = sf.readText()
-                    val sid = extractJsonString(st, "sessionId") ?: continue
-                    val cwd = extractJsonString(st, "cwd") ?: continue
-                    val bypass = readPermissionMode(cwd, sid)
-                    sessions.add(SavedSession(sid, cwd, m.content.displayName ?: "Claude", bypass))
-                }
-                saveState(project, sessions)
-                LOG.info("[ClaudeTabs] Saved ${sessions.size} session(s) on shutdown")
-            } catch (e: Exception) {
-                LOG.warn("[ClaudeTabs] Shutdown save failed: ${e.message}")
-            }
+            LOG.info("[ClaudeTabs] Project closing")
+            // Save state from the last known good snapshot (saved by poll loop)
             scope.cancel()
         })
 
         // File watcher — reacts instantly when rename files appear
+        // Runs independently so a crash here doesn't kill the poll loop
         scope.launch {
             delay(2_000)
-            watchTabsDirectory(project)
+            try {
+                watchTabsDirectory(project)
+            } catch (e: Exception) {
+                LOG.warn("[ClaudeTabs] Watcher crashed (polling will handle renames): ${e.message}")
+            }
         }
 
-        // Main loop — restore, poll for state save, slower renames as fallback
+        // Main loop — restore, poll for state save, renames
         scope.launch {
             delay(2_000)
             withContext(Dispatchers.Main) { restoreSessions(project) }
@@ -82,7 +71,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         processPendingRestores(project)
                         poll(project)
                     }
+                } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
+                    LOG.info("[ClaudeTabs] Project disposed, stopping poll")
+                    break
                 } catch (e: Exception) {
+                    if (e.message?.contains("disposed") == true) {
+                        LOG.info("[ClaudeTabs] Project disposed, stopping poll")
+                        break
+                    }
                     if (pollCount % 12 == 0) LOG.warn("[ClaudeTabs] Poll: ${e.message}")
                 }
                 delay(if (pendingRestores.isNotEmpty()) 2_000L else POLL_INTERVAL_MS)
@@ -507,6 +503,59 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             if ((cmd.contains("claude", true) || line.contains("claude", true)) && (cmd.endsWith("claude") || cmd.endsWith("claude.exe") || cmd.endsWith("claude.cmd") || line.contains("@anthropic", true) || line.contains("claude-code", true) || (cmd.contains("node", true) && line.contains("claude", true)))) return c
             findClaudeRec(c)?.let { return it }
         }; return null
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // AUTO-DEPLOY Claude integration files on first run
+    // ══════════════════════════════════════════════════════════════
+
+    private val CLAUDE_MD_MARKER = "<!-- rider-claude-tabs-plugin -->"
+
+    private fun deployClaudeIntegration() {
+        try {
+            // 1. Deploy rename-tab.sh
+            val scriptFile = File(CLAUDE_HOME, "rider-plugin/rename-tab.sh")
+            deployResource("claude-integration/rename-tab.sh", scriptFile)
+
+            // 2. Deploy /tab command
+            val cmdDir = File(CLAUDE_HOME, "commands")
+            cmdDir.mkdirs()
+            deployResource("claude-integration/tab.md", File(cmdDir, "tab.md"))
+
+            // 3. Add instruction to global CLAUDE.md (idempotent)
+            val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
+            val existing = if (claudeMd.exists()) claudeMd.readText() else ""
+            if (!existing.contains(CLAUDE_MD_MARKER)) {
+                val section = """
+                    |
+                    |$CLAUDE_MD_MARKER
+                    |## Terminal Tab Naming (Rider Plugin)
+                    |At the **start of every conversation**, rename your Rider terminal tab by running:
+                    |```bash
+                    |bash ~/.claude/rider-plugin/rename-tab.sh "Short Topic Name"
+                    |```
+                    |Pick a concise name (3-5 words) that describes the conversation's purpose. Update it if the topic shifts significantly. The Rider plugin auto-detects Claude sessions, applies the name, and restores sessions on Rider restart.
+                    |
+                    |This applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.
+                    |$CLAUDE_MD_MARKER
+                """.trimMargin()
+                claudeMd.appendText(section)
+                LOG.info("[ClaudeTabs] Added instruction to CLAUDE.md")
+            }
+
+            LOG.info("[ClaudeTabs] Integration files deployed")
+        } catch (e: Exception) {
+            LOG.warn("[ClaudeTabs] Deploy failed: ${e.message}")
+        }
+    }
+
+    private fun deployResource(resourcePath: String, target: File) {
+        // Always overwrite to keep in sync with plugin version
+        try {
+            val stream = javaClass.classLoader.getResourceAsStream(resourcePath) ?: return
+            target.parentFile?.mkdirs()
+            target.writeBytes(stream.readBytes())
+        } catch (_: Exception) {}
     }
 
     // ══════════════════════════════════════════════════════════════
