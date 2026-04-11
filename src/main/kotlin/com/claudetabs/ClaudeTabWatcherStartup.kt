@@ -521,6 +521,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
 
             val title = tab.widget?.terminalTitle?.buildTitle() ?: tab.tabName ?: "Claude"
+
+            // Never save generic/unnamed tabs — only save tabs that were explicitly renamed
+            if (isGenericTabName(title)) continue
+
             val bypass = readPermissionMode(cwd, sessionId)
             activeSessions.add(SavedSession(sessionId, cwd, title, bypass))
         }
@@ -779,6 +783,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun extractJsonString(json: String, key: String): String? {
         val m = Regex(""""$key"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""").find(json) ?: return null
         return m.groupValues[1].replace("\\\\", "\\").replace("\\\"", "\"")
+    }
+
+    /** Tabs with generic names should never be saved for restore or grabbed for restore */
+    private fun isGenericTabName(name: String): Boolean {
+        val n = name.trim()
+        return n == "Local" || n.matches(Regex("Local \\(\\d+\\)")) ||
+            n == "bash" || n == "pwsh" || n == "PowerShell" || n == "cmd" ||
+            n.matches(Regex("bash \\(\\d+\\)")) || n.matches(Regex("pwsh \\(\\d+\\)"))
     }
 
     private fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
