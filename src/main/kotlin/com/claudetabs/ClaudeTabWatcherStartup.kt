@@ -555,36 +555,51 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val usedPids = mutableSetOf<Long>()
 
         for (s in pendingRestores) {
-            // Find a matching tab: by name first, then any idle tab
-            var match = tabs.find { it.tabName == s.tabName && it.pid !in usedPids }
-            if (match == null) {
-                match = tabs.find { findClaudeChild(it.pid) == null && it.pid !in usedPids }
-            }
+            // ONLY match by exact saved tab name — never grab generic "Local" tabs
+            val match = tabs.find { it.tabName == s.tabName && it.pid !in usedPids }
 
             if (match != null) {
                 val cmd = buildResumeCmd(s)
                 renameTab(match, s.tabName)
 
-                // Send command via TerminalView.sendText or widget API or tty fallback
+                // Send command via createSendTextBuilder (proper API, no garbled text)
                 val view = match.reworkedSession
                 val w = match.widget
+                var sent = false
+
                 if (view != null) {
+                    // Try createSendTextBuilder first (cleanest API)
                     try {
-                        val sendText = view.javaClass.getMethod("sendText", String::class.java)
-                        sendText.invoke(view, cmd + "\n")
-                        LOG.info("[ClaudeTabs] Sent command via TerminalView.sendText")
-                    } catch (_: Exception) {
-                        // Fallback: write to ttyConnector
+                        val builder = view.javaClass.getMethod("createSendTextBuilder").invoke(view)
+                        val shouldExec = builder.javaClass.getMethod("shouldExecute").invoke(builder)
+                        shouldExec.javaClass.getMethod("send", String::class.java).invoke(shouldExec, cmd)
+                        LOG.info("[ClaudeTabs] Sent via createSendTextBuilder")
+                        sent = true
+                    } catch (_: Exception) {}
+
+                    // Fallback: sendText with newline
+                    if (!sent) {
+                        try {
+                            view.javaClass.getMethod("sendText", String::class.java).invoke(view, cmd + "\n")
+                            LOG.info("[ClaudeTabs] Sent via sendText")
+                            sent = true
+                        } catch (_: Exception) {}
+                    }
+
+                    // Last resort: tty connector
+                    if (!sent) {
                         try {
                             val connector = extractConnectorFromSession(view)
                             connector?.write(cmd.toByteArray())
                             connector?.write("\r\n".toByteArray())
+                            sent = true
                         } catch (_: Exception) {}
                     }
                 } else if (w != null) {
                     ApplicationManager.getApplication().invokeLater {
                         w.sendCommandToExecute(cmd)
                     }
+                    sent = true
                 }
 
                 usedPids.add(match.pid)
@@ -694,7 +709,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
             if (!existing.contains(CLAUDE_MD_MARKER)) {
-                claudeMd.appendText("\n$CLAUDE_MD_MARKER\n## Terminal Tab Naming (Rider Plugin)\nAt the **start of every conversation**, rename your Rider terminal tab by running:\n```bash\nbash ~/.claude/rider-plugin/rename-tab.sh \"Short Topic Name\"\n```\nPick a concise name (3-5 words) that describes the conversation's purpose. Update it if the topic shifts significantly.\n\nThis applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.\n$CLAUDE_MD_MARKER\n")
+                claudeMd.appendText("\n$CLAUDE_MD_MARKER\n## Terminal Tab Naming (Rider Plugin)\nAt the **start of every conversation**, rename your Rider terminal tab by running:\n```bash\nbash ~/.claude/rider-plugin/rename-tab.sh \"Short Topic Name\" \"YOUR_SESSION_ID\"\n```\nPick a concise name (3-5 words) that describes the conversation's purpose. Update it if the topic shifts significantly.\n\nThis applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.\n\n**You MUST pass your session ID as the second argument.** Find your session ID from the conversation metadata. Do NOT omit it.\n$CLAUDE_MD_MARKER\n")
             }
 
             addPermission()
