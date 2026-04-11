@@ -417,19 +417,54 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             for (event in key.pollEvents()) {
                 val filename = (event.context() as? Path)?.toString() ?: continue
                 if (!filename.endsWith(".json")) continue
-                val sessionId = filename.removeSuffix(".json")
                 delay(100)
                 try {
                     val f = File(TABS_DIR, filename)
                     if (!f.exists()) continue
-                    val name = extractJsonString(f.readText(), "name") ?: continue
-                    LOG.info("[ClaudeTabs] Watcher: '$name' for $sessionId")
-                    withContext(Dispatchers.Main) { handleRename(project, sessionId, name) }
+                    val text = f.readText()
+                    val name = extractJsonString(text, "name") ?: continue
+
+                    if (filename.startsWith("pid-")) {
+                        // PID-keyed file: walk up from script PID to find shell → tab
+                        val scriptPid = filename.removePrefix("pid-").removeSuffix(".json").toLongOrNull() ?: continue
+                        LOG.info("[ClaudeTabs] Watcher: PID-rename '$name' from script PID $scriptPid")
+                        withContext(Dispatchers.Main) { handlePidRename(project, scriptPid, name) }
+                        f.delete() // PID files are ephemeral
+                    } else {
+                        // Session-keyed file: use session ID to find Claude → shell → tab
+                        val sessionId = filename.removeSuffix(".json")
+                        LOG.info("[ClaudeTabs] Watcher: session-rename '$name' for $sessionId")
+                        withContext(Dispatchers.Main) { handleRename(project, sessionId, name) }
+                    }
                 } catch (e: Exception) {
                     LOG.warn("[ClaudeTabs] Watcher: ${e.message}")
                 }
             }
             key.reset()
+        }
+    }
+
+    /**
+     * Handle PID-keyed rename: walk up from the bash script's PID to find the
+     * terminal shell, then match to a tab.
+     */
+    private fun handlePidRename(project: Project, scriptPid: Long, name: String) {
+        // Walk up from script PID: bash(script) → node(claude) → ... → shell(terminal)
+        val shellPid = findShellAncestor(scriptPid)
+        if (shellPid == null) {
+            LOG.info("[ClaudeTabs] PID-RENAME: no shell ancestor for script PID $scriptPid")
+            return
+        }
+        LOG.info("[ClaudeTabs] PID-RENAME: script PID $scriptPid → shell PID $shellPid")
+
+        val tabs = getAllTabs(project)
+        val match = tabs.find { it.pid == shellPid }
+        if (match != null) {
+            LOG.info("[ClaudeTabs] PID-RENAME: '${match.tabName}' → '$name'")
+            renameTab(match, name)
+            renamedSessions.add("pid-$scriptPid")
+        } else {
+            LOG.info("[ClaudeTabs] PID-RENAME: FAILED — shell PID $shellPid not in tabs: ${tabs.map { it.pid }}")
         }
     }
 
@@ -705,6 +740,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             deployResource("claude-integration/rename-tab.sh", File(CLAUDE_HOME, "rider-plugin/rename-tab.sh"))
             File(CLAUDE_HOME, "commands").mkdirs()
             deployResource("claude-integration/tab.md", File(CLAUDE_HOME, "commands/tab.md"))
+            deployResource("claude-integration/clear-tabs.md", File(CLAUDE_HOME, "commands/clear-tabs.md"))
 
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
