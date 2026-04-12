@@ -91,9 +91,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun getAllTabs(project: Project): List<TabInfo> {
         val result = mutableListOf<TabInfo>()
 
-        // Step 1: Get frontend views keyed by Content identity (stable across renames)
-        val frontendByContent = mutableMapOf<Content, Any>() // Content → TerminalView
-        val frontendOrphanViews = mutableListOf<Any>() // views without Content (split panels)
+        // Step 1: Get frontend views — store view + content per tab
+        data class FrontendEntry(val view: Any, val content: Content?)
+        val frontendTabs = mutableListOf<FrontendEntry>()
         try {
             val feMgrCls = Class.forName("com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager")
             val feMgr = feMgrCls.getMethod("getInstance", Project::class.java).invoke(null, project)
@@ -105,14 +105,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 try {
                     val content = feTab.javaClass.getMethod("getContent").invoke(feTab) as? Content
                     val view = feTab.javaClass.getMethod("getView").invoke(feTab) ?: return@forEach
-                    if (content != null) {
-                        frontendByContent[content] = view
-                    } else {
-                        frontendOrphanViews.add(view)
-                    }
+                    frontendTabs.add(FrontendEntry(view, content))
                 } catch (_: Exception) {}
             }
-            LOG.info("[ClaudeTabs] STEP 2: Frontend: ${frontendByContent.size} with Content, ${frontendOrphanViews.size} orphans")
+            LOG.info("[ClaudeTabs] STEP 2: Frontend tabs: ${frontendTabs.size}, names: ${frontendTabs.map { it.content?.displayName ?: "?" }}")
         } catch (_: ClassNotFoundException) {}
         catch (_: Exception) {}
 
@@ -147,20 +143,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
                     backendWithPids.add("$name→PID$pid")
 
-                    // Merge: find frontend view via Content identity (stable across renames)
-                    // Get Content from ContentManager by matching backend tab name or ID
-                    val mgr = TerminalToolWindowManager.getInstance(project)
-                    val allContents = mgr.toolWindow?.contentManager?.contents ?: emptyArray()
-                    // Try to find content by name (backend name = original name)
-                    var content: Content? = allContents.firstOrNull { it.displayName == name }
-                    // If not found by backend name, try by tab ID stored in userData
-                    if (content == null) {
-                        // Match by elimination: contents not yet used
-                        val usedContents = result.mapNotNull { it.content }.toSet()
-                        content = allContents.firstOrNull { it !in usedContents }
-                    }
-                    val view = if (content != null) frontendByContent[content] else null
-                    val hasFrontend = view != null
+                    // Merge: match to frontend by index (both APIs return tabs in same order)
+                    val backendIdx = backendNames.size - 1
+                    val fe = frontendTabs.getOrNull(backendIdx)
+                    val view = fe?.view
+                    val content = fe?.content
+                    val hasFrontend = fe != null
 
                     result.add(TabInfo(
                         content = content,
@@ -331,7 +319,28 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // Path 2: Content.displayName (visual tab label)
         tab.content?.displayName = name
 
-        // Path 3: Stable TerminalWidget API (classic terminal)
+        // Path 3: Backend renameTerminalTab (updates backend name for save/restore)
+        if (tab.reworkedTabId != null) {
+            try {
+                val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
+                val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+                if (project != null) {
+                    val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
+                    val renameMethod = tmCls.methods.find { it.name == "renameTerminalTab" }
+                    if (tm != null && renameMethod != null) {
+                        val d = CompletableDeferred<Any?>()
+                        val cont = object : kotlin.coroutines.Continuation<Any?> {
+                            override val context = kotlin.coroutines.EmptyCoroutineContext
+                            override fun resumeWith(r: Result<Any?>) { d.complete(r.getOrNull()) }
+                        }
+                        renameMethod.invoke(tm, tab.reworkedTabId, name, true, cont)
+                        LOG.info("[ClaudeTabs] Renamed via backend API: tabId=${tab.reworkedTabId}")
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Path 4: Stable TerminalWidget API (classic terminal)
         tab.widget?.terminalTitle?.change { userDefinedTitle = name }
     }
 
@@ -479,21 +488,24 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     private fun handleRename(project: Project, sessionId: String, name: String) {
-        val claudePid = findClaudePidForSession(sessionId)
-        if (claudePid == null) { LOG.info("[ClaudeTabs] RENAME: no alive Claude for session $sessionId"); return }
-        val shellPid = findShellAncestor(claudePid)
-        if (shellPid == null) { LOG.info("[ClaudeTabs] RENAME: no shell ancestor for Claude PID $claudePid"); return }
-        LOG.info("[ClaudeTabs] RENAME: session=$sessionId → Claude PID=$claudePid → shell PID=$shellPid")
-
+        // Direct match: find the tab whose Claude child has this session ID
         val tabs = getAllTabs(project)
-        val match = tabs.find { it.pid == shellPid }
-        if (match != null) {
-            LOG.info("[ClaudeTabs] RENAME: '${match.tabName}' → '$name'")
-            renameTab(match, name)
-            renamedSessions.add(sessionId)
-        } else {
-            LOG.info("[ClaudeTabs] RENAME: FAILED — shell PID $shellPid not in tabs: ${tabs.map { it.pid }}")
+
+        for (tab in tabs) {
+            val claudeProcess = findClaudeChild(tab.pid) ?: continue
+            val sf = File(SESSIONS_DIR, "${claudeProcess.pid()}.json")
+            if (!sf.exists()) continue
+            val tabSessionId = try { extractJsonString(sf.readText(), "sessionId") } catch (_: Exception) { null }
+
+            if (tabSessionId == sessionId) {
+                LOG.info("[ClaudeTabs] RENAME: '${tab.tabName}' → '$name' (session $sessionId matched tab PID ${tab.pid})")
+                renameTab(tab, name)
+                renamedSessions.add(sessionId)
+                return
+            }
         }
+
+        LOG.info("[ClaudeTabs] RENAME: no tab found for session $sessionId")
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -752,6 +764,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun deployClaudeIntegration() {
         try {
             deployResource("claude-integration/rename-tab.sh", File(CLAUDE_HOME, "rider-plugin/rename-tab.sh"))
+            deployResource("claude-integration/session-start-hook.sh", File(CLAUDE_HOME, "rider-plugin/session-start-hook.sh"))
             File(CLAUDE_HOME, "commands").mkdirs()
             deployResource("claude-integration/tab.md", File(CLAUDE_HOME, "commands/tab.md"))
             deployResource("claude-integration/clear-tabs.md", File(CLAUDE_HOME, "commands/clear-tabs.md"))
@@ -763,6 +776,40 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
 
             addPermission()
+            addSessionStartHook()
+        } catch (_: Exception) {}
+    }
+
+    private val HOOK_MARKER = "active-sessions"
+
+    private fun addSessionStartHook() {
+        val sf = File(CLAUDE_HOME, "settings.json")
+        if (!sf.exists()) return
+        try {
+            val text = sf.readText()
+            if (text.contains(HOOK_MARKER)) return // already has our hook
+
+            val hookJson = """
+                "hooks": {
+                    "SessionStart": [
+                      {
+                        "hooks": [
+                          {
+                            "type": "command",
+                            "command": "bash -c 'read INPUT; SID=${'$'}(echo \"${'$'}INPUT\" | sed \"s/.*session_id....//\" | sed \"s/\\\".*//\"); mkdir -p ~/.claude/rider-plugin/active-sessions; echo \"${'$'}SID\" > ~/.claude/rider-plugin/active-sessions/${'$'}${'$'}.sid'",
+                            "timeout": 5
+                          }
+                        ]
+                      }
+                    ]
+                  }
+            """.trimIndent()
+
+            if (!text.contains("\"hooks\"")) {
+                // No hooks section — add before closing brace
+                sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  $hookJson\n}")
+                LOG.info("[ClaudeTabs] Added SessionStart hook")
+            }
         } catch (_: Exception) {}
     }
 
