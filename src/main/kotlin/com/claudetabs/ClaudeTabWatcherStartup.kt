@@ -26,10 +26,45 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private val SESSIONS_DIR = File(CLAUDE_HOME, "sessions")
         private val TABS_DIR = File(CLAUDE_HOME, "rider-plugin/tabs")
         private val STATE_DIR = File(CLAUDE_HOME, "rider-plugin")
+        private const val CLAUDE_MD_MARKER = "<!-- rider-claude-tabs-plugin -->"
+        private const val PERMISSION_ENTRY = "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)"
+
+        /**
+         * Removes all plugin artifacts from ~/.claude.
+         * Called on plugin uninstall or via clear-tabs command.
+         */
+        @JvmStatic
+        fun uninstall() {
+            // 1. Remove CLAUDE.md section
+            val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
+            if (claudeMd.exists()) {
+                val text = claudeMd.readText()
+                if (text.contains(CLAUDE_MD_MARKER)) {
+                    val pattern = Regex("\n?${Regex.escape(CLAUDE_MD_MARKER)}.*?${Regex.escape(CLAUDE_MD_MARKER)}\n?", RegexOption.DOT_MATCHES_ALL)
+                    claudeMd.writeText(text.replace(pattern, "\n").trim() + "\n")
+                }
+            }
+
+            // 2. Remove permission entry from settings.json
+            val settings = File(CLAUDE_HOME, "settings.json")
+            if (settings.exists()) {
+                var text = settings.readText()
+                text = text.replace("\"$PERMISSION_ENTRY\", ", "")
+                    .replace(", \"$PERMISSION_ENTRY\"", "")
+                    .replace("\"$PERMISSION_ENTRY\"", "")
+                settings.writeText(text)
+            }
+
+            // 3. Remove deployed scripts and data
+            File(CLAUDE_HOME, "rider-plugin").deleteRecursively()
+            File(CLAUDE_HOME, "commands/tab.md").delete()
+            File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
+        }
     }
 
     private var pollCount = 0
     private val renamedSessions = mutableSetOf<String>()
+    private val lastAppliedName = mutableMapOf<String, String>() // sessionId → name the plugin set
     private val pendingRestores = mutableListOf<SavedSession>()
 
     override fun runActivity(project: Project) {
@@ -443,12 +478,18 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     val text = f.readText()
                     val name = extractJsonString(text, "name") ?: continue
 
-                    if (filename.startsWith("pid-")) {
+                    if (filename.startsWith("termsess-")) {
+                        // TERM_SESSION_ID-keyed file: match JetBrains terminal session → tab
+                        val termSessionId = filename.removePrefix("termsess-").removeSuffix(".json")
+                        LOG.info("[ClaudeTabs] Watcher: termsess-rename '$name' for TERM_SESSION_ID=$termSessionId")
+                        withContext(Dispatchers.Main) { handleTermSessionRename(project, termSessionId, name) }
+                        f.delete()
+                    } else if (filename.startsWith("pid-")) {
                         // PID-keyed file: walk up from script PID to find shell → tab
                         val scriptPid = filename.removePrefix("pid-").removeSuffix(".json").toLongOrNull() ?: continue
                         LOG.info("[ClaudeTabs] Watcher: PID-rename '$name' from script PID $scriptPid")
                         withContext(Dispatchers.Main) { handlePidRename(project, scriptPid, name) }
-                        f.delete() // PID files are ephemeral
+                        f.delete()
                     } else {
                         // Session-keyed file: use session ID to find Claude → shell → tab
                         val sessionId = filename.removeSuffix(".json")
@@ -482,9 +523,61 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             LOG.info("[ClaudeTabs] PID-RENAME: '${match.tabName}' → '$name'")
             renameTab(match, name)
             renamedSessions.add("pid-$scriptPid")
+            lastAppliedName["pid-$scriptPid"] = name
         } else {
             LOG.info("[ClaudeTabs] PID-RENAME: FAILED — shell PID $shellPid not in tabs: ${tabs.map { it.pid }}")
         }
+    }
+
+    /**
+     * Handle TERM_SESSION_ID-keyed rename: match the JetBrains terminal session ID
+     * to a backend tab, then rename. This is race-condition free because each terminal
+     * tab has a unique, stable TERM_SESSION_ID env var that propagates to all subprocesses.
+     */
+    private fun handleTermSessionRename(project: Project, termSessionId: String, name: String) {
+        try {
+            val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
+            val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
+            val backendTabs = tm?.let { invokeSuspend(it, tmCls.methods.find { m -> m.name == "getTerminalTabs" }!!) as? List<*> }
+            val allTabs = getAllTabs(project)
+
+            backendTabs?.forEachIndexed { index, tab ->
+                tab ?: return@forEachIndexed
+                try {
+                    val sessIdObj = tab.javaClass.getMethod("getSessionId").invoke(tab) ?: return@forEachIndexed
+                    val sessIdStr = sessIdObj.toString()
+                    LOG.info("[ClaudeTabs] TERMSESS: Tab $index sessId='$sessIdStr' vs target='$termSessionId'")
+
+                    // Match: toString() may return raw UUID or wrapped like TerminalSessionId(uuid)
+                    if (sessIdStr == termSessionId || sessIdStr.contains(termSessionId) || termSessionId.contains(sessIdStr)) {
+                        val tabInfo = allTabs.getOrNull(index)
+                        if (tabInfo != null) {
+                            LOG.info("[ClaudeTabs] TERMSESS: MATCH tab $index '${tabInfo.tabName}' → '$name'")
+                            renameTab(tabInfo, name)
+                            renamedSessions.add("termsess-$termSessionId")
+                            lastAppliedName["termsess-$termSessionId"] = name
+
+                            // Also track the Claude session ID for save/restore
+                            val claudeProcess = findClaudeChild(tabInfo.pid)
+                            if (claudeProcess != null) {
+                                val sf = File(SESSIONS_DIR, "${claudeProcess.pid()}.json")
+                                if (sf.exists()) {
+                                    val claudeSessionId = try { extractJsonString(sf.readText(), "sessionId") } catch (_: Exception) { null }
+                                    if (claudeSessionId != null) {
+                                        renamedSessions.add(claudeSessionId)
+                                        lastAppliedName[claudeSessionId] = name
+                                    }
+                                }
+                            }
+                            return
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (e: Exception) {
+            LOG.warn("[ClaudeTabs] TERMSESS: ${e.message}")
+        }
+        LOG.info("[ClaudeTabs] TERMSESS: no tab found for TERM_SESSION_ID=$termSessionId")
     }
 
     private fun handleRename(project: Project, sessionId: String, name: String) {
@@ -501,6 +594,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 LOG.info("[ClaudeTabs] RENAME: '${tab.tabName}' → '$name' (session $sessionId matched tab PID ${tab.pid})")
                 renameTab(tab, name)
                 renamedSessions.add(sessionId)
+                lastAppliedName[sessionId] = name
                 return
             }
         }
@@ -513,6 +607,19 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     // ══════════════════════════════════════════════════════════════
 
     private fun poll(project: Project) {
+        // Poll fallback: process any unhandled termsess-*.json files
+        TABS_DIR.listFiles()?.filter { it.name.startsWith("termsess-") && it.name.endsWith(".json") }?.forEach { f ->
+            try {
+                val termSessionId = f.name.removePrefix("termsess-").removeSuffix(".json")
+                if ("termsess-$termSessionId" !in renamedSessions) {
+                    val name = extractJsonString(f.readText(), "name") ?: return@forEach
+                    LOG.info("[ClaudeTabs] POLL: processing termsess file $termSessionId")
+                    handleTermSessionRename(project, termSessionId, name)
+                    f.delete()
+                }
+            } catch (_: Exception) {}
+        }
+
         val tabs = getAllTabs(project)
         val activeSessions = mutableListOf<SavedSession>()
         val claudeSessions = mutableListOf<String>()
@@ -529,6 +636,19 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
             claudeSessions.add("'${tab.tabName}'→session:${sessionId.take(8)}")
 
+            // Detect manual renames: if user changed the name from what we last set,
+            // respect their choice and don't overwrite
+            if (sessionId in renamedSessions) {
+                val lastSet = lastAppliedName[sessionId]
+                val currentName = tab.tabName ?: ""
+                if (lastSet != null && currentName != lastSet && !isGenericTabName(currentName)) {
+                    LOG.info("[ClaudeTabs] Manual rename detected: plugin set '$lastSet', now '$currentName' — respecting user choice")
+                    lastAppliedName[sessionId] = currentName  // track the manual name
+                    // Delete the rename file so we don't try again
+                    File(TABS_DIR, "$sessionId.json").delete()
+                }
+            }
+
             // Fallback rename
             if (sessionId !in renamedSessions) {
                 val renameFile = File(TABS_DIR, "$sessionId.json")
@@ -538,6 +658,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         LOG.info("[ClaudeTabs] POLL RENAME: '${tab.tabName}' → '$name'")
                         renameTab(tab, name)
                         renamedSessions.add(sessionId)
+                        lastAppliedName[sessionId] = name
                     }
                 }
             }
@@ -758,8 +879,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     // AUTO-DEPLOY
     // ══════════════════════════════════════════════════════════════
 
-    private val CLAUDE_MD_MARKER = "<!-- rider-claude-tabs-plugin -->"
-    private val PERMISSION_ENTRY = "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)"
+    // CLAUDE_MD_MARKER and PERMISSION_ENTRY are in the companion object
 
     private fun deployClaudeIntegration() {
         try {
@@ -771,8 +891,34 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
-            if (!existing.contains(CLAUDE_MD_MARKER)) {
-                claudeMd.appendText("\n$CLAUDE_MD_MARKER\n## Terminal Tab Naming (Rider Plugin)\nAt the **start of every conversation**, rename your Rider terminal tab by running:\n```bash\nbash ~/.claude/rider-plugin/rename-tab.sh \"Short Topic Name\"\n```\nIf the user explicitly tells you what to name the tab, use EXACTLY what they said. Otherwise, pick a concise name (3-5 words) that describes the conversation's purpose.\n\nThis applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.\n$CLAUDE_MD_MARKER\n")
+            val claudeMdBlock = """
+$CLAUDE_MD_MARKER
+## Terminal Tab Naming (Rider Plugin)
+At the **start of every conversation**, rename your Rider terminal tab by running:
+```bash
+bash ~/.claude/rider-plugin/rename-tab.sh "Short Topic Name"
+```
+
+**Naming priority:**
+1. If the user provides a name — in their first message, via `/tab`, or by saying "name it X", "call this X", "name this X tab" — use their **exact words** as the tab name. "name this left tab" means the name IS "left tab". Never reinterpret the user's words as a description; take them literally as the desired name.
+2. Otherwise, pick a concise name (3-5 words) that describes the conversation's purpose.
+3. Update it if the topic shifts significantly.
+
+This applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.
+$CLAUDE_MD_MARKER
+""".trimStart()
+            if (existing.contains(CLAUDE_MD_MARKER)) {
+                // Replace existing section with latest version
+                val pattern = Regex("$CLAUDE_MD_MARKER.*?$CLAUDE_MD_MARKER", RegexOption.DOT_MATCHES_ALL)
+                val updated = existing.replace(pattern, claudeMdBlock.trim())
+                if (updated != existing) {
+                    claudeMd.writeText(updated)
+                    LOG.info("[ClaudeTabs] Updated CLAUDE.md section")
+                }
+            } else {
+                // First install — append
+                claudeMd.appendText("\n$claudeMdBlock")
+                LOG.info("[ClaudeTabs] Added CLAUDE.md section")
             }
 
             addPermission()
