@@ -254,7 +254,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         if (r == kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) d.await() else r
     }
 
-    private fun renameTab(tab: TabInfo, name: String) {
+    private fun renameTab(project: Project, tab: TabInfo, name: String) {
         // Path 1: Frontend TerminalView.title (primary — updates UI directly)
         val view = tab.reworkedSession
         if (view != null) {
@@ -296,19 +296,16 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         if (tab.reworkedTabId != null) {
             try {
                 val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
-                val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-                if (project != null) {
-                    val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
-                    val renameMethod = tmCls.methods.find { it.name == "renameTerminalTab" }
-                    if (tm != null && renameMethod != null) {
-                        val d = CompletableDeferred<Any?>()
-                        val cont = object : kotlin.coroutines.Continuation<Any?> {
-                            override val context = kotlin.coroutines.EmptyCoroutineContext
-                            override fun resumeWith(r: Result<Any?>) { d.complete(r.getOrNull()) }
-                        }
-                        renameMethod.invoke(tm, tab.reworkedTabId, name, true, cont)
-                        LOG.info("[ClaudeTabs] Renamed via backend API: tabId=${tab.reworkedTabId}")
+                val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
+                val renameMethod = tmCls.methods.find { it.name == "renameTerminalTab" }
+                if (tm != null && renameMethod != null) {
+                    val d = CompletableDeferred<Any?>()
+                    val cont = object : kotlin.coroutines.Continuation<Any?> {
+                        override val context = kotlin.coroutines.EmptyCoroutineContext
+                        override fun resumeWith(r: Result<Any?>) { d.complete(r.getOrNull()) }
                     }
+                    renameMethod.invoke(tm, tab.reworkedTabId, name, true, cont)
+                    LOG.info("[ClaudeTabs] Renamed via backend API: tabId=${tab.reworkedTabId}")
                 }
             } catch (_: Exception) {}
         }
@@ -381,7 +378,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val match = tabs.find { it.pid == shellPid }
         if (match != null) {
             LOG.info("[ClaudeTabs] PID-RENAME: '${match.tabName}' → '$name'")
-            renameTab(match, name)
+            renameTab(project, match, name)
             renamedSessions.add("pid-$scriptPid")
             lastAppliedName["pid-$scriptPid"] = name
         } else {
@@ -413,7 +410,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         val tabInfo = allTabs.getOrNull(index)
                         if (tabInfo != null) {
                             LOG.info("[ClaudeTabs] TERMSESS: MATCH tab $index '${tabInfo.tabName}' → '$name'")
-                            renameTab(tabInfo, name)
+                            renameTab(project, tabInfo, name)
                             renamedSessions.add("termsess-$termSessionId")
                             lastAppliedName["termsess-$termSessionId"] = name
 
@@ -452,7 +449,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
             if (tabSessionId == sessionId) {
                 LOG.info("[ClaudeTabs] RENAME: '${tab.tabName}' → '$name' (session $sessionId matched tab PID ${tab.pid})")
-                renameTab(tab, name)
+                renameTab(project, tab, name)
                 renamedSessions.add(sessionId)
                 lastAppliedName[sessionId] = name
                 return
@@ -516,7 +513,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     val name = try { extractJsonString(renameFile.readText(), "name") } catch (_: Exception) { null }
                     if (name != null) {
                         LOG.info("[ClaudeTabs] POLL RENAME: '${tab.tabName}' → '$name'")
-                        renameTab(tab, name)
+                        renameTab(project, tab, name)
                         renamedSessions.add(sessionId)
                         lastAppliedName[sessionId] = name
                     }
@@ -602,7 +599,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
             if (match != null) {
                 val cmd = buildResumeCmd(s)
-                renameTab(match, s.tabName)
+                renameTab(project, match, s.tabName)
 
                 // Send command via createSendTextBuilder (proper API, no garbled text)
                 val view = match.reworkedSession
@@ -656,8 +653,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // Delete restore file only when ALL sessions have been restored
         if (pendingRestores.isEmpty() && restored.isNotEmpty()) {
             try {
-                val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-                if (project != null) getStateFile(project).delete()
+                getStateFile(project).delete()
             } catch (_: Exception) {}
         }
     }
@@ -704,16 +700,23 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         return null
     }
 
+    private val SHELL_NAMES = setOf(
+        "bash", "bash.exe", "sh", "sh.exe", "zsh", "fish",
+        "pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd.exe"
+    )
+
+    private fun isShellCommand(cmd: String): Boolean {
+        val name = cmd.substringAfterLast('/').substringAfterLast('\\').lowercase()
+        return name in SHELL_NAMES
+    }
+
     private fun findShellAncestor(claudePid: Long): Long? {
         var current = ProcessHandle.of(claudePid).orElse(null) ?: return null
         for (i in 0 until 5) {
             val parent = current.parent().orElse(null) ?: break
             current = parent
             val cmd = current.info().command().orElse("")
-            if (cmd.contains("bash", true) || cmd.contains("pwsh", true) ||
-                cmd.contains("powershell", true) || cmd.contains("cmd.exe", true) ||
-                cmd.contains("zsh", true) || cmd.contains("fish", true) || cmd.contains("sh", true)
-            ) return current.pid()
+            if (isShellCommand(cmd)) return current.pid()
         }
         return ProcessHandle.of(claudePid).flatMap { it.parent() }.flatMap { it.parent() }.map { it.pid() }.orElse(null)
     }
