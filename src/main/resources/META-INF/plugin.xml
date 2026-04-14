@@ -2,13 +2,24 @@
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Namer</name>
     <version>1.0.0</version>
-    <vendor>claudetabs</vendor>
+    <vendor url="https://github.com/Ragnaraven/RiderClaudeTabs">QCW</vendor>
 
     <description><![CDATA[
     Auto-renames Rider/IntelliJ terminal tabs to match the active Claude Code chat name.
     Detects Claude Code processes in terminal tabs, reads the conversation topic from
     session files, and updates tab titles. Supports multiple concurrent Claude sessions.
     ]]></description>
+
+    <change-notes><![CDATA[
+    <b>1.0.0</b>
+    <ul>
+      <li>Auto-rename terminal tabs to match Claude Code conversation topic</li>
+      <li>Session save/restore across IDE restarts</li>
+      <li>Race-condition-free rename via TERM_SESSION_ID mapping</li>
+      <li>SessionStart hook with automatic context injection</li>
+      <li>/tab and /clear-tabs slash commands for Claude Code</li>
+    </ul>
+    ]]></change-notes>
 
     <depends>com.intellij.modules.platform</depends>
     <depends>org.jetbrains.plugins.terminal</depends>

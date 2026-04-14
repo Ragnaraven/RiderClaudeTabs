@@ -114,4 +114,4 @@ IDE startup                    →    reads restore file
 
 ## License
 
-MIT
+[MPL-2.0](LICENSE) — free for personal and commercial use; modifications to source files must remain MPL-2.0.
