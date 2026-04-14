@@ -835,7 +835,7 @@ $CLAUDE_MD_MARKER
             if (text.contains("\"allow\"")) {
                 sf.writeText(text.replace(Regex(""""allow"\s*:\s*\["""), "\"allow\": [\"$PERMISSION_ENTRY\", "))
             } else if (text.contains("\"permissions\"")) {
-                // permissions exists but no allow
+                sf.writeText(text.replace(Regex(""""permissions"\s*:\s*\{"""), "\"permissions\": {\n    \"allow\": [\"$PERMISSION_ENTRY\"],"))
             } else {
                 sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  \"permissions\": {\n    \"allow\": [\"$PERMISSION_ENTRY\"]\n  }\n}")
             }
