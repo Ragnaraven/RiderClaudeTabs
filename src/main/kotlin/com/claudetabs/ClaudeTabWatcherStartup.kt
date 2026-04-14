@@ -789,14 +789,15 @@ $CLAUDE_MD_MARKER
         } catch (_: Exception) {}
     }
 
-    private val HOOK_MARKER = "active-sessions"
+    private val HOOK_MARKER = "session-start-hook.sh"
+    private val HOOK_MARKER_LEGACY = "active-sessions"
 
     private fun addSessionStartHook() {
         val sf = File(CLAUDE_HOME, "settings.json")
         if (!sf.exists()) return
         try {
             val text = sf.readText()
-            if (text.contains(HOOK_MARKER)) return // already has our hook
+            if (text.contains(HOOK_MARKER) || text.contains(HOOK_MARKER_LEGACY)) return
 
             val hookJson = """
                 "hooks": {
@@ -805,7 +806,7 @@ $CLAUDE_MD_MARKER
                         "hooks": [
                           {
                             "type": "command",
-                            "command": "bash -c 'read INPUT; SID=${'$'}(echo \"${'$'}INPUT\" | sed \"s/.*session_id....//\" | sed \"s/\\\".*//\"); mkdir -p ~/.claude/rider-plugin/active-sessions; echo \"${'$'}SID\" > ~/.claude/rider-plugin/active-sessions/${'$'}${'$'}.sid'",
+                            "command": "bash ~/.claude/rider-plugin/session-start-hook.sh",
                             "timeout": 5
                           }
                         ]
@@ -815,11 +816,12 @@ $CLAUDE_MD_MARKER
             """.trimIndent()
 
             if (!text.contains("\"hooks\"")) {
-                // No hooks section — add before closing brace
                 sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  $hookJson\n}")
                 LOG.info("[ClaudeTabs] Added SessionStart hook")
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Hook install failed: ${e.message}")
+        }
     }
 
     private fun addPermission() {
