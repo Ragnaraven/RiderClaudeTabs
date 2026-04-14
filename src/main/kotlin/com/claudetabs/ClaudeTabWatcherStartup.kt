@@ -81,7 +81,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // File watcher for instant renames
         scope.launch {
             delay(2_000)
-            try { watchTabsDirectory(project) } catch (_: Exception) {}
+            try { watchTabsDirectory(project) } catch (e: Exception) { LOG.debug("[ClaudeTabs] Watcher failed: ${e.message}") }
         }
 
         // Main poll loop
@@ -133,7 +133,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val feMgrCls = Class.forName("com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager")
             val feMgr = feMgrCls.getMethod("getInstance", Project::class.java).invoke(null, project)
             val feTabs = feMgr?.javaClass?.getMethod("getTabs")?.invoke(feMgr) as? List<*>
-            LOG.info("[ClaudeTabs] STEP 1: Frontend has ${feTabs?.size ?: 0} tabs")
+            if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 1: Frontend has ${feTabs?.size ?: 0} tabs")
 
             feTabs?.forEach { feTab ->
                 feTab ?: return@forEach
@@ -143,7 +143,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     frontendTabs.add(FrontendEntry(view, content))
                 } catch (_: Exception) {}
             }
-            LOG.info("[ClaudeTabs] STEP 2: Frontend tabs: ${frontendTabs.size}, names: ${frontendTabs.map { it.content?.displayName ?: "?" }}")
+            if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 2: Frontend tabs: ${frontendTabs.size}, names: ${frontendTabs.map { it.content?.displayName ?: "?" }}")
         } catch (_: ClassNotFoundException) {}
         catch (_: Exception) {}
 
@@ -152,7 +152,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
             val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
             val tabs = tm?.let { invokeSuspend(it, tmCls.methods.find { m -> m.name == "getTerminalTabs" }!!) as? List<*> }
-            LOG.info("[ClaudeTabs] STEP 3: Backend has ${tabs?.size ?: 0} tabs")
+            if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 3: Backend has ${tabs?.size ?: 0} tabs")
 
             val smCls = Class.forName("com.intellij.terminal.backend.TerminalSessionsManager")
             val sm = smCls.getMethod("getInstance").invoke(null)
@@ -199,13 +199,15 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     }
                 } catch (_: Exception) {}
             }
-            LOG.info("[ClaudeTabs] STEP 3a: Backend all names: $backendNames")
-            LOG.info("[ClaudeTabs] STEP 3b: Backend with PIDs: $backendWithPids")
-            if (backendNoSession.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 3c: Backend no session/pid: $backendNoSession")
+            if (pollCount % 12 == 0) {
+                LOG.info("[ClaudeTabs] STEP 3a: Backend all names: $backendNames")
+                LOG.info("[ClaudeTabs] STEP 3b: Backend with PIDs: $backendWithPids")
+                if (backendNoSession.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 3c: Backend no session/pid: $backendNoSession")
+            }
         } catch (_: ClassNotFoundException) {}
         catch (_: Exception) {}
 
-        LOG.info("[ClaudeTabs] STEP 4: Total: ${result.size} → ${result.map { "'${it.tabName}'→PID${it.pid}" }}")
+        if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 4: Total: ${result.size} → ${result.map { "'${it.tabName}'→PID${it.pid}" }}")
         return result
     }
 
@@ -529,10 +531,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             activeSessions.add(SavedSession(sessionId, cwd, title, bypass))
         }
 
-        if (claudeSessions.isNotEmpty()) {
-            LOG.info("[ClaudeTabs] STEP 6: Claude sessions found: $claudeSessions")
+        if (pollCount % 12 == 0) {
+            if (claudeSessions.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 6: Claude sessions found: $claudeSessions")
+            LOG.info("[ClaudeTabs] STEP 7: Saving ${activeSessions.size} active session(s)")
         }
-        LOG.info("[ClaudeTabs] STEP 7: Saving ${activeSessions.size} active session(s)")
         saveState(project, activeSessions)
     }
 
@@ -558,7 +560,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 sb.append("\n")
             }
             sb.append("]"); f.writeText(sb.toString())
-        } catch (_: Exception) {}
+        } catch (e: Exception) { LOG.debug("[ClaudeTabs] Save state failed: ${e.message}") }
     }
 
     private fun loadRestoreFile(project: Project) {
@@ -786,7 +788,7 @@ $CLAUDE_MD_MARKER
 
             addPermission()
             addSessionStartHook()
-        } catch (_: Exception) {}
+        } catch (e: Exception) { LOG.warn("[ClaudeTabs] Deploy failed: ${e.message}") }
     }
 
     private val HOOK_MARKER = "session-start-hook.sh"
@@ -837,11 +839,11 @@ $CLAUDE_MD_MARKER
             } else {
                 sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  \"permissions\": {\n    \"allow\": [\"$PERMISSION_ENTRY\"]\n  }\n}")
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) { LOG.debug("[ClaudeTabs] Permission install failed: ${e.message}") }
     }
 
     private fun deployResource(path: String, target: File) {
-        try { javaClass.classLoader.getResourceAsStream(path)?.let { target.parentFile?.mkdirs(); target.writeBytes(it.readBytes()) } } catch (_: Exception) {}
+        try { javaClass.classLoader.getResourceAsStream(path)?.let { target.parentFile?.mkdirs(); target.writeBytes(it.readBytes()) } } catch (e: Exception) { LOG.debug("[ClaudeTabs] Deploy resource failed: $path — ${e.message}") }
     }
 
     // ══════════════════════════════════════════════════════════════
