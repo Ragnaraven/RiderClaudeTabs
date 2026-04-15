@@ -28,6 +28,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private val STATE_DIR = File(CLAUDE_HOME, "rider-plugin")
         private const val CLAUDE_MD_MARKER = "<!-- rider-claude-tabs-plugin -->"
         private const val PERMISSION_ENTRY = "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)"
+        private val HISTORY_FILE = File(CLAUDE_HOME, "rider-plugin/history.json")
+        private const val HISTORY_MAX_AGE_MS = 90L * 24 * 60 * 60 * 1000 // 90 days
 
         /**
          * Removes all plugin artifacts from ~/.claude.
@@ -60,6 +62,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             File(CLAUDE_HOME, "commands/tab.md").delete()
             File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
             File(CLAUDE_HOME, "commands/restore-tabs.md").delete()
+            File(CLAUDE_HOME, "commands/tab-history.md").delete()
         }
     }
 
@@ -67,6 +70,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private val renamedSessions = mutableSetOf<String>()
     private val lastAppliedName = mutableMapOf<String, String>() // sessionId → name the plugin set
     private val pendingRestores = mutableListOf<SavedSession>()
+    private val previousActive = mutableMapOf<String, SavedSession>() // sessionId → last known state
 
     override fun runActivity(project: Project) {
         LOG.info("[ClaudeTabs] Started for: ${project.name}")
@@ -536,6 +540,18 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             if (claudeSessions.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 6: Claude sessions found: $claudeSessions")
             LOG.info("[ClaudeTabs] STEP 7: Saving ${activeSessions.size} active session(s)")
         }
+
+        // Detect closed sessions and write to history
+        val currentIds = activeSessions.map { it.sessionId }.toSet()
+        for ((id, session) in previousActive) {
+            if (id !in currentIds) {
+                appendToHistory(session)
+                LOG.info("[ClaudeTabs] Session closed, saved to history: '${session.tabName}'")
+            }
+        }
+        previousActive.clear()
+        for (s in activeSessions) previousActive[s.sessionId] = s
+
         saveState(project, activeSessions)
     }
 
@@ -544,6 +560,43 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     // ══════════════════════════════════════════════════════════════
 
     data class SavedSession(val sessionId: String, val cwd: String, val tabName: String, val bypassPermissions: Boolean)
+
+    private fun appendToHistory(session: SavedSession) {
+        try {
+            val now = System.currentTimeMillis()
+            val entries = loadHistory().toMutableList()
+
+            // Don't duplicate — update if same sessionId exists
+            entries.removeAll { extractJsonString(it, "sessionId") == session.sessionId }
+
+            val entry = "{\"sessionId\":\"${esc(session.sessionId)}\",\"cwd\":\"${esc(session.cwd)}\",\"tabName\":\"${esc(session.tabName)}\",\"bypassPermissions\":${session.bypassPermissions},\"closedAt\":$now}"
+            entries.add(entry)
+
+            // Prune entries older than 90 days
+            val cutoff = now - HISTORY_MAX_AGE_MS
+            val pruned = entries.filter { raw ->
+                val ts = Regex(""""closedAt":(\d+)""").find(raw)?.groupValues?.get(1)?.toLongOrNull()
+                ts != null && ts > cutoff
+            }
+
+            HISTORY_FILE.parentFile?.mkdirs()
+            val sb = StringBuilder("[\n")
+            pruned.forEachIndexed { i, e ->
+                sb.append("  $e")
+                if (i < pruned.size - 1) sb.append(",")
+                sb.append("\n")
+            }
+            sb.append("]")
+            HISTORY_FILE.writeText(sb.toString())
+        } catch (e: Exception) { LOG.debug("[ClaudeTabs] History write failed: ${e.message}") }
+    }
+
+    private fun loadHistory(): List<String> {
+        if (!HISTORY_FILE.exists()) return emptyList()
+        return try {
+            Regex("""\{[^}]+\}""").findAll(HISTORY_FILE.readText()).map { it.value }.toList()
+        } catch (_: Exception) { emptyList() }
+    }
 
     private fun getStateFile(project: Project): File {
         val h = (project.basePath ?: "default").replace("\\", "/").replace(":/", "--").replace("/", "-")
@@ -755,6 +808,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             deployResource("claude-integration/tab.md", File(CLAUDE_HOME, "commands/tab.md"))
             deployResource("claude-integration/clear-tabs.md", File(CLAUDE_HOME, "commands/clear-tabs.md"))
             deployResource("claude-integration/restore-tabs.md", File(CLAUDE_HOME, "commands/restore-tabs.md"))
+            deployResource("claude-integration/tab-history.md", File(CLAUDE_HOME, "commands/tab-history.md"))
 
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
