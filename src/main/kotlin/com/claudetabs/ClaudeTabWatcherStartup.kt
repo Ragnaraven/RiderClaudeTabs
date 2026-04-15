@@ -79,7 +79,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         Disposer.register(project as Disposable, Disposable {
-            LOG.info("[ClaudeTabs] Project closing")
+            LOG.info("[ClaudeTabs] Project closing — saving ${previousActive.size} session(s) to history")
+            for ((_, session) in previousActive) {
+                appendToHistory(session)
+            }
+            previousActive.clear()
             scope.cancel()
         })
 
