@@ -59,6 +59,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             File(CLAUDE_HOME, "rider-plugin").deleteRecursively()
             File(CLAUDE_HOME, "commands/tab.md").delete()
             File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
+            File(CLAUDE_HOME, "commands/restore-tabs.md").delete()
         }
     }
 
@@ -753,6 +754,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             File(CLAUDE_HOME, "commands").mkdirs()
             deployResource("claude-integration/tab.md", File(CLAUDE_HOME, "commands/tab.md"))
             deployResource("claude-integration/clear-tabs.md", File(CLAUDE_HOME, "commands/clear-tabs.md"))
+            deployResource("claude-integration/restore-tabs.md", File(CLAUDE_HOME, "commands/restore-tabs.md"))
 
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
