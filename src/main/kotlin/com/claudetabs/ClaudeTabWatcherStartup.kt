@@ -857,9 +857,7 @@ $CLAUDE_MD_MARKER
             val text = sf.readText()
             if (text.contains(HOOK_MARKER) || text.contains(HOOK_MARKER_LEGACY)) return
 
-            val hookJson = """
-                "hooks": {
-                    "SessionStart": [
+            val hookEntry = """
                       {
                         "hooks": [
                           {
@@ -869,13 +867,21 @@ $CLAUDE_MD_MARKER
                           }
                         ]
                       }
-                    ]
-                  }
             """.trimIndent()
 
             if (!text.contains("\"hooks\"")) {
+                // No hooks section at all — add the entire block
+                val hookJson = "\"hooks\": {\n    \"SessionStart\": [\n      $hookEntry\n    ]\n  }"
                 sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  $hookJson\n}")
-                LOG.info("[ClaudeTabs] Added SessionStart hook")
+                LOG.info("[ClaudeTabs] Added hooks section with SessionStart hook")
+            } else if (!text.contains("\"SessionStart\"")) {
+                // Has hooks but no SessionStart — add SessionStart array
+                sf.writeText(text.replace(Regex(""""hooks"\s*:\s*\{"""), "\"hooks\": {\n    \"SessionStart\": [\n      $hookEntry\n    ],"))
+                LOG.info("[ClaudeTabs] Added SessionStart hook to existing hooks")
+            } else {
+                // Has SessionStart but our hook isn't in it — append to the array
+                sf.writeText(text.replace(Regex(""""SessionStart"\s*:\s*\["""), "\"SessionStart\": [\n      $hookEntry,"))
+                LOG.info("[ClaudeTabs] Appended hook to existing SessionStart array")
             }
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs] Hook install failed: ${e.message}")
