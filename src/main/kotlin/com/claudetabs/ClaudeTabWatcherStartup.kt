@@ -639,9 +639,18 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
                     // Match: toString() may return raw UUID or wrapped like TerminalSessionId(uuid)
                     if (sessIdStr == termSessionId || sessIdStr.contains(termSessionId) || termSessionId.contains(sessIdStr)) {
-                        val tabInfo = allTabs.getOrNull(index)
+                        // Match backend tab to our TabInfo via the stable backend tab ID.
+                        // (Using iteration index breaks off-by-one when any backend tab has no
+                        // PID and is filtered out of getAllTabs — see issue where rename landed
+                        // on the wrong tab, one position off.)
+                        val backendTabId = tab.javaClass.getMethod("getId").invoke(tab) as? Int
+                        val tabInfo = if (backendTabId != null) {
+                            allTabs.find { it.reworkedTabId == backendTabId }
+                        } else {
+                            allTabs.getOrNull(index)  // very old fallback
+                        }
                         if (tabInfo != null) {
-                            LOG.info("[ClaudeTabs] TERMSESS: MATCH tab $index '${tabInfo.tabName}' → '$name'")
+                            LOG.info("[ClaudeTabs] TERMSESS: MATCH tab $index (backendId=$backendTabId) '${tabInfo.tabName}' → '$name'")
                             renameTab(project, tabInfo, name)
                             renamedSessions.add("termsess-$termSessionId")
                             lastAppliedName["termsess-$termSessionId"] = name
@@ -659,6 +668,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                                 }
                             }
                             return
+                        } else {
+                            LOG.warn("[ClaudeTabs] TERMSESS: matched backend tab (id=$backendTabId) but no TabInfo with that id in allTabs")
                         }
                     }
                 } catch (e: Exception) {
