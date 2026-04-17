@@ -10,6 +10,9 @@ repositories {
     mavenCentral()
 }
 
+// Target IntelliJ Platform 2024.3 for wide compatibility.
+// Tested on Rider 2026.1. Build number 243 = 2024.3; higher-numbered builds stay compatible
+// since untilBuild is left empty (see patchPluginXml).
 intellij {
     version.set("2024.3")
     type.set("IC")
@@ -19,7 +22,8 @@ intellij {
 tasks {
     patchPluginXml {
         sinceBuild.set("243")
-        // No untilBuild — compatible with all future versions
+        // Empty untilBuild = forward-compatible with future IntelliJ versions.
+        // plugin.xml declares the same via <idea-version since-build="243"/>.
         untilBuild.set("")
     }
 

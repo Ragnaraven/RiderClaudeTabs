@@ -2,24 +2,55 @@
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Namer</name>
     <version>1.0.0</version>
-    <vendor url="https://github.com/Ragnaraven/RiderClaudeTabs">QCW</vendor>
+    <vendor url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
-    Auto-renames Rider/IntelliJ terminal tabs to match the active Claude Code chat name.
-    Detects Claude Code processes in terminal tabs, reads the conversation topic from
-    session files, and updates tab titles. Supports multiple concurrent Claude sessions.
+    <h2>Claude Terminal Tab Namer for Rider / IntelliJ</h2>
+
+    <p>Auto-renames terminal tabs to match the active <a href="https://claude.com/claude-code">Claude Code</a>
+    conversation, so you can juggle multiple Claude sessions without losing track of which tab is which.</p>
+
+    <h3>Features</h3>
+    <ul>
+      <li><b>Auto-rename terminal tabs</b> based on the Claude conversation topic (or a name you give it)</li>
+      <li><b>Race-condition-free</b> identification of each tab via <code>TERM_SESSION_ID</code> mapping</li>
+      <li><b>Session save/restore</b> across IDE restarts — your named tabs come back</li>
+      <li><b>Session history</b> — browse and resume past Claude sessions with <code>/tabs-history</code></li>
+      <li><b>Respects manual renames</b> — if you rename a tab yourself, the plugin backs off</li>
+    </ul>
+
+    <h3>Slash Commands (installed into ~/.claude/commands/)</h3>
+    <ul>
+      <li><code>/tab &lt;name&gt;</code> — rename current tab and snapshot to history</li>
+      <li><code>/tabs-status</code> — report of all active Claude sessions</li>
+      <li><code>/tabs-backup</code> — manually snapshot current sessions to history</li>
+      <li><code>/tabs-history</code> — browse and resume past sessions</li>
+      <li><code>/tabs-restore</code> — restore saved sessions from last close</li>
+      <li><code>/tabs-clear</code> — clear the rename cache</li>
+    </ul>
+
+    <p><b>Requirements:</b> Rider / IntelliJ 2024.3+ with the bundled Terminal plugin, and
+    <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a> installed. Currently Windows-focused
+    (the session-detection logic uses <code>tasklist</code>); macOS / Linux compatibility is in progress.</p>
     ]]></description>
 
     <change-notes><![CDATA[
-    <b>1.0.0</b>
+    <h3>1.0.0 — Initial release</h3>
     <ul>
       <li>Auto-rename terminal tabs to match Claude Code conversation topic</li>
       <li>Session save/restore across IDE restarts</li>
-      <li>Race-condition-free rename via TERM_SESSION_ID mapping</li>
-      <li>SessionStart hook with automatic context injection</li>
-      <li>/tab and /clear-tabs slash commands for Claude Code</li>
+      <li>Race-condition-free rename via TERM_SESSION_ID → session-ID mapping</li>
+      <li>SessionStart hook writes per-tab mapping files (no shared FIFO queue)</li>
+      <li>Manual renames are detected and respected — plugin backs off after user edit</li>
+      <li>Slash commands: <code>/tab</code>, <code>/tabs-status</code>, <code>/tabs-backup</code>,
+        <code>/tabs-history</code>, <code>/tabs-restore</code>, <code>/tabs-clear</code></li>
+      <li>Auto-install: plugin deploys scripts, commands, CLAUDE.md section, and permissions on startup</li>
+      <li>Clean uninstall: removes all deployed artifacts when the plugin is uninstalled</li>
     </ul>
     ]]></change-notes>
+
+    <!-- IntelliJ Platform 2024.3 (build 243) and newer. No untilBuild — forward compatible. -->
+    <idea-version since-build="243"/>
 
     <depends>com.intellij.modules.platform</depends>
     <depends>org.jetbrains.plugins.terminal</depends>

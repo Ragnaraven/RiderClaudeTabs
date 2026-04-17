@@ -5,52 +5,45 @@ Similar output to what you'd see when asking "what tabs do I have open", but str
 1. Run this to display the report:
 
 ```bash
-# Find a working Python (skip Windows Store stubs)
-PY=""
-for candidate in python py python3; do
-  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" --version >/dev/null 2>&1; then
-    PY="$candidate"; break
-  fi
-done
-if [ -z "$PY" ]; then echo "No working Python found"; exit 1; fi
+node - <<'EOF'
+const fs = require('fs'), path = require('path'), os = require('os');
+const home = path.join(os.homedir(), '.claude', 'rider-plugin');
 
-"$PY" - <<'PYEOF'
-import json, os, glob
-home = os.path.expanduser('~/.claude/rider-plugin')
+const restoreFiles = fs.existsSync(home)
+  ? fs.readdirSync(home).filter(f => f.startsWith('restore-') && f.endsWith('.json')).sort()
+  : [];
 
-restore_files = sorted(glob.glob(os.path.join(home, 'restore-*.json')))
-if not restore_files:
-    print('No active Claude sessions tracked.')
-    raise SystemExit
+if (!restoreFiles.length) {
+  console.log('No active Claude sessions tracked.');
+  process.exit(0);
+}
 
-total = 0
-for rf in restore_files:
-    try:
-        with open(rf) as f:
-            sessions = json.load(f)
-    except Exception:
-        continue
-    if not sessions:
-        continue
+let total = 0;
+for (const rf of restoreFiles) {
+  let sessions;
+  try { sessions = JSON.parse(fs.readFileSync(path.join(home, rf), 'utf8')); }
+  catch { continue; }
+  if (!sessions.length) continue;
 
-    project_key = os.path.basename(rf).removeprefix('restore-').removesuffix('.json')
-    sep = chr(92)
-    sample_cwd = sessions[0].get('cwd', '').replace(sep, '/').rstrip('/')
-    project_name = sample_cwd.split('/')[-1] if sample_cwd else project_key
-
-    print(f'=== {project_name} ({len(sessions)} tab{"s" if len(sessions) != 1 else ""}) ===')
-    print(f'    {sample_cwd}')
-    print()
-    for i, s in enumerate(sessions, 1):
-        bypass = ' [bypass]' if s.get('bypassPermissions') else ''
-        sid = s.get('sessionId', '?')[:12]
-        print(f'  {i}. {s.get("tabName", "?")}{bypass}')
-        print(f'     session: {sid}...')
-    print()
-    total += len(sessions)
-
-print(f'Total: {total} active session(s) across {len(restore_files)} project(s).')
-PYEOF
+  // Build backslash from char code to avoid shell-escape issues in heredocs
+  const BS = String.fromCharCode(92);
+  const sampleCwd = (sessions[0].cwd || '').split(BS).join('/').replace(/\/+$/, '');
+  const projectName = sampleCwd.split('/').pop() || rf;
+  const plural = sessions.length === 1 ? '' : 's';
+  console.log(`=== ${projectName} (${sessions.length} tab${plural}) ===`);
+  console.log(`    ${sampleCwd}`);
+  console.log('');
+  sessions.forEach((s, i) => {
+    const bypass = s.bypassPermissions ? ' [bypass]' : '';
+    const sid = (s.sessionId || '?').slice(0, 12);
+    console.log(`  ${i + 1}. ${s.tabName || '?'}${bypass}`);
+    console.log(`     session: ${sid}...`);
+  });
+  console.log('');
+  total += sessions.length;
+}
+console.log(`Total: ${total} active session(s) across ${restoreFiles.length} project(s).`);
+EOF
 ```
 
 2. Show the user the output.

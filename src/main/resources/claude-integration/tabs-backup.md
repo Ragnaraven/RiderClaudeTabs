@@ -1,78 +1,63 @@
-Manually snapshot currently-active Claude sessions into history.json so they appear in /tab-history.
+Manually snapshot currently-active Claude sessions into history.json so they appear in /tabs-history.
 
 Useful when you want to checkpoint your sessions without closing Rider or waiting for tabs to close naturally.
 
 1. Run this to append all currently-active sessions from restore files into history.json:
 
 ```bash
-# Find a working Python (skip Windows Store stubs)
-PY=""
-for candidate in python py python3; do
-  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" --version >/dev/null 2>&1; then
-    PY="$candidate"; break
-  fi
-done
-if [ -z "$PY" ]; then echo "No working Python found"; exit 1; fi
+node - <<'EOF'
+const fs = require('fs'), path = require('path'), os = require('os');
+const home = path.join(os.homedir(), '.claude', 'rider-plugin');
+const historyPath = path.join(home, 'history.json');
 
-"$PY" - <<'PYEOF'
-import json, time, os, glob
-home = os.path.expanduser('~/.claude/rider-plugin')
-history_path = os.path.join(home, 'history.json')
+let history = [];
+if (fs.existsSync(historyPath)) {
+  try { history = JSON.parse(fs.readFileSync(historyPath, 'utf8')); }
+  catch { history = []; }
+}
 
-history = []
-if os.path.exists(history_path):
-    try:
-        with open(history_path) as f:
-            history = json.load(f)
-    except Exception:
-        history = []
+let active = [];
+if (fs.existsSync(home)) {
+  for (const f of fs.readdirSync(home).filter(n => n.startsWith('restore-') && n.endsWith('.json'))) {
+    try { active.push(...JSON.parse(fs.readFileSync(path.join(home, f), 'utf8'))); }
+    catch {}
+  }
+}
 
-active = []
-for f in glob.glob(os.path.join(home, 'restore-*.json')):
-    try:
-        with open(f) as fp:
-            active.extend(json.load(fp))
-    except Exception:
-        pass
+if (!active.length) {
+  console.log('No active sessions to back up.');
+  process.exit(0);
+}
 
-if not active:
-    print('No active sessions to back up.')
-else:
-    now = int(time.time() * 1000)
-    added = 0
-    updated = 0
-    for s in active:
-        sid = s.get('sessionId')
-        if not sid:
-            continue
-        before = len(history)
-        history = [e for e in history if e.get('sessionId') != sid]
-        was_present = len(history) < before
-        entry = {
-            'sessionId': sid,
-            'cwd': s.get('cwd', ''),
-            'tabName': s.get('tabName', ''),
-            'bypassPermissions': s.get('bypassPermissions', False),
-            'closedAt': now,
-            'backedUp': True,
-        }
-        history.append(entry)
-        if was_present:
-            updated += 1
-        else:
-            added += 1
+const now = Date.now();
+let added = 0, updated = 0;
+for (const s of active) {
+  const sid = s.sessionId;
+  if (!sid) continue;
+  const wasPresent = history.some(e => e.sessionId === sid);
+  history = history.filter(e => e.sessionId !== sid);
+  history.push({
+    sessionId: sid,
+    cwd: s.cwd || '',
+    tabName: s.tabName || '',
+    bypassPermissions: !!s.bypassPermissions,
+    closedAt: now,
+    backedUp: true,
+  });
+  if (wasPresent) updated++; else added++;
+}
 
-    cutoff = now - 90 * 24 * 60 * 60 * 1000
-    history = [e for e in history if e.get('closedAt', 0) > cutoff]
+// Prune entries older than 90 days
+const cutoff = now - 90 * 24 * 60 * 60 * 1000;
+history = history.filter(e => (e.closedAt || 0) > cutoff);
 
-    os.makedirs(home, exist_ok=True)
-    with open(history_path, 'w') as f:
-        json.dump(history, f, indent=2)
+fs.mkdirSync(home, { recursive: true });
+fs.writeFileSync(historyPath, JSON.stringify(history, null, 2));
 
-    print(f'Backup complete: {added} new, {updated} updated, {len(history)} total in history.')
-    print('')
-    print('Run /tab-history to browse all sessions.')
-PYEOF
+console.log(`Backup complete: ${added} new, ${updated} updated, ${history.length} total in history.`);
+console.log('');
+console.log('Run /tabs-history to browse all sessions.');
+EOF
 ```
 
 2. Show the output to the user.
