@@ -75,8 +75,65 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Long-term session history — one JSON entry per closed/backed-up session. */
         private val HISTORY_FILE = File(CLAUDE_HOME, "rider-plugin/history.json")
 
-        /** Entries older than this are pruned on every append. 90 days. */
-        private const val HISTORY_MAX_AGE_MS = 90L * 24 * 60 * 60 * 1000
+        /** Rotating snapshots of restore-*.json — one per successful non-empty save. */
+        private val SNAPSHOTS_DIR = File(CLAUDE_HOME, "rider-plugin/snapshots")
+
+        /**
+         * User-overridable config file. Read once at startup (see [loadConfig]). Defaults
+         * below are used when the file is missing or a field is malformed. Users can create
+         * or edit this file to change retention policies without recompiling the plugin.
+         */
+        private val CONFIG_FILE = File(CLAUDE_HOME, "rider-plugin/config.json")
+
+        // ── Live config (loaded from CONFIG_FILE; defaults apply if not overridden). ──
+
+        /** History entries older than this are pruned on every append. Default: 90 days. */
+        var historyMaxAgeMs: Long = 90L * 24 * 60 * 60 * 1000
+            private set
+
+        /** How many recent snapshots to retain per project. Default: 10. */
+        var snapshotKeepCount: Int = 10
+            private set
+
+        /**
+         * Load [CONFIG_FILE] and apply any recognised fields, falling back to defaults for
+         * anything missing or malformed. Accepted fields:
+         *   - `historyMaxAgeDays` — integer (converted to ms internally)
+         *   - `snapshotKeepCount` — integer
+         */
+        private fun loadConfig() {
+            if (!CONFIG_FILE.exists()) return
+            try {
+                val text = CONFIG_FILE.readText()
+                Regex(""""historyMaxAgeDays"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()?.let {
+                    if (it > 0) historyMaxAgeMs = it * 24 * 60 * 60 * 1000
+                }
+                Regex(""""snapshotKeepCount"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull()?.let {
+                    if (it >= 0) snapshotKeepCount = it
+                }
+                LOG.info("[ClaudeTabs] Config loaded: historyMaxAgeDays=${historyMaxAgeMs / (24*60*60*1000)}, snapshotKeepCount=$snapshotKeepCount")
+            } catch (e: Exception) {
+                LOG.warn("[ClaudeTabs] Config load failed (using defaults): ${e.message}")
+            }
+        }
+
+        /** Write a commented template config.json if the file doesn't exist yet. */
+        private fun maybeWriteConfigTemplate() {
+            if (CONFIG_FILE.exists()) return
+            try {
+                CONFIG_FILE.parentFile?.mkdirs()
+                CONFIG_FILE.writeText(
+                    """{
+  "_comment": "Claude Terminal Tab Namer — edit values and restart Rider to apply.",
+  "historyMaxAgeDays": 90,
+  "snapshotKeepCount": 10
+}
+"""
+                )
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] Config template write failed: ${e.message}")
+            }
+        }
 
         /**
          * Removes all plugin artifacts from ~/.claude.
@@ -143,6 +200,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     override fun runActivity(project: Project) {
         LOG.info("[ClaudeTabs] Started for: ${project.name}")
         TABS_DIR.mkdirs()
+        maybeWriteConfigTemplate()
+        loadConfig()
         deployClaudeIntegration()
 
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -761,7 +820,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * Append (or update) a session entry in history.json.
      *
      * Called when a tab closes (or when the IDE is shutting down) to preserve the session so the user
-     * can browse/resume it later via `/tabs-history`. Entries older than [HISTORY_MAX_AGE_MS] are pruned.
+     * can browse/resume it later via `/tabs-history`. Entries older than [historyMaxAgeMs] are pruned.
      *
      * Thread-safe: wrapped in [historyLock] because the poll loop, file watcher, and project-close
      * disposable can all call this concurrently.
@@ -777,8 +836,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val entry = "{\"sessionId\":\"${esc(session.sessionId)}\",\"cwd\":\"${esc(session.cwd)}\",\"tabName\":\"${esc(session.tabName)}\",\"bypassPermissions\":${session.bypassPermissions},\"closedAt\":$now}"
             entries.add(entry)
 
-            // Prune entries older than HISTORY_MAX_AGE_MS (90 days).
-            val cutoff = now - HISTORY_MAX_AGE_MS
+            // Prune entries older than configured retention window.
+            val cutoff = now - historyMaxAgeMs
             val pruned = entries.filter { raw ->
                 val ts = Regex(""""closedAt":(\d+)""").find(raw)?.groupValues?.get(1)?.toLongOrNull()
                 ts != null && ts > cutoff
@@ -814,44 +873,128 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
     }
 
-    private fun getStateFile(project: Project): File {
-        val h = (project.basePath ?: "default").replace("\\", "/").replace(":/", "--").replace("/", "-")
-        return File(STATE_DIR, "restore-$h.json")
+    /** Stable hash of the project path, used as the suffix for restore/snapshot file names. */
+    private fun projectHash(project: Project): String =
+        (project.basePath ?: "default").replace("\\", "/").replace(":/", "--").replace("/", "-")
+
+    private fun getStateFile(project: Project): File = File(STATE_DIR, "restore-${projectHash(project)}.json")
+
+    /**
+     * List this project's snapshot files in the snapshots dir, newest first (by filename —
+     * filenames are `<projectHash>-<timestampMs>.json` so lexical order = chronological order).
+     */
+    private fun listSnapshots(project: Project): List<File> {
+        val prefix = "${projectHash(project)}-"
+        return SNAPSHOTS_DIR.listFiles()
+            ?.filter { it.name.startsWith(prefix) && it.name.endsWith(".json") }
+            ?.sortedByDescending { it.name }
+            ?: emptyList()
     }
 
+    /**
+     * Write a timestamped snapshot of [content] (already-serialised JSON array) to the snapshots
+     * dir, then prune older snapshots beyond [snapshotKeepCount]. Silently best-effort — if this
+     * fails the user still has the live restore file and history.json.
+     */
+    private fun writeSnapshot(project: Project, content: String) {
+        if (snapshotKeepCount <= 0) return  // user disabled snapshots entirely
+        try {
+            SNAPSHOTS_DIR.mkdirs()
+            val file = File(SNAPSHOTS_DIR, "${projectHash(project)}-${System.currentTimeMillis()}.json")
+            file.writeText(content)
+
+            // Prune older snapshots beyond the retention window.
+            val existing = listSnapshots(project)
+            if (existing.size > snapshotKeepCount) {
+                existing.drop(snapshotKeepCount).forEach { old ->
+                    try { old.delete() } catch (_: Exception) { /* best effort */ }
+                }
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Snapshot write failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Write [sessions] to the project's restore file, overwriting the previous content.
+     *
+     * Important: if [sessions] is empty AND there are still [pendingRestores] waiting to be
+     * placed, we leave the file alone. Otherwise the restore file can get wiped on the first
+     * poll after startup — before terminal tabs have spawned Claude processes — destroying
+     * the saved state we just loaded a second ago.
+     */
     private fun saveState(project: Project, sessions: List<SavedSession>) {
         val f = getStateFile(project)
         try {
-            if (sessions.isEmpty()) { f.delete(); return }
+            if (sessions.isEmpty()) {
+                if (pendingRestores.isNotEmpty()) {
+                    // Restore hasn't finished yet — don't wipe the file we're still consuming.
+                    return
+                }
+                f.delete(); return
+            }
             val sb = StringBuilder("[\n")
             sessions.forEachIndexed { i, s ->
                 sb.append("  {\"sessionId\":\"${esc(s.sessionId)}\",\"cwd\":\"${esc(s.cwd)}\",\"tabName\":\"${esc(s.tabName)}\",\"bypassPermissions\":${s.bypassPermissions}}")
                 if (i < sessions.size - 1) sb.append(",")
                 sb.append("\n")
             }
-            sb.append("]"); f.writeText(sb.toString())
-        } catch (e: Exception) { LOG.debug("[ClaudeTabs] Save state failed: ${e.message}") }
+            sb.append("]")
+            val content = sb.toString()
+            f.writeText(content)
+
+            // Capture a timestamped snapshot so a later wipe (crash mid-save, poll races, etc.)
+            // can't lose the last known-good state.
+            writeSnapshot(project, content)
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Save state failed: ${e.message}")
+        }
     }
 
+    /**
+     * Load the project's restore file into [pendingRestores]. If the live file is missing,
+     * empty, or an empty array, fall back to the most recent non-empty snapshot from
+     * [SNAPSHOTS_DIR]. This protects against:
+     *   - Previous poll wiping the file (pre-fix bug).
+     *   - Crashes during save that leave an empty or truncated file.
+     *   - Accidental deletion by the user or external tools.
+     */
     private fun loadRestoreFile(project: Project) {
-        val f = getStateFile(project)
-        if (!f.exists()) return
-        try {
-            val json = f.readText().trim()
-            if (json.isEmpty() || json == "[]") return
-            for (m in Regex("""\{[^}]+\}""").findAll(json)) {
-                val o = m.value
-                pendingRestores.add(SavedSession(
-                    extractJsonString(o, "sessionId") ?: continue,
-                    extractJsonString(o, "cwd") ?: continue,
-                    extractJsonString(o, "tabName") ?: continue,
-                    o.contains("\"bypassPermissions\":true")
-                ))
+        val sources = mutableListOf<File>().apply {
+            val live = getStateFile(project)
+            if (live.exists()) add(live)
+            addAll(listSnapshots(project))  // newest → oldest
+        }
+
+        for ((index, source) in sources.withIndex()) {
+            try {
+                val json = source.readText().trim()
+                if (json.isEmpty() || json == "[]") continue
+
+                val loadedBefore = pendingRestores.size
+                for (m in Regex("""\{[^}]+\}""").findAll(json)) {
+                    val o = m.value
+                    pendingRestores.add(SavedSession(
+                        extractJsonString(o, "sessionId") ?: continue,
+                        extractJsonString(o, "cwd") ?: continue,
+                        extractJsonString(o, "tabName") ?: continue,
+                        o.contains("\"bypassPermissions\":true")
+                    ))
+                }
+
+                if (pendingRestores.size > loadedBefore) {
+                    val provenance = if (index == 0) "live restore file" else "snapshot (${source.name})"
+                    LOG.info("[ClaudeTabs] ${pendingRestores.size} session(s) to restore from $provenance")
+                    // Don't delete yet — delete after all restores complete
+                    return
+                }
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] Restore source ${source.name} parse failed (trying next): ${e.message}")
             }
-            if (pendingRestores.isNotEmpty()) LOG.info("[ClaudeTabs] ${pendingRestores.size} session(s) to restore")
-            // Don't delete yet — delete after all restores complete
-        } catch (e: Exception) {
-            LOG.debug("[ClaudeTabs] Restore file parse failed: ${e.message}")
+        }
+
+        if (sources.isNotEmpty()) {
+            LOG.info("[ClaudeTabs] No non-empty restore source found (${sources.size} candidates checked)")
         }
     }
 
