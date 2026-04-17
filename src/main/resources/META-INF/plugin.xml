@@ -2,7 +2,7 @@
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Namer</name>
     <version>1.0.0</version>
-    <vendor url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
+    <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
     <h2>Claude Terminal Tab Namer for Rider / IntelliJ</h2>
