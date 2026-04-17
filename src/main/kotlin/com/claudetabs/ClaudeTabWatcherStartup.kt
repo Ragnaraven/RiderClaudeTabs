@@ -471,7 +471,44 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      *
      * All four are attempted; individual failures are logged at DEBUG and don't abort the others.
      */
+    /**
+     * True if [newName] is close enough to [currentName] that renaming is just churn.
+     *
+     * Used to skip redundant renames on `claude --resume` (where Claude's CLAUDE.md
+     * instruction triggers a fresh rename with a similar-but-not-identical name).
+     *
+     * Rules:
+     *  - Current empty/generic → never redundant (always allow the rename).
+     *  - Exact match (case-insensitive, whitespace-normalised) → redundant.
+     *  - Word-set overlap ≥ 0.6 (Jaccard) when both have ≥ 2 words → redundant.
+     */
+    private fun isRenameRedundant(currentName: String?, newName: String): Boolean {
+        if (currentName.isNullOrBlank() || isGenericTabName(currentName)) return false
+        val norm: (String) -> String = { it.trim().lowercase().replace(Regex("\\s+"), " ") }
+        if (norm(currentName) == norm(newName)) return true
+
+        val tokens: (String) -> Set<String> = { s ->
+            s.lowercase()
+                .replace(Regex("[^a-z0-9 ]"), " ")
+                .split(Regex("\\s+"))
+                .filter { it.length > 1 }
+                .toSet()
+        }
+        val cur = tokens(currentName)
+        val new = tokens(newName)
+        if (cur.size < 2 || new.size < 2) return false
+        val intersection = cur.intersect(new).size.toDouble()
+        val union = cur.union(new).size.toDouble()
+        val jaccard = if (union == 0.0) 0.0 else intersection / union
+        return jaccard >= 0.6
+    }
+
     private fun renameTab(project: Project, tab: TabInfo, name: String) {
+        if (isRenameRedundant(tab.tabName, name)) {
+            LOG.info("[ClaudeTabs] Skipping redundant rename '${tab.tabName}' → '$name'")
+            return
+        }
+
         // Path 1: Frontend TerminalView.title (primary — updates UI directly)
         val view = tab.reworkedSession
         if (view != null) {

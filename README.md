@@ -16,14 +16,14 @@ Everything else (scripts, commands, CLAUDE.md section, permissions) is set up on
 
 ## Slash commands
 
-```
-/tab My Topic         Rename this tab, snapshot to history
-/tabs-status          Show all active sessions
-/tabs-backup          Snapshot current sessions to history
-/tabs-history         List past sessions, resume any
-/tabs-restore         Show what will auto-restore on next start
-/tabs-clear           Clear the rename cache
-```
+| Command | What it does |
+|---|---|
+| `/tab [name]` | Renames this tab and snapshots it to history. If no name is given, Claude picks one (3–5 words) based on the current conversation. |
+| `/tabs-status` | Shows every active Claude session grouped by project, with session IDs. |
+| `/tabs-backup` | Writes currently-active sessions into history so you can resume them later, without waiting for the tab to close. |
+| `/tabs-history` | Numbered list of past closed/backed-up sessions (newest first). Pick one to resume. |
+| `/tabs-restore` | Shows what's in the auto-restore file (the set of tabs that will come back next Rider start). |
+| `/tabs-clear` | Clears the rename cache and per-project restore files. Doesn't touch history. |
 
 ## Config
 
@@ -64,7 +64,7 @@ Plugins page → Uninstall → restart. All deployed files are removed.
 
 ## License
 
-[MPL-2.0](LICENSE)
+Licensed under the [Mozilla Public License 2.0](LICENSE). Free for personal and commercial use. You can modify, distribute, and bundle it; changes to MPL-covered files must remain under MPL-2.0 and be made available, but proprietary code that *uses* the plugin is unaffected.
 
 ## Issues / PRs
 
