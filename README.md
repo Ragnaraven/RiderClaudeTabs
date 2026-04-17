@@ -1,117 +1,160 @@
 # Claude Terminal Tab Namer
 
-A JetBrains Rider/IntelliJ plugin that auto-renames terminal tabs running [Claude Code](https://claude.ai/claude-code) and restores sessions across IDE restarts.
+A JetBrains Rider / IntelliJ plugin that names terminal tabs to match the [Claude Code](https://claude.com/claude-code) conversation running inside them — so you can juggle multiple Claude sessions without losing track of which tab is which.
+
+---
 
 ## Features
 
-- **Tab Renaming** — Claude Code names its own terminal tab via a simple bash command. The plugin detects the rename request and updates the tab title.
-- **Session Restore** — When Rider closes, active Claude sessions are saved. On restart, the plugin claims the existing terminal tab and runs `claude --resume` to pick up where you left off.
-- **Permission Preservation** — `--dangerously-skip-permissions` is automatically included on restore if your Claude settings have `skipDangerousModePermissionPrompt` enabled.
+### Tab naming that actually works with multiple Claude sessions
+- **Race-condition free** — each tab is identified via JetBrains' `TERM_SESSION_ID` env var, mapped to the Claude session ID at session start. No shared queues, no guessing, no cross-wired tabs when you `/tab` two conversations at the same time.
+- **Manual rename priority** — if you rename a tab yourself in the Rider UI, the plugin detects it and backs off. Your name wins.
+- **Instant** — a file watcher picks up renames immediately; no polling delay.
 
-## How It Works
+### Session restore across IDE restarts
+- Every named tab is saved to `~/.claude/rider-plugin/restore-<project>.json` as you work.
+- On restart, the plugin finds your tabs and runs `claude --resume <id>` in each one — no duplicate tabs, no retyping.
+- `--dangerously-skip-permissions` is preserved per session (so bypass-mode tabs come back the same way).
 
-### Tab Naming
+### Crash resilience
+- Every successful save also writes a timestamped snapshot to `~/.claude/rider-plugin/snapshots/`.
+- If Rider crashes or the live restore file is wiped, startup falls back through snapshots (newest first) so your last known-good state is preserved.
+- Retention (N snapshots per project) is configurable.
 
-Claude Code writes a rename request file:
+### Long-term session history
+- Closed sessions are auto-appended to `~/.claude/rider-plugin/history.json` (last 90 days by default).
+- Browse and resume any past session with `/tabs-history`.
 
-```bash
-bash ~/.claude/rider-plugin/rename-tab.sh "My Topic Name"
-```
+### Zero-config install
+- Drops all integration files (`rename-tab.sh`, `session-start-hook.sh`, slash commands, CLAUDE.md section, permission entry in `settings.json`) on first startup.
+- Updates them automatically when you update the plugin.
+- Clean uninstall — removes every deployed artifact when you remove the plugin.
 
-The plugin watches `~/.claude/rider-plugin/tabs/` for these files, matches the session ID to a terminal tab (via process tree detection), and renames it.
+---
 
-### Session Restore
+## Slash commands
 
-1. While running, the plugin saves active Claude sessions to `~/.claude/rider-plugin/restore-{project}.json`
-2. On IDE restart, Rider reopens empty terminal tabs with the same names
-3. The plugin claims those tabs by writing `claude --resume {sessionId}` directly into their shell
-4. No duplicate tabs — the existing tab is reused
+These are installed automatically into `~/.claude/commands/`:
 
-### Claude Code Integration
+| Command | What it does |
+|---|---|
+| `/tab <name>` | Renames the current tab **and** snapshots it to history. No name = pick one from conversation context. |
+| `/tabs-status` | Report of every active Claude session, grouped by project. |
+| `/tabs-backup` | Manually snapshot currently-active sessions into history (checkpoint without closing). |
+| `/tabs-history` | Numbered list of past sessions (newest first). Pick one to resume via `claude --resume`. |
+| `/tabs-restore` | Show currently-saved sessions from the restore files (what would auto-restore next Rider start). |
+| `/tabs-clear` | Clear the tab rename cache and restore files. |
 
-Add this to your global `~/.claude/CLAUDE.md`:
+All commands use **Node.js** (which ships with Claude Code) — no Python dependency.
 
-```markdown
-## Terminal Tab Naming (Rider Plugin)
-At the **start of every conversation**, rename your Rider terminal tab by running:
-\```bash
-bash ~/.claude/rider-plugin/rename-tab.sh "Short Topic Name"
-\```
-Pick a concise name (3-5 words) that describes the conversation's purpose.
-Update it if the topic shifts significantly. The Rider plugin auto-detects Claude sessions,
-applies the name, and restores sessions on Rider restart.
-
-This applies to **new chats, resumed chats** (`--resume`), **and `/resume`**.
-On resume, re-use the previous tab name if the topic hasn't changed.
-```
-
-### `/tab` Slash Command
-
-For legacy or missed chats, users can manually rename with:
-
-```
-/tab My Topic Name
-```
-
-If no name is given, Claude picks one based on the conversation. Install by copying `commands/tab.md` to `~/.claude/commands/tab.md`.
+---
 
 ## Installation
 
-### Build from Source
+### From the JetBrains Marketplace
+**Settings → Plugins → Marketplace → search "Claude Terminal Tab Namer" → Install → restart Rider.**
 
-Requires JDK 17+ and Gradle (wrapper included).
+That's it. The plugin auto-installs all integration files on first project open.
+
+### From source
+Requires JDK 17 and the Gradle wrapper (included).
 
 ```bash
-cd rider-claude-tabs
 ./gradlew buildPlugin
 ```
 
-Output: `build/distributions/rider-claude-tabs-1.0.0.zip`
+Then **Settings → Plugins → gear icon → Install Plugin from Disk...** → pick `build/distributions/rider-claude-tabs-1.0.0.zip`.
 
-### Install in Rider
+---
 
-1. **Settings** → **Plugins** → gear icon → **Install Plugin from Disk...**
-2. Select the ZIP file
-3. Restart Rider
+## Configuration
 
-### Setup
+Optional. The plugin creates `~/.claude/rider-plugin/config.json` with defaults on first run:
 
-1. Copy `rename-tab.sh` to `~/.claude/rider-plugin/rename-tab.sh`
-2. Add the Claude Code integration snippet to `~/.claude/CLAUDE.md`
-3. Copy `commands/tab.md` to `~/.claude/commands/tab.md` for the `/tab` slash command
+```json
+{
+  "historyMaxAgeDays": 90,
+  "snapshotKeepCount": 10
+}
+```
+
+- `historyMaxAgeDays` — how long closed sessions stay in `/tabs-history`.
+- `snapshotKeepCount` — how many restore snapshots to retain per project. Set to `0` to disable snapshots.
+
+Edit and restart Rider to apply.
+
+---
+
+## How it works
+
+### Tab naming flow
+
+```
+SessionStart hook              rename-tab.sh                plugin
+─────────────────              ─────────────                ──────
+TERM_SESSION_ID + sessId  →    TERM_SESSION_ID lookup  →    file watcher sees
+write session-map/<UUID>       finds sessId                 {sessId}.json
+                               writes {sessId}.json   →     matches tab by
+                                                            Claude process tree
+                                                            renames via terminal API
+```
+
+Each terminal tab has a unique, stable `TERM_SESSION_ID` injected by JetBrains. The `SessionStart` hook maps that to the Claude session ID in a per-tab file. When `rename-tab.sh` runs inside a specific tab, it reads the right session ID from its own map file — no shared state, no collisions.
+
+### Restore flow
+
+```
+shutdown                    startup
+────────                    ───────
+poll() saves state      →   loadRestoreFile() loads sessions into memory
+  → restore-<proj>.json       → fall back to newest snapshot if live file is empty
+  + snapshot to              → processPendingRestores() matches saved names
+    snapshots/<proj>-<ts>       to the shell tabs JetBrains restored
+                             → sendText("claude --resume <id>") into each one
+                             → saveState() re-writes restore file with live sessions
+```
+
+### Files the plugin writes
+All under `~/.claude/rider-plugin/`:
+
+| Path | Purpose |
+|---|---|
+| `rename-tab.sh`, `session-start-hook.sh` | Shell integration (auto-deployed) |
+| `tabs/{sessionId}.json` | Rename directives from scripts → plugin |
+| `session-map/{TERM_SESSION_ID}` | Per-tab map to Claude session ID |
+| `restore-<project>.json` | Current named-tab state (auto-restore target) |
+| `snapshots/<project>-<ts>.json` | Rolling snapshots of the restore file |
+| `history.json` | Closed/backed-up sessions (90d default) |
+| `config.json` | User-overridable retention settings |
+
+---
 
 ## Compatibility
 
-- JetBrains Rider 2024.3+ (tested on 2026.1)
-- JetBrains IntelliJ IDEA 2024.3+
-- Windows (primary), macOS/Linux (should work but untested)
-- Uses the Reworked Terminal API (2025.2+) with legacy fallback
+- **JetBrains Rider 2024.3+** (build 243, tested on 2026.1)
+- **JetBrains IntelliJ IDEA 2024.3+**
+- **Windows** (primary) — full process-tree detection via `tasklist`
+- **macOS / Linux** — shell scripts use `kill -0` fallback for liveness; main rename path works identically since it's Claude Code/Node-driven
+- Supports both the **reworked terminal API** (2024.3+) and the **classic terminal widget** (older). Graceful fallback when one is unavailable.
 
-## Architecture
+---
 
-```
-Claude Code                          Rider Plugin
-───────────                          ────────────
-bash rename-tab.sh "Topic"    →    watches ~/.claude/rider-plugin/tabs/
-  writes {sessionId}.json            reads rename request
-                                     matches sessionId → Claude PID → shell PID → tab
-                                     renames tab via ContentManager
+## Uninstall
 
-IDE shutdown                   →    saves active sessions to restore file
+Plugin uninstall removes everything the plugin installed:
+- CLAUDE.md section between plugin markers
+- Permission entry from `settings.json`
+- All files under `~/.claude/rider-plugin/`
+- All `/tab` and `/tabs-*` command files
 
-IDE startup                    →    reads restore file
-                                     finds stale tab by name
-                                     writes "claude --resume {id}" into its tty
-                                     session continues in same tab
-```
+Manually: **Settings → Plugins → find "Claude Terminal Tab Namer" → Uninstall → restart.**
 
-### Key Implementation Details
-
-- **Process detection**: Walks the terminal shell's child process tree to find Claude Code (`node` running `claude`)
-- **PID extraction**: Reflects into `StateAwareTerminalSession → delegate → BackendTerminalSessionImpl → ttyConnector → ProcessTtyConnector → Process.pid()`
-- **Rename**: Sets both `Content.displayName` (visual) and calls `TerminalTabsManager.renameTerminalTab()` (internal state) via reflection
-- **Suspend functions**: JetBrains' reworked terminal API uses Kotlin coroutines; invoked via `runBlocking` + manual `Continuation`
+---
 
 ## License
 
-[MPL-2.0](LICENSE) — free for personal and commercial use; modifications to source files must remain MPL-2.0.
+[MPL-2.0](LICENSE). Free for personal and commercial use; source modifications must remain MPL-2.0.
+
+## Contributing / Issues
+
+File an issue or PR at [github.com/Ragnaraven/RiderClaudeTabs](https://github.com/Ragnaraven/RiderClaudeTabs).
