@@ -33,7 +33,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
         /**
          * Removes all plugin artifacts from ~/.claude.
-         * Called on plugin uninstall or via clear-tabs command.
+         * Called on plugin uninstall or via /tabs-clear command.
          */
         @JvmStatic
         fun uninstall() {
@@ -60,9 +60,16 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // 3. Remove deployed scripts and data
             File(CLAUDE_HOME, "rider-plugin").deleteRecursively()
             File(CLAUDE_HOME, "commands/tab.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-clear.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-restore.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-history.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-backup.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-status.md").delete()
+            // Legacy command filenames (pre-rename)
             File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
             File(CLAUDE_HOME, "commands/restore-tabs.md").delete()
             File(CLAUDE_HOME, "commands/tab-history.md").delete()
+            File(CLAUDE_HOME, "commands/backup-tabs.md").delete()
         }
     }
 
@@ -810,9 +817,16 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             deployResource("claude-integration/session-start-hook.sh", File(CLAUDE_HOME, "rider-plugin/session-start-hook.sh"))
             File(CLAUDE_HOME, "commands").mkdirs()
             deployResource("claude-integration/tab.md", File(CLAUDE_HOME, "commands/tab.md"))
-            deployResource("claude-integration/clear-tabs.md", File(CLAUDE_HOME, "commands/clear-tabs.md"))
-            deployResource("claude-integration/restore-tabs.md", File(CLAUDE_HOME, "commands/restore-tabs.md"))
-            deployResource("claude-integration/tab-history.md", File(CLAUDE_HOME, "commands/tab-history.md"))
+            deployResource("claude-integration/tabs-clear.md", File(CLAUDE_HOME, "commands/tabs-clear.md"))
+            deployResource("claude-integration/tabs-restore.md", File(CLAUDE_HOME, "commands/tabs-restore.md"))
+            deployResource("claude-integration/tabs-history.md", File(CLAUDE_HOME, "commands/tabs-history.md"))
+            deployResource("claude-integration/tabs-backup.md", File(CLAUDE_HOME, "commands/tabs-backup.md"))
+            deployResource("claude-integration/tabs-status.md", File(CLAUDE_HOME, "commands/tabs-status.md"))
+            // Cleanup old command filenames (pre-rename)
+            File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
+            File(CLAUDE_HOME, "commands/restore-tabs.md").delete()
+            File(CLAUDE_HOME, "commands/tab-history.md").delete()
+            File(CLAUDE_HOME, "commands/backup-tabs.md").delete()
 
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
