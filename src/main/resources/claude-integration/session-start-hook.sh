@@ -1,7 +1,25 @@
 #!/bin/bash
-# SessionStart hook — maps TERM_SESSION_ID → Claude session ID
-# and injects a tab-rename reminder into the conversation context.
-# Each terminal tab gets its own mapping file — no shared queue, no race condition.
+# ─────────────────────────────────────────────────────────────────────
+# session-start-hook.sh — Claude Code SessionStart hook
+# ─────────────────────────────────────────────────────────────────────
+# Claude invokes this hook when a new session begins, passing the session
+# metadata as JSON on stdin. We extract the session_id and record the
+# mapping TERM_SESSION_ID → session_id.
+#
+# Why the mapping exists:
+#   The rename-tab.sh script knows TERM_SESSION_ID (a JetBrains per-tab
+#   UUID in the environment) but not the Claude session ID. The plugin
+#   watches for rename files named "{sessionId}.json". This hook bridges
+#   the two: each tab writes its own unique mapping file, so the rename
+#   script can look up the correct session ID without any shared state
+#   or FIFO queue — eliminating the race condition that caused tabs to
+#   cross-wire when multiple instances called /tab simultaneously.
+#
+# Files written:
+#   ~/.claude/rider-plugin/session-map/{TERM_SESSION_ID} → session_id
+#   ~/.claude/rider-plugin/session-queue/{timestamp}    → session_id
+#     (legacy queue kept for back-compat with older rename-tab.sh versions)
+# ─────────────────────────────────────────────────────────────────────
 
 INPUT=$(cat)
 SID=$(echo "$INPUT" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
@@ -10,21 +28,16 @@ if [ -n "$SID" ]; then
   MAP_DIR="$HOME/.claude/rider-plugin/session-map"
   mkdir -p "$MAP_DIR"
 
+  # Primary: per-tab mapping — race-condition free
   TERM_SID="${TERM_SESSION_ID}"
   if [ -n "$TERM_SID" ]; then
-    # Race-condition free: each tab writes to its own unique file
     echo "$SID" > "$MAP_DIR/$TERM_SID"
   fi
 
-  # Also keep the queue for backwards compatibility with old rename-tab.sh
+  # Legacy queue — kept so older rename-tab.sh versions keep working
+  # across a plugin upgrade. New code paths should prefer the map above.
   QUEUE_DIR="$HOME/.claude/rider-plugin/session-queue"
   mkdir -p "$QUEUE_DIR"
   TIMESTAMP=$(date +%s%N 2>/dev/null || date +%s)
   echo "$SID" > "$QUEUE_DIR/$TIMESTAMP"
 fi
-
-# Inject a tab-rename reminder into Claude's conversation context.
-# This fires on every session start/resume, ensuring Claude never forgets.
-cat <<'HOOK_JSON'
-{"additionalContext":"RIDER TAB RENAME REQUIRED: Your FIRST action in this conversation MUST be to run: bash ~/.claude/rider-plugin/rename-tab.sh \"Topic Name\" — Pick a concise 3-5 word name based on the user's message. Do this BEFORE any other tool calls or responses. This is a blocking requirement."}
-HOOK_JSON

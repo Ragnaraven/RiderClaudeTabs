@@ -1,3 +1,4 @@
+<!-- Canonical source: src/main/resources/claude-integration/tab.md (deployed from JAR). Keep in sync. -->
 Rename your Rider terminal tab by running:
 
 ```bash

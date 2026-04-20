@@ -17,21 +17,123 @@ import java.io.File
 import java.io.FileReader
 import java.nio.file.*
 
+/**
+ * Entry point for the Claude Terminal Tab Namer plugin.
+ *
+ * This is a JetBrains IntelliJ Platform post-startup activity. When a project opens, it:
+ *
+ *  1. **Deploys** its bash integration (`rename-tab.sh`, `session-start-hook.sh`), slash commands,
+ *     a CLAUDE.md section, and permission/settings entries into `~/.claude/`.
+ *  2. **Watches** `~/.claude/rider-plugin/tabs/` for `{sessionId}.json` rename files written by the
+ *     bash scripts when the user runs `/tab` or any other command that names a terminal tab.
+ *  3. **Polls** the terminal tool window every [POLL_INTERVAL_MS] to:
+ *     - Match Claude Code processes to their terminal tab (by walking each tab's PID tree).
+ *     - Apply any pending renames.
+ *     - Save the set of named tabs to a per-project restore file.
+ *     - Detect closed sessions and append them to `history.json` for `/tabs-history`.
+ *  4. **Restores** saved tabs after a Rider restart — typing `claude --resume <id>` into each
+ *     matching idle terminal.
+ *
+ * ### Design notes
+ *
+ * - **Reflection-heavy**: navigates IntelliJ's reworked (and classic) terminal internals because
+ *   the public API doesn't expose what's needed. Fallback paths are graceful — see [renameTab].
+ * - **Race-condition free**: tab identification uses JetBrains' `TERM_SESSION_ID` env var, which
+ *   is unique per terminal tab. The `session-start-hook.sh` writes the mapping
+ *   `TERM_SESSION_ID → Claude session ID` per-tab, so no shared FIFO queue is needed.
+ * - **Manual-rename priority**: if the user renames a tab themselves, [lastAppliedName] lets us
+ *   detect it and back off — we won't overwrite their choice.
+ *
+ * See `plugin.xml` for Marketplace metadata and `README.md` for user-facing docs.
+ */
 class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
     companion object {
         private val LOG = Logger.getInstance(ClaudeTabWatcherStartup::class.java)
+
+        /** Poll cadence for detecting rename files and session state changes. */
         private const val POLL_INTERVAL_MS = 5_000L
+
+        /** Root of Claude Code's user data (scripts, sessions, commands live under this). */
         private val CLAUDE_HOME = File(System.getProperty("user.home"), ".claude")
+
+        /** Where Claude Code writes `{PID}.json` session files. Read-only for the plugin. */
         private val SESSIONS_DIR = File(CLAUDE_HOME, "sessions")
+
+        /** Where bash scripts drop `{sessionId}.json` rename directives for the plugin to pick up. */
         private val TABS_DIR = File(CLAUDE_HOME, "rider-plugin/tabs")
+
+        /** Where per-project restore files (`restore-<projectPath>.json`) and `history.json` live. */
         private val STATE_DIR = File(CLAUDE_HOME, "rider-plugin")
+
+        /** Markers wrapping the plugin's section of `~/.claude/CLAUDE.md` so it can be replaced cleanly. */
         private const val CLAUDE_MD_MARKER = "<!-- rider-claude-tabs-plugin -->"
+
+        /** Permission line inserted into `~/.claude/settings.json` so Claude can run our rename script. */
         private const val PERMISSION_ENTRY = "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)"
+
+        /** Long-term session history — one JSON entry per closed/backed-up session. */
+        private val HISTORY_FILE = File(CLAUDE_HOME, "rider-plugin/history.json")
+
+        /** Rotating snapshots of restore-*.json — one per successful non-empty save. */
+        private val SNAPSHOTS_DIR = File(CLAUDE_HOME, "rider-plugin/snapshots")
+
+        /**
+         * User-overridable config file. Read once at startup (see [loadConfig]). Defaults
+         * below are used when the file is missing or a field is malformed. Users can create
+         * or edit this file to change retention policies without recompiling the plugin.
+         */
+        private val CONFIG_FILE = File(CLAUDE_HOME, "rider-plugin/config.json")
+
+        // ── Live config (loaded from CONFIG_FILE; defaults apply if not overridden). ──
+
+        /** History entries older than this are pruned on every append. Default: 90 days. */
+        var historyMaxAgeMs: Long = 90L * 24 * 60 * 60 * 1000
+            private set
+
+        /** How many recent snapshots to retain per project. Default: 10. */
+        var snapshotKeepCount: Int = 10
+            private set
+
+        /**
+         * Load [CONFIG_FILE] and apply any recognised fields, falling back to defaults for
+         * anything missing or malformed. Accepted fields:
+         *   - `historyMaxAgeDays` — integer (converted to ms internally)
+         *   - `snapshotKeepCount` — integer
+         */
+        private fun loadConfig() {
+            if (!CONFIG_FILE.exists()) return
+            try {
+                val cfg = ClaudeTabsHelpers.parseConfig(CONFIG_FILE.readText())
+                historyMaxAgeMs = cfg.historyMaxAgeMs
+                snapshotKeepCount = cfg.snapshotKeepCount
+                LOG.info("[ClaudeTabs] Config loaded: historyMaxAgeDays=${historyMaxAgeMs / (24*60*60*1000)}, snapshotKeepCount=$snapshotKeepCount")
+            } catch (e: Exception) {
+                LOG.warn("[ClaudeTabs] Config load failed (using defaults): ${e.message}")
+            }
+        }
+
+        /** Write a commented template config.json if the file doesn't exist yet. */
+        private fun maybeWriteConfigTemplate() {
+            if (CONFIG_FILE.exists()) return
+            try {
+                CONFIG_FILE.parentFile?.mkdirs()
+                CONFIG_FILE.writeText(
+                    """{
+  "_comment": "Claude Terminal Tab Namer — edit values and restart Rider to apply.",
+  "historyMaxAgeDays": 90,
+  "snapshotKeepCount": 10
+}
+"""
+                )
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] Config template write failed: ${e.message}")
+            }
+        }
 
         /**
          * Removes all plugin artifacts from ~/.claude.
-         * Called on plugin uninstall or via clear-tabs command.
+         * Called on plugin uninstall or via /tabs-clear command.
          */
         @JvmStatic
         fun uninstall() {
@@ -58,30 +160,60 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // 3. Remove deployed scripts and data
             File(CLAUDE_HOME, "rider-plugin").deleteRecursively()
             File(CLAUDE_HOME, "commands/tab.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-clear.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-restore.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-history.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-backup.md").delete()
+            File(CLAUDE_HOME, "commands/tabs-status.md").delete()
+            // Legacy command filenames (pre-rename)
             File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
+            File(CLAUDE_HOME, "commands/restore-tabs.md").delete()
+            File(CLAUDE_HOME, "commands/tab-history.md").delete()
+            File(CLAUDE_HOME, "commands/backup-tabs.md").delete()
         }
     }
 
     private var pollCount = 0
     private val renamedSessions = mutableSetOf<String>()
-    private val lastAppliedName = mutableMapOf<String, String>() // sessionId → name the plugin set
+    /** Last name the plugin itself applied to each session. If the current tab name diverges from
+     * this, we infer the user manually renamed the tab and back off — see [poll]. */
+    private val lastAppliedName = mutableMapOf<String, String>()
+
+    /** Sessions loaded from the project's restore file, waiting for an idle tab to be restored into. */
     private val pendingRestores = mutableListOf<SavedSession>()
 
+    /** Sessions we've seen active at least once this run. Used to detect closures and write history. */
+    private val previousActive = mutableMapOf<String, SavedSession>()
+
+    /**
+     * IntelliJ entry point. Fires once per project open. Starts two coroutines:
+     *  - a [java.nio.file.WatchService] on the tabs dir for instant renames
+     *  - a main poll loop that does rename fallback + state save + history tracking
+     *
+     * The project [Disposable] ensures both coroutines shut down on project close, and any
+     * still-active sessions get written to history for later browsing.
+     */
     override fun runActivity(project: Project) {
         LOG.info("[ClaudeTabs] Started for: ${project.name}")
         TABS_DIR.mkdirs()
+        maybeWriteConfigTemplate()
+        loadConfig()
         deployClaudeIntegration()
 
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         Disposer.register(project as Disposable, Disposable {
-            LOG.info("[ClaudeTabs] Project closing")
+            LOG.info("[ClaudeTabs] Project closing — saving ${previousActive.size} session(s) to history")
+            for ((_, session) in previousActive) {
+                appendToHistory(session)
+            }
+            previousActive.clear()
             scope.cancel()
         })
 
         // File watcher for instant renames
         scope.launch {
             delay(2_000)
-            try { watchTabsDirectory(project) } catch (_: Exception) {}
+            try { watchTabsDirectory(project) } catch (e: Exception) { LOG.debug("[ClaudeTabs] Watcher failed: ${e.message}") }
         }
 
         // Main poll loop
@@ -114,15 +246,31 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     // TERMINAL TAB ACCESS — stable API, all panels
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * A unified view of a single terminal tab across IntelliJ's two terminal backends:
+     *  - **Classic** terminal (`TerminalWidget` via `TerminalToolWindowManager`) — [widget] set, [content] set.
+     *  - **Reworked** terminal (2024.3+ split-panel aware) — [reworkedSession] + [reworkedTabId] set.
+     *
+     * Exactly one of the two paths will be populated, depending on which backend is active for
+     * this particular tab. [pid] is the shell process PID (PowerShell / bash / cmd) at the root
+     * of the tab — we walk its children with [findClaudeChild] to find the Claude process.
+     */
     data class TabInfo(
         val content: Content?,              // null for reworked API tabs (split panels)
         val widget: TerminalWidget?,        // null when using reworked API
         val pid: Long,
         val reworkedSession: Any? = null,   // reworked session for PID/command access
-        val reworkedTabId: Int? = null,      // for renameTerminalTab()
+        val reworkedTabId: Int? = null,     // for renameTerminalTab()
         val tabName: String = ""            // current tab name
     )
 
+    /**
+     * Enumerate every terminal tab in the project's terminal tool window.
+     *
+     * Uses reflection on both the reworked and classic terminal APIs; tabs from both paths are
+     * merged into a single list of [TabInfo] entries with their PIDs resolved. Silent on API drift
+     * (see `LOG.debug` messages) so one backend missing doesn't block the other.
+     */
     private fun getAllTabs(project: Project): List<TabInfo> {
         val result = mutableListOf<TabInfo>()
 
@@ -133,7 +281,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val feMgrCls = Class.forName("com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager")
             val feMgr = feMgrCls.getMethod("getInstance", Project::class.java).invoke(null, project)
             val feTabs = feMgr?.javaClass?.getMethod("getTabs")?.invoke(feMgr) as? List<*>
-            LOG.info("[ClaudeTabs] STEP 1: Frontend has ${feTabs?.size ?: 0} tabs")
+            if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 1: Frontend has ${feTabs?.size ?: 0} tabs")
 
             feTabs?.forEach { feTab ->
                 feTab ?: return@forEach
@@ -141,18 +289,23 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     val content = feTab.javaClass.getMethod("getContent").invoke(feTab) as? Content
                     val view = feTab.javaClass.getMethod("getView").invoke(feTab) ?: return@forEach
                     frontendTabs.add(FrontendEntry(view, content))
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    LOG.debug("[ClaudeTabs] frontend tab access failed: ${e.message}")
+                }
             }
-            LOG.info("[ClaudeTabs] STEP 2: Frontend tabs: ${frontendTabs.size}, names: ${frontendTabs.map { it.content?.displayName ?: "?" }}")
-        } catch (_: ClassNotFoundException) {}
-        catch (_: Exception) {}
+            if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 2: Frontend tabs: ${frontendTabs.size}, names: ${frontendTabs.map { it.content?.displayName ?: "?" }}")
+        } catch (_: ClassNotFoundException) {
+            // Older IntelliJ — reworked terminal frontend not available. Falls back to classic paths.
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] TerminalToolWindowTabsManager unavailable: ${e.message}")
+        }
 
         // Step 2: Get backend tabs (name → PID + session) for process detection
         try {
             val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
             val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
             val tabs = tm?.let { invokeSuspend(it, tmCls.methods.find { m -> m.name == "getTerminalTabs" }!!) as? List<*> }
-            LOG.info("[ClaudeTabs] STEP 3: Backend has ${tabs?.size ?: 0} tabs")
+            if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 3: Backend has ${tabs?.size ?: 0} tabs")
 
             val smCls = Class.forName("com.intellij.terminal.backend.TerminalSessionsManager")
             val sm = smCls.getMethod("getInstance").invoke(null)
@@ -197,84 +350,46 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     if (!hasFrontend) {
                         LOG.info("[ClaudeTabs] Backend tab '$name' has NO frontend view match!")
                     }
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    LOG.debug("[ClaudeTabs] backend tab access failed: ${e.message}")
+                }
             }
-            LOG.info("[ClaudeTabs] STEP 3a: Backend all names: $backendNames")
-            LOG.info("[ClaudeTabs] STEP 3b: Backend with PIDs: $backendWithPids")
-            if (backendNoSession.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 3c: Backend no session/pid: $backendNoSession")
-        } catch (_: ClassNotFoundException) {}
-        catch (_: Exception) {}
+            if (pollCount % 12 == 0) {
+                LOG.info("[ClaudeTabs] STEP 3a: Backend all names: $backendNames")
+                LOG.info("[ClaudeTabs] STEP 3b: Backend with PIDs: $backendWithPids")
+                if (backendNoSession.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 3c: Backend no session/pid: $backendNoSession")
+            }
+        } catch (_: ClassNotFoundException) {
+            // Older IntelliJ — reworked terminal backend not available. Falls back to classic paths.
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] TerminalTabsManager unavailable: ${e.message}")
+        }
 
-        LOG.info("[ClaudeTabs] STEP 4: Total: ${result.size} → ${result.map { "'${it.tabName}'→PID${it.pid}" }}")
+        if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 4: Total: ${result.size} → ${result.map { "'${it.tabName}'→PID${it.pid}" }}")
         return result
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // REWORKED API REFLECTION HELPERS
+    // ══════════════════════════════════════════════════════════════
+    // These navigate private fields of IntelliJ's "reworked" terminal
+    // classes (public API doesn't expose what we need). The many inner
+    // try/catches are intentional: each iteration is a best-effort probe
+    // and failing one field is expected — we silently try the next.
+
     /**
-     * Recursively walk a Swing component tree to find TerminalWidget instances
-     * that aren't already in our result list. This catches split panel terminals.
+     * Walk the session object (and its `delegate`, if any) looking for a
+     * `ttyConnector` field, then unwrap a [ProcessTtyConnector] to get
+     * the underlying Windows/Unix PID.
+     * Returns null if no connector/process is accessible.
      */
-    private fun findTerminalWidgetsInTree(
-        component: java.awt.Component?,
-        contents: Array<Content>,
-        result: MutableList<TabInfo>,
-        foundPids: MutableSet<Long>
-    ) {
-        if (component == null) return
-
-        // Check if this component IS a TerminalWidget
-        if (component is TerminalWidget) {
-            try {
-                val tty = component.ttyConnectorAccessor.ttyConnector
-                if (tty is ProcessTtyConnector) {
-                    val pid = tty.process.pid()
-                    if (pid !in foundPids) {
-                        // Find or create a Content association
-                        val content = contents.firstOrNull { result.none { r -> r.content == it } }
-                        if (content != null) {
-                            result.add(TabInfo(content, component, pid))
-                            foundPids.add(pid)
-                            if (pollCount % 6 == 0) LOG.info("[ClaudeTabs] Tree-found widget PID=$pid")
-                        }
-                    }
-                }
-            } catch (_: Exception) {}
-        }
-
-        // Check if component has TerminalWidget as a data key (TERMINAL_WIDGET_DATA_KEY)
-        try {
-            val dataKey = Class.forName("org.jetbrains.plugins.terminal.ui.TerminalContainer")
-                .getField("TERMINAL_WIDGET_DATA_KEY").get(null)
-            if (component is com.intellij.openapi.actionSystem.DataProvider) {
-                val widget = component.getData(dataKey.toString())
-                if (widget is TerminalWidget) {
-                    val tty = widget.ttyConnectorAccessor.ttyConnector
-                    if (tty is ProcessTtyConnector) {
-                        val pid = tty.process.pid()
-                        if (pid !in foundPids) {
-                            val content = contents.firstOrNull { result.none { r -> r.content == it } }
-                            if (content != null) {
-                                result.add(TabInfo(content, widget, pid))
-                                foundPids.add(pid)
-                                if (pollCount % 6 == 0) LOG.info("[ClaudeTabs] DataKey-found widget PID=$pid")
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-
-        // Recurse into children
-        if (component is java.awt.Container) {
-            for (child in component.components) {
-                findTerminalWidgetsInTree(child, contents, result, foundPids)
-            }
-        }
-    }
-
-    // Reworked API helpers
     private fun extractPidFromSession(session: Any): Long? {
         val targets = mutableListOf(session)
-        try { val f = session.javaClass.getDeclaredField("delegate"); f.isAccessible = true; f.get(session)?.let { targets.add(0, it) } } catch (_: Exception) {}
+        try {
+            val f = session.javaClass.getDeclaredField("delegate"); f.isAccessible = true
+            f.get(session)?.let { targets.add(0, it) }
+        } catch (_: Exception) { /* no delegate — fine */ }
+
         for (t in targets) {
             try {
                 for (field in t.javaClass.declaredFields) {
@@ -282,17 +397,34 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     field.isAccessible = true
                     val c = field.get(t) ?: continue
                     if (c is ProcessTtyConnector) return c.process.pid()
-                    try { (c.javaClass.getMethod("getProcess").invoke(c) as? Process)?.let { return it.pid() } } catch (_: Exception) {}
-                    for (cf in c.javaClass.declaredFields) { cf.isAccessible = true; val v = cf.get(c); if (v is ProcessTtyConnector) return v.process.pid(); if (v is Process) return v.pid() }
+                    try {
+                        (c.javaClass.getMethod("getProcess").invoke(c) as? Process)?.let { return it.pid() }
+                    } catch (_: Exception) { /* no getProcess — try fields */ }
+                    for (cf in c.javaClass.declaredFields) {
+                        cf.isAccessible = true
+                        val v = cf.get(c)
+                        if (v is ProcessTtyConnector) return v.process.pid()
+                        if (v is Process) return v.pid()
+                    }
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] extractPidFromSession probe failed: ${e.message}")
+            }
         }
         return null
     }
 
+    /**
+     * Sibling of [extractPidFromSession] for getting the raw [com.jediterm.terminal.TtyConnector]
+     * when we need to send commands (e.g. restore flow) rather than just read the PID.
+     */
     private fun extractConnectorFromSession(session: Any): com.jediterm.terminal.TtyConnector? {
         val targets = mutableListOf(session)
-        try { val f = session.javaClass.getDeclaredField("delegate"); f.isAccessible = true; f.get(session)?.let { targets.add(0, it) } } catch (_: Exception) {}
+        try {
+            val f = session.javaClass.getDeclaredField("delegate"); f.isAccessible = true
+            f.get(session)?.let { targets.add(0, it) }
+        } catch (_: Exception) { /* no delegate — fine */ }
+
         for (t in targets) {
             try {
                 for (field in t.javaClass.declaredFields) {
@@ -301,11 +433,18 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     val c = field.get(t)
                     if (c is com.jediterm.terminal.TtyConnector) return c
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] extractConnectorFromSession probe failed: ${e.message}")
+            }
         }
         return null
     }
 
+    /**
+     * Call a Kotlin `suspend` function via reflection by constructing an explicit [kotlin.coroutines.Continuation]
+     * and blocking on its completion. Needed because many of IntelliJ's internal methods are suspend
+     * functions exposed only via `Method.invoke`.
+     */
     private fun invokeSuspend(target: Any, method: java.lang.reflect.Method): Any? = kotlinx.coroutines.runBlocking {
         val d = CompletableDeferred<Any?>()
         val cont = object : kotlin.coroutines.Continuation<Any?> {
@@ -316,7 +455,27 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         if (r == kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) d.await() else r
     }
 
-    private fun renameTab(tab: TabInfo, name: String) {
+    /**
+     * Apply [name] to the given [tab] across every known rename path so whichever API is actually
+     * wired up on this IntelliJ version takes effect:
+     *
+     *  1. **TerminalTitle** field mutation (reworked terminal, 2024.3+) — sets `userDefinedTitle` and
+     *     fires the change notification so the UI repaints immediately.
+     *  2. **Content.displayName** — classic tab label in the tool window.
+     *  3. **TerminalTabsManager.renameTerminalTab()** — reworked backend; persists across split panels.
+     *  4. **TerminalWidget.terminalTitle.change { }** — classic widget API.
+     *
+     * All four are attempted; individual failures are logged at DEBUG and don't abort the others.
+     */
+    private fun isRenameRedundant(currentName: String?, newName: String): Boolean =
+        ClaudeTabsHelpers.isRenameRedundant(currentName, newName)
+
+    private fun renameTab(project: Project, tab: TabInfo, name: String) {
+        if (isRenameRedundant(tab.tabName, name)) {
+            LOG.info("[ClaudeTabs] Skipping redundant rename '${tab.tabName}' → '$name'")
+            return
+        }
+
         // Path 1: Frontend TerminalView.title (primary — updates UI directly)
         val view = tab.reworkedSession
         if (view != null) {
@@ -344,7 +503,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         if (changeMethod != null) {
                             // Can't easily create kotlin Function1, so skip this path
                         }
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        LOG.debug("[ClaudeTabs] title.change() probe failed: ${e.message}")
+                    }
                 }
             } catch (e: Exception) {
                 LOG.warn("[ClaudeTabs] TerminalTitle rename failed: ${e.message}")
@@ -358,109 +519,41 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         if (tab.reworkedTabId != null) {
             try {
                 val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
-                val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-                if (project != null) {
-                    val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
-                    val renameMethod = tmCls.methods.find { it.name == "renameTerminalTab" }
-                    if (tm != null && renameMethod != null) {
-                        val d = CompletableDeferred<Any?>()
-                        val cont = object : kotlin.coroutines.Continuation<Any?> {
-                            override val context = kotlin.coroutines.EmptyCoroutineContext
-                            override fun resumeWith(r: Result<Any?>) { d.complete(r.getOrNull()) }
-                        }
-                        renameMethod.invoke(tm, tab.reworkedTabId, name, true, cont)
-                        LOG.info("[ClaudeTabs] Renamed via backend API: tabId=${tab.reworkedTabId}")
+                val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project)
+                val renameMethod = tmCls.methods.find { it.name == "renameTerminalTab" }
+                if (tm != null && renameMethod != null) {
+                    val d = CompletableDeferred<Any?>()
+                    val cont = object : kotlin.coroutines.Continuation<Any?> {
+                        override val context = kotlin.coroutines.EmptyCoroutineContext
+                        override fun resumeWith(r: Result<Any?>) { d.complete(r.getOrNull()) }
                     }
+                    renameMethod.invoke(tm, tab.reworkedTabId, name, true, cont)
+                    LOG.info("[ClaudeTabs] Renamed via backend API: tabId=${tab.reworkedTabId}")
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] Backend renameTerminalTab failed (falling back to frontend path): ${e.message}")
+            }
         }
 
         // Path 4: Stable TerminalWidget API (classic terminal)
         tab.widget?.terminalTitle?.change { userDefinedTitle = name }
     }
 
-    /**
-     * Extract shell PID from a frontend TerminalView.
-     * The view's startupOptions or backing session has the ttyConnector.
-     */
-    private fun extractPidFromView(view: Any): Long? {
-        // Try to get the session from the view via sessionState or similar
-        // The TerminalView doesn't directly expose ttyConnector, but the
-        // backing BackendTerminalSession (accessible via the session system) does.
-
-        // Strategy: get all alive session PIDs and match by checking the view's
-        // component tree for any process info
-        // Actually, let's try getting it from the backend session system
-        try {
-            val smCls = Class.forName("com.intellij.terminal.backend.TerminalSessionsManager")
-            val sm = smCls.getMethod("getInstance").invoke(null) ?: return null
-
-            // The SessionsManager has a sessionsMap — reflect into it
-            for (f in sm.javaClass.declaredFields) {
-                if (f.name.contains("session", true) && f.type.name.contains("Map")) {
-                    f.isAccessible = true
-                    val map = f.get(sm) as? Map<*, *> ?: continue
-                    // Each entry: TerminalSessionId → BackendTerminalSession
-                    for ((_, session) in map) {
-                        if (session == null) continue
-                        // Check if this session's coroutineScope matches the view's
-                        // This is a heuristic — match by checking if the PID is unique
-                        val pid = extractPidFromSession(session)
-                        if (pid != null) {
-                            // We can't directly match view to session without more info
-                            // Return PIDs that we'll match externally
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-
-        // Simpler approach: traverse the view's component to find something with PID
-        try {
-            val component = view.javaClass.getMethod("getComponent").invoke(view) as? java.awt.Component
-            return findPidInComponentTree(component)
-        } catch (_: Exception) {}
-
-        return null
-    }
-
-    private fun findPidInComponentTree(component: java.awt.Component?): Long? {
-        if (component == null) return null
-        // Check if this component is or contains a TerminalWidget
-        if (component is TerminalWidget) {
-            try {
-                val tty = component.ttyConnectorAccessor.ttyConnector
-                if (tty is ProcessTtyConnector) return tty.process.pid()
-            } catch (_: Exception) {}
-        }
-        // Check for any object with getTtyConnector/getTtyConnectorAccessor
-        try {
-            for (m in component.javaClass.methods) {
-                if (m.name == "getTtyConnectorAccessor" && m.parameterCount == 0) {
-                    val accessor = m.invoke(component) ?: continue
-                    val tty = accessor.javaClass.getMethod("getTtyConnector").invoke(accessor)
-                    if (tty is ProcessTtyConnector) return tty.process.pid()
-                }
-                if (m.name == "getTtyConnector" && m.parameterCount == 0) {
-                    val tty = m.invoke(component)
-                    if (tty is ProcessTtyConnector) return tty.process.pid()
-                }
-            }
-        } catch (_: Exception) {}
-        // Recurse
-        if (component is java.awt.Container) {
-            for (child in component.components) {
-                val pid = findPidInComponentTree(child)
-                if (pid != null) return pid
-            }
-        }
-        return null
-    }
-
     // ══════════════════════════════════════════════════════════════
     // FILE WATCHER — instant rename
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * Watch [TABS_DIR] with Java NIO's [java.nio.file.WatchService] and route new rename files
+     * to their handler immediately, rather than waiting for the next poll.
+     *
+     * File-name conventions:
+     *  - `termsess-{TERM_SESSION_ID}.json` — legacy format — routed to [handleTermSessionRename]
+     *  - `pid-{scriptPid}.json` — legacy format — routed to [handlePidRename]
+     *  - `{sessionId}.json` — primary format — routed to [handleRename]
+     *
+     * Runs for the lifetime of the project's coroutine scope.
+     */
     private suspend fun watchTabsDirectory(project: Project) {
         val watcher = FileSystems.getDefault().newWatchService()
         TABS_DIR.toPath().register(watcher, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_MODIFY)
@@ -521,7 +614,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val match = tabs.find { it.pid == shellPid }
         if (match != null) {
             LOG.info("[ClaudeTabs] PID-RENAME: '${match.tabName}' → '$name'")
-            renameTab(match, name)
+            renameTab(project, match, name)
             renamedSessions.add("pid-$scriptPid")
             lastAppliedName["pid-$scriptPid"] = name
         } else {
@@ -550,10 +643,19 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
                     // Match: toString() may return raw UUID or wrapped like TerminalSessionId(uuid)
                     if (sessIdStr == termSessionId || sessIdStr.contains(termSessionId) || termSessionId.contains(sessIdStr)) {
-                        val tabInfo = allTabs.getOrNull(index)
+                        // Match backend tab to our TabInfo via the stable backend tab ID.
+                        // (Using iteration index breaks off-by-one when any backend tab has no
+                        // PID and is filtered out of getAllTabs — see issue where rename landed
+                        // on the wrong tab, one position off.)
+                        val backendTabId = tab.javaClass.getMethod("getId").invoke(tab) as? Int
+                        val tabInfo = if (backendTabId != null) {
+                            allTabs.find { it.reworkedTabId == backendTabId }
+                        } else {
+                            allTabs.getOrNull(index)  // very old fallback
+                        }
                         if (tabInfo != null) {
-                            LOG.info("[ClaudeTabs] TERMSESS: MATCH tab $index '${tabInfo.tabName}' → '$name'")
-                            renameTab(tabInfo, name)
+                            LOG.info("[ClaudeTabs] TERMSESS: MATCH tab $index (backendId=$backendTabId) '${tabInfo.tabName}' → '$name'")
+                            renameTab(project, tabInfo, name)
                             renamedSessions.add("termsess-$termSessionId")
                             lastAppliedName["termsess-$termSessionId"] = name
 
@@ -570,9 +672,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                                 }
                             }
                             return
+                        } else {
+                            LOG.warn("[ClaudeTabs] TERMSESS: matched backend tab (id=$backendTabId) but no TabInfo with that id in allTabs")
                         }
                     }
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    LOG.debug("[ClaudeTabs] TERMSESS: per-tab probe failed: ${e.message}")
+                }
             }
         } catch (e: Exception) {
             LOG.warn("[ClaudeTabs] TERMSESS: ${e.message}")
@@ -580,6 +686,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         LOG.info("[ClaudeTabs] TERMSESS: no tab found for TERM_SESSION_ID=$termSessionId")
     }
 
+    /**
+     * Handle session-ID-keyed rename — the primary path.
+     *
+     * For each terminal tab, walks the process tree to find a Claude child whose session file
+     * contains the target [sessionId]; if found, renames that tab.
+     */
     private fun handleRename(project: Project, sessionId: String, name: String) {
         // Direct match: find the tab whose Claude child has this session ID
         val tabs = getAllTabs(project)
@@ -588,11 +700,16 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val claudeProcess = findClaudeChild(tab.pid) ?: continue
             val sf = File(SESSIONS_DIR, "${claudeProcess.pid()}.json")
             if (!sf.exists()) continue
-            val tabSessionId = try { extractJsonString(sf.readText(), "sessionId") } catch (_: Exception) { null }
+            val tabSessionId = try {
+                extractJsonString(sf.readText(), "sessionId")
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] session file read failed (${sf.name}): ${e.message}")
+                null
+            }
 
             if (tabSessionId == sessionId) {
                 LOG.info("[ClaudeTabs] RENAME: '${tab.tabName}' → '$name' (session $sessionId matched tab PID ${tab.pid})")
-                renameTab(tab, name)
+                renameTab(project, tab, name)
                 renamedSessions.add(sessionId)
                 lastAppliedName[sessionId] = name
                 return
@@ -606,6 +723,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     // POLL — fallback rename + state save
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * Main periodic loop. On each tick:
+     *
+     *  1. Cleans up any `termsess-*.json` files the watcher missed.
+     *  2. Detects **manual renames** — user-edited tab names get preserved and we stop rewriting them.
+     *  3. Applies **fallback renames** — any pending `{sessionId}.json` that wasn't picked up by the watcher.
+     *  4. Updates the per-project **restore file** (`restore-<projectPath>.json`) with currently named tabs.
+     *  5. Detects **closed sessions** (present last tick, gone now) and appends them to history.json.
+     *
+     * Called every [POLL_INTERVAL_MS] (or faster during the 60s startup burst).
+     */
     private fun poll(project: Project) {
         // Poll fallback: process any unhandled termsess-*.json files
         TABS_DIR.listFiles()?.filter { it.name.startsWith("termsess-") && it.name.endsWith(".json") }?.forEach { f ->
@@ -617,7 +745,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     handleTermSessionRename(project, termSessionId, name)
                     f.delete()
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] termsess file processing failed for ${f.name}: ${e.message}")
+            }
         }
 
         val tabs = getAllTabs(project)
@@ -656,7 +786,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     val name = try { extractJsonString(renameFile.readText(), "name") } catch (_: Exception) { null }
                     if (name != null) {
                         LOG.info("[ClaudeTabs] POLL RENAME: '${tab.tabName}' → '$name'")
-                        renameTab(tab, name)
+                        renameTab(project, tab, name)
                         renamedSessions.add(sessionId)
                         lastAppliedName[sessionId] = name
                     }
@@ -672,10 +802,22 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             activeSessions.add(SavedSession(sessionId, cwd, title, bypass))
         }
 
-        if (claudeSessions.isNotEmpty()) {
-            LOG.info("[ClaudeTabs] STEP 6: Claude sessions found: $claudeSessions")
+        if (pollCount % 12 == 0) {
+            if (claudeSessions.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 6: Claude sessions found: $claudeSessions")
+            LOG.info("[ClaudeTabs] STEP 7: Saving ${activeSessions.size} active session(s)")
         }
-        LOG.info("[ClaudeTabs] STEP 7: Saving ${activeSessions.size} active session(s)")
+
+        // Detect closed sessions and write to history
+        val currentIds = activeSessions.map { it.sessionId }.toSet()
+        for ((id, session) in previousActive) {
+            if (id !in currentIds) {
+                appendToHistory(session)
+                LOG.info("[ClaudeTabs] Session closed, saved to history: '${session.tabName}'")
+            }
+        }
+        previousActive.clear()
+        for (s in activeSessions) previousActive[s.sessionId] = s
+
         saveState(project, activeSessions)
     }
 
@@ -683,45 +825,192 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     // SESSION SAVE / RESTORE
     // ══════════════════════════════════════════════════════════════
 
+    /** A Claude Code session that has been (or currently is) associated with a named terminal tab. */
     data class SavedSession(val sessionId: String, val cwd: String, val tabName: String, val bypassPermissions: Boolean)
 
-    private fun getStateFile(project: Project): File {
-        val h = (project.basePath ?: "default").replace("\\", "/").replace(":/", "--").replace("/", "-")
-        return File(STATE_DIR, "restore-$h.json")
+    /** Lock object guarding all reads/writes to [HISTORY_FILE]. */
+    private val historyLock = Any()
+
+    /**
+     * Append (or update) a session entry in history.json.
+     *
+     * Called when a tab closes (or when the IDE is shutting down) to preserve the session so the user
+     * can browse/resume it later via `/tabs-history`. Entries older than [historyMaxAgeMs] are pruned.
+     *
+     * Thread-safe: wrapped in [historyLock] because the poll loop, file watcher, and project-close
+     * disposable can all call this concurrently.
+     */
+    private fun appendToHistory(session: SavedSession) = synchronized(historyLock) {
+        try {
+            val now = System.currentTimeMillis()
+            val entries = loadHistory().toMutableList()
+
+            // Don't duplicate — replace any existing entry for the same sessionId.
+            entries.removeAll { extractJsonString(it, "sessionId") == session.sessionId }
+
+            val entry = "{\"sessionId\":\"${esc(session.sessionId)}\",\"cwd\":\"${esc(session.cwd)}\",\"tabName\":\"${esc(session.tabName)}\",\"bypassPermissions\":${session.bypassPermissions},\"closedAt\":$now}"
+            entries.add(entry)
+
+            // Prune entries older than configured retention window.
+            val cutoff = now - historyMaxAgeMs
+            val pruned = entries.filter { raw ->
+                val ts = Regex(""""closedAt":(\d+)""").find(raw)?.groupValues?.get(1)?.toLongOrNull()
+                ts != null && ts > cutoff
+            }
+
+            HISTORY_FILE.parentFile?.mkdirs()
+            val sb = StringBuilder("[\n")
+            pruned.forEachIndexed { i, e ->
+                sb.append("  $e")
+                if (i < pruned.size - 1) sb.append(",")
+                sb.append("\n")
+            }
+            sb.append("]")
+            HISTORY_FILE.writeText(sb.toString())
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] History write failed: ${e.message}")
+        }
     }
 
+    /**
+     * Read the history file as a list of raw JSON entry strings.
+     *
+     * Uses a simple non-greedy regex rather than a full JSON parser because entries are flat
+     * (no nested objects). See [appendToHistory] for the matching writer.
+     */
+    private fun loadHistory(): List<String> = synchronized(historyLock) {
+        if (!HISTORY_FILE.exists()) return@synchronized emptyList()
+        try {
+            Regex("""\{[^}]+\}""").findAll(HISTORY_FILE.readText()).map { it.value }.toList()
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] History read failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /** Stable hash of the project path, used as the suffix for restore/snapshot file names. */
+    private fun projectHash(project: Project): String =
+        ClaudeTabsHelpers.projectHashForPath(project.basePath)
+
+    private fun getStateFile(project: Project): File = File(STATE_DIR, "restore-${projectHash(project)}.json")
+
+    /**
+     * List this project's snapshot files in the snapshots dir, newest first (by filename —
+     * filenames are `<projectHash>-<timestampMs>.json` so lexical order = chronological order).
+     */
+    private fun listSnapshots(project: Project): List<File> {
+        val prefix = "${projectHash(project)}-"
+        return SNAPSHOTS_DIR.listFiles()
+            ?.filter { it.name.startsWith(prefix) && it.name.endsWith(".json") }
+            ?.sortedByDescending { it.name }
+            ?: emptyList()
+    }
+
+    /**
+     * Write a timestamped snapshot of [content] (already-serialised JSON array) to the snapshots
+     * dir, then prune older snapshots beyond [snapshotKeepCount]. Silently best-effort — if this
+     * fails the user still has the live restore file and history.json.
+     */
+    private fun writeSnapshot(project: Project, content: String) {
+        if (snapshotKeepCount <= 0) return  // user disabled snapshots entirely
+        try {
+            SNAPSHOTS_DIR.mkdirs()
+            val file = File(SNAPSHOTS_DIR, "${projectHash(project)}-${System.currentTimeMillis()}.json")
+            file.writeText(content)
+
+            // Prune older snapshots beyond the retention window.
+            val existing = listSnapshots(project)
+            if (existing.size > snapshotKeepCount) {
+                existing.drop(snapshotKeepCount).forEach { old ->
+                    try { old.delete() } catch (_: Exception) { /* best effort */ }
+                }
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Snapshot write failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Write [sessions] to the project's restore file, overwriting the previous content.
+     *
+     * Important: if [sessions] is empty AND there are still [pendingRestores] waiting to be
+     * placed, we leave the file alone. Otherwise the restore file can get wiped on the first
+     * poll after startup — before terminal tabs have spawned Claude processes — destroying
+     * the saved state we just loaded a second ago.
+     */
     private fun saveState(project: Project, sessions: List<SavedSession>) {
         val f = getStateFile(project)
         try {
-            if (sessions.isEmpty()) { f.delete(); return }
+            if (sessions.isEmpty()) {
+                if (pendingRestores.isNotEmpty()) {
+                    // Restore hasn't finished yet — don't wipe the file we're still consuming.
+                    return
+                }
+                f.delete(); return
+            }
             val sb = StringBuilder("[\n")
             sessions.forEachIndexed { i, s ->
                 sb.append("  {\"sessionId\":\"${esc(s.sessionId)}\",\"cwd\":\"${esc(s.cwd)}\",\"tabName\":\"${esc(s.tabName)}\",\"bypassPermissions\":${s.bypassPermissions}}")
                 if (i < sessions.size - 1) sb.append(",")
                 sb.append("\n")
             }
-            sb.append("]"); f.writeText(sb.toString())
-        } catch (_: Exception) {}
+            sb.append("]")
+            val content = sb.toString()
+            f.writeText(content)
+
+            // Capture a timestamped snapshot so a later wipe (crash mid-save, poll races, etc.)
+            // can't lose the last known-good state.
+            writeSnapshot(project, content)
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Save state failed: ${e.message}")
+        }
     }
 
+    /**
+     * Load the project's restore file into [pendingRestores]. If the live file is missing,
+     * empty, or an empty array, fall back to the most recent non-empty snapshot from
+     * [SNAPSHOTS_DIR]. This protects against:
+     *   - Previous poll wiping the file (pre-fix bug).
+     *   - Crashes during save that leave an empty or truncated file.
+     *   - Accidental deletion by the user or external tools.
+     */
     private fun loadRestoreFile(project: Project) {
-        val f = getStateFile(project)
-        if (!f.exists()) return
-        try {
-            val json = f.readText().trim()
-            if (json.isEmpty() || json == "[]") return
-            for (m in Regex("""\{[^}]+\}""").findAll(json)) {
-                val o = m.value
-                pendingRestores.add(SavedSession(
-                    extractJsonString(o, "sessionId") ?: continue,
-                    extractJsonString(o, "cwd") ?: continue,
-                    extractJsonString(o, "tabName") ?: continue,
-                    o.contains("\"bypassPermissions\":true")
-                ))
+        val sources = mutableListOf<File>().apply {
+            val live = getStateFile(project)
+            if (live.exists()) add(live)
+            addAll(listSnapshots(project))  // newest → oldest
+        }
+
+        for ((index, source) in sources.withIndex()) {
+            try {
+                val json = source.readText().trim()
+                if (json.isEmpty() || json == "[]") continue
+
+                val loadedBefore = pendingRestores.size
+                for (m in Regex("""\{[^}]+\}""").findAll(json)) {
+                    val o = m.value
+                    pendingRestores.add(SavedSession(
+                        extractJsonString(o, "sessionId") ?: continue,
+                        extractJsonString(o, "cwd") ?: continue,
+                        extractJsonString(o, "tabName") ?: continue,
+                        o.contains("\"bypassPermissions\":true")
+                    ))
+                }
+
+                if (pendingRestores.size > loadedBefore) {
+                    val provenance = if (index == 0) "live restore file" else "snapshot (${source.name})"
+                    LOG.info("[ClaudeTabs] ${pendingRestores.size} session(s) to restore from $provenance")
+                    // Don't delete yet — delete after all restores complete
+                    return
+                }
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] Restore source ${source.name} parse failed (trying next): ${e.message}")
             }
-            if (pendingRestores.isNotEmpty()) LOG.info("[ClaudeTabs] ${pendingRestores.size} session(s) to restore")
-            // Don't delete yet — delete after all restores complete
-        } catch (_: Exception) {}
+        }
+
+        if (sources.isNotEmpty()) {
+            LOG.info("[ClaudeTabs] No non-empty restore source found (${sources.size} candidates checked)")
+        }
     }
 
     private fun processPendingRestores(project: Project) {
@@ -742,7 +1031,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
             if (match != null) {
                 val cmd = buildResumeCmd(s)
-                renameTab(match, s.tabName)
+                renameTab(project, match, s.tabName)
 
                 // Send command via createSendTextBuilder (proper API, no garbled text)
                 val view = match.reworkedSession
@@ -750,32 +1039,38 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 var sent = false
 
                 if (view != null) {
-                    // Try createSendTextBuilder first (cleanest API)
+                    // Try createSendTextBuilder first (cleanest API — IntelliJ 2024.3+).
                     try {
                         val builder = view.javaClass.getMethod("createSendTextBuilder").invoke(view)
                         val shouldExec = builder.javaClass.getMethod("shouldExecute").invoke(builder)
                         shouldExec.javaClass.getMethod("send", String::class.java).invoke(shouldExec, cmd)
                         LOG.info("[ClaudeTabs] Sent via createSendTextBuilder")
                         sent = true
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        LOG.debug("[ClaudeTabs] createSendTextBuilder unavailable: ${e.message}")
+                    }
 
-                    // Fallback: sendText with newline
+                    // Fallback: sendText with newline (older API).
                     if (!sent) {
                         try {
                             view.javaClass.getMethod("sendText", String::class.java).invoke(view, cmd + "\n")
                             LOG.info("[ClaudeTabs] Sent via sendText")
                             sent = true
-                        } catch (_: Exception) {}
+                        } catch (e: Exception) {
+                            LOG.debug("[ClaudeTabs] sendText unavailable: ${e.message}")
+                        }
                     }
 
-                    // Last resort: tty connector
+                    // Last resort: write straight to the tty connector.
                     if (!sent) {
                         try {
                             val connector = extractConnectorFromSession(view)
                             connector?.write(cmd.toByteArray())
                             connector?.write("\r\n".toByteArray())
                             sent = true
-                        } catch (_: Exception) {}
+                        } catch (e: Exception) {
+                            LOG.debug("[ClaudeTabs] tty-connector write failed: ${e.message}")
+                        }
                     }
                 } else if (w != null) {
                     ApplicationManager.getApplication().invokeLater {
@@ -796,9 +1091,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // Delete restore file only when ALL sessions have been restored
         if (pendingRestores.isEmpty() && restored.isNotEmpty()) {
             try {
-                val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-                if (project != null) getStateFile(project).delete()
-            } catch (_: Exception) {}
+                getStateFile(project).delete()
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] Failed to delete restore file after full restore: ${e.message}")
+            }
         }
     }
 
@@ -810,8 +1106,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun shouldAlwaysBypass(): Boolean {
         val f = File(CLAUDE_HOME, "settings.json")
         if (!f.exists()) return false
-        return try { f.readText().let { it.contains("\"skipDangerousModePermissionPrompt\":true") || it.contains("\"skipDangerousModePermissionPrompt\": true") } }
-        catch (_: Exception) { false }
+        return try {
+            f.readText().let { it.contains("\"skipDangerousModePermissionPrompt\":true") || it.contains("\"skipDangerousModePermissionPrompt\": true") }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] settings.json read failed: ${e.message}")
+            false
+        }
     }
 
     private fun readPermissionMode(cwd: String, sessionId: String): Boolean {
@@ -825,13 +1125,21 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     if (l.contains("\"permission-mode\"")) return@use extractJsonString(l, "permissionMode") == "bypassPermissions"
                 }; false
             }
-        } catch (_: Exception) { false }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] session jsonl read failed: ${e.message}")
+            false
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
     // CLAUDE DETECTION
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * Find the currently-alive Claude process PID that owns the given [sessionId],
+     * by scanning the JSON files in `~/.claude/sessions/`. Returns null if no match
+     * or the process has exited.
+     */
     private fun findClaudePidForSession(sessionId: String): Long? {
         for (f in SESSIONS_DIR.listFiles() ?: emptyArray()) {
             if (!f.name.endsWith(".json")) continue
@@ -839,30 +1147,42 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 if (extractJsonString(f.readText(), "sessionId") != sessionId) continue
                 val pid = f.nameWithoutExtension.toLongOrNull() ?: continue
                 if (ProcessHandle.of(pid).map { it.isAlive }.orElse(false)) return pid
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] session lookup error for ${f.name}: ${e.message}")
+            }
         }
         return null
     }
 
+    /** @return true if [cmd] ends in a known shell executable name (any OS). */
+    private fun isShellCommand(cmd: String): Boolean = ClaudeTabsHelpers.isShellCommand(cmd)
+
+    /**
+     * Walk up at most 5 levels from [claudePid] looking for the terminal shell process that hosts
+     * the Claude instance. Used by the PID-rename flow when the script writes its own PID and we
+     * need to map back to a specific tab.
+     */
     private fun findShellAncestor(claudePid: Long): Long? {
         var current = ProcessHandle.of(claudePid).orElse(null) ?: return null
         for (i in 0 until 5) {
             val parent = current.parent().orElse(null) ?: break
             current = parent
             val cmd = current.info().command().orElse("")
-            if (cmd.contains("bash", true) || cmd.contains("pwsh", true) ||
-                cmd.contains("powershell", true) || cmd.contains("cmd.exe", true) ||
-                cmd.contains("zsh", true) || cmd.contains("fish", true) || cmd.contains("sh", true)
-            ) return current.pid()
+            if (isShellCommand(cmd)) return current.pid()
         }
         return ProcessHandle.of(claudePid).flatMap { it.parent() }.flatMap { it.parent() }.map { it.pid() }.orElse(null)
     }
 
+    /**
+     * Starting from the shell PID [pid] (the process hosting a terminal tab), search the full
+     * descendant tree for a running Claude Code CLI process. Returns null if nothing matches.
+     */
     private fun findClaudeChild(pid: Long): ProcessHandle? {
         val h = ProcessHandle.of(pid).orElse(null) ?: return null
         return findClaudeRec(h)
     }
 
+    /** Recursive worker for [findClaudeChild]. Matches `claude[.exe|.cmd]` or `node` + `claude` args. */
     private fun findClaudeRec(h: ProcessHandle): ProcessHandle? {
         for (c in h.children().toList()) {
             val cmd = c.info().command().orElse(""); val line = c.info().commandLine().orElse("")
@@ -881,13 +1201,32 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
     // CLAUDE_MD_MARKER and PERMISSION_ENTRY are in the companion object
 
+    /**
+     * Installs (and updates) the plugin's bash integration into the user's `~/.claude/` directory.
+     * Safe to call on every startup — it's idempotent:
+     *  - Files are overwritten from JAR resources (so script updates ship with plugin updates).
+     *  - CLAUDE.md section is replaced between its markers (so instruction text stays current).
+     *  - Permissions & hooks are only added if missing.
+     *  - Old-named command files (pre-rename) are cleaned up.
+     *
+     * The complementary [uninstall] method lives in the companion object.
+     */
     private fun deployClaudeIntegration() {
         try {
             deployResource("claude-integration/rename-tab.sh", File(CLAUDE_HOME, "rider-plugin/rename-tab.sh"))
             deployResource("claude-integration/session-start-hook.sh", File(CLAUDE_HOME, "rider-plugin/session-start-hook.sh"))
             File(CLAUDE_HOME, "commands").mkdirs()
             deployResource("claude-integration/tab.md", File(CLAUDE_HOME, "commands/tab.md"))
-            deployResource("claude-integration/clear-tabs.md", File(CLAUDE_HOME, "commands/clear-tabs.md"))
+            deployResource("claude-integration/tabs-clear.md", File(CLAUDE_HOME, "commands/tabs-clear.md"))
+            deployResource("claude-integration/tabs-restore.md", File(CLAUDE_HOME, "commands/tabs-restore.md"))
+            deployResource("claude-integration/tabs-history.md", File(CLAUDE_HOME, "commands/tabs-history.md"))
+            deployResource("claude-integration/tabs-backup.md", File(CLAUDE_HOME, "commands/tabs-backup.md"))
+            deployResource("claude-integration/tabs-status.md", File(CLAUDE_HOME, "commands/tabs-status.md"))
+            // Cleanup old command filenames (pre-rename)
+            File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
+            File(CLAUDE_HOME, "commands/restore-tabs.md").delete()
+            File(CLAUDE_HOME, "commands/tab-history.md").delete()
+            File(CLAUDE_HOME, "commands/backup-tabs.md").delete()
 
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
@@ -923,40 +1262,48 @@ $CLAUDE_MD_MARKER
 
             addPermission()
             addSessionStartHook()
-        } catch (_: Exception) {}
+        } catch (e: Exception) { LOG.warn("[ClaudeTabs] Deploy failed: ${e.message}") }
     }
 
-    private val HOOK_MARKER = "active-sessions"
+    private val HOOK_MARKER = "session-start-hook.sh"
+    private val HOOK_MARKER_LEGACY = "active-sessions"
 
     private fun addSessionStartHook() {
         val sf = File(CLAUDE_HOME, "settings.json")
         if (!sf.exists()) return
         try {
             val text = sf.readText()
-            if (text.contains(HOOK_MARKER)) return // already has our hook
+            if (text.contains(HOOK_MARKER) || text.contains(HOOK_MARKER_LEGACY)) return
 
-            val hookJson = """
-                "hooks": {
-                    "SessionStart": [
+            val hookEntry = """
                       {
                         "hooks": [
                           {
                             "type": "command",
-                            "command": "bash -c 'read INPUT; SID=${'$'}(echo \"${'$'}INPUT\" | sed \"s/.*session_id....//\" | sed \"s/\\\".*//\"); mkdir -p ~/.claude/rider-plugin/active-sessions; echo \"${'$'}SID\" > ~/.claude/rider-plugin/active-sessions/${'$'}${'$'}.sid'",
+                            "command": "bash ~/.claude/rider-plugin/session-start-hook.sh",
                             "timeout": 5
                           }
                         ]
                       }
-                    ]
-                  }
             """.trimIndent()
 
             if (!text.contains("\"hooks\"")) {
-                // No hooks section — add before closing brace
+                // No hooks section at all — add the entire block
+                val hookJson = "\"hooks\": {\n    \"SessionStart\": [\n      $hookEntry\n    ]\n  }"
                 sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  $hookJson\n}")
-                LOG.info("[ClaudeTabs] Added SessionStart hook")
+                LOG.info("[ClaudeTabs] Added hooks section with SessionStart hook")
+            } else if (!text.contains("\"SessionStart\"")) {
+                // Has hooks but no SessionStart — add SessionStart array
+                sf.writeText(text.replace(Regex(""""hooks"\s*:\s*\{"""), "\"hooks\": {\n    \"SessionStart\": [\n      $hookEntry\n    ],"))
+                LOG.info("[ClaudeTabs] Added SessionStart hook to existing hooks")
+            } else {
+                // Has SessionStart but our hook isn't in it — append to the array
+                sf.writeText(text.replace(Regex(""""SessionStart"\s*:\s*\["""), "\"SessionStart\": [\n      $hookEntry,"))
+                LOG.info("[ClaudeTabs] Appended hook to existing SessionStart array")
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Hook install failed: ${e.message}")
+        }
     }
 
     private fun addPermission() {
@@ -968,33 +1315,24 @@ $CLAUDE_MD_MARKER
             if (text.contains("\"allow\"")) {
                 sf.writeText(text.replace(Regex(""""allow"\s*:\s*\["""), "\"allow\": [\"$PERMISSION_ENTRY\", "))
             } else if (text.contains("\"permissions\"")) {
-                // permissions exists but no allow
+                sf.writeText(text.replace(Regex(""""permissions"\s*:\s*\{"""), "\"permissions\": {\n    \"allow\": [\"$PERMISSION_ENTRY\"],"))
             } else {
                 sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  \"permissions\": {\n    \"allow\": [\"$PERMISSION_ENTRY\"]\n  }\n}")
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) { LOG.debug("[ClaudeTabs] Permission install failed: ${e.message}") }
     }
 
     private fun deployResource(path: String, target: File) {
-        try { javaClass.classLoader.getResourceAsStream(path)?.let { target.parentFile?.mkdirs(); target.writeBytes(it.readBytes()) } } catch (_: Exception) {}
+        try { javaClass.classLoader.getResourceAsStream(path)?.let { target.parentFile?.mkdirs(); target.writeBytes(it.readBytes()) } } catch (e: Exception) { LOG.debug("[ClaudeTabs] Deploy resource failed: $path — ${e.message}") }
     }
 
     // ══════════════════════════════════════════════════════════════
     // UTILITIES
     // ══════════════════════════════════════════════════════════════
 
-    private fun extractJsonString(json: String, key: String): String? {
-        val m = Regex(""""$key"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""").find(json) ?: return null
-        return m.groupValues[1].replace("\\\\", "\\").replace("\\\"", "\"")
-    }
-
-    /** Tabs with generic names should never be saved for restore or grabbed for restore */
-    private fun isGenericTabName(name: String): Boolean {
-        val n = name.trim()
-        return n == "Local" || n.matches(Regex("Local \\(\\d+\\)")) ||
-            n == "bash" || n == "pwsh" || n == "PowerShell" || n == "cmd" ||
-            n.matches(Regex("bash \\(\\d+\\)")) || n.matches(Regex("pwsh \\(\\d+\\)"))
-    }
-
-    private fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
+    // Pure helpers delegated to ClaudeTabsHelpers so they can be unit-tested
+    // without needing an IntelliJ Project instance.
+    private fun extractJsonString(json: String, key: String): String? = ClaudeTabsHelpers.extractJsonString(json, key)
+    private fun isGenericTabName(name: String): Boolean = ClaudeTabsHelpers.isGenericTabName(name)
+    private fun esc(s: String): String = ClaudeTabsHelpers.esc(s)
 }

@@ -2,43 +2,39 @@
 # Renames the Rider terminal tab for the current Claude Code session.
 # Usage: bash ~/.claude/rider-plugin/rename-tab.sh "Tab Name"
 #
-# Consumes the OLDEST queued session ID (written by SessionStart hook).
-# FIFO order ensures each rename gets the correct session.
+# Strategy 1: TERM_SESSION_ID → session-map lookup (race-condition free)
+# Strategy 2: Fallback — newest alive Claude session in CWD
 
 NAME="$1"
-
 if [ -z "$NAME" ]; then
   echo "Usage: bash ~/.claude/rider-plugin/rename-tab.sh \"Tab Name\""
   exit 1
 fi
 
 TABS_DIR="$HOME/.claude/rider-plugin/tabs"
-QUEUE_DIR="$HOME/.claude/rider-plugin/session-queue"
+MAP_DIR="$HOME/.claude/rider-plugin/session-map"
 mkdir -p "$TABS_DIR"
 
-# Consume the OLDEST queued session (FIFO)
-if [ -d "$QUEUE_DIR" ]; then
-  OLDEST=$(ls "$QUEUE_DIR" 2>/dev/null | sort -n | head -1)
-  if [ -n "$OLDEST" ]; then
-    SID=$(cat "$QUEUE_DIR/$OLDEST" 2>/dev/null)
-    # Atomic consume: rename the file so no other script grabs it
-    if mv "$QUEUE_DIR/$OLDEST" "$QUEUE_DIR/$OLDEST.claimed" 2>/dev/null; then
-      rm -f "$QUEUE_DIR/$OLDEST.claimed"
-      if [ -n "$SID" ]; then
-        echo "{\"name\":\"$NAME\"}" > "$TABS_DIR/$SID.json"
-        exit 0
-      fi
-    fi
+# ── Strategy 1: Look up Claude session ID via TERM_SESSION_ID mapping ──
+# The session-start-hook.sh writes: session-map/{TERM_SESSION_ID} → claude-session-id
+# Each tab has its own unique TERM_SESSION_ID, so no race condition.
+TERM_SID="${TERM_SESSION_ID}"
+if [ -n "$TERM_SID" ] && [ -f "$MAP_DIR/$TERM_SID" ]; then
+  sid=$(cat "$MAP_DIR/$TERM_SID")
+  if [ -n "$sid" ]; then
+    echo "{\"name\":\"$NAME\"}" > "$TABS_DIR/$sid.json"
+    exit 0
   fi
 fi
 
-# Fallback for re-renames: update newest alive session in CWD
+# ── Strategy 2 (fallback): Find newest alive Claude session in CWD ──
+SESSIONS_DIR="$HOME/.claude/sessions"
 CWD_WIN="$(pwd -W 2>/dev/null || pwd)"
 norm_cwd=$(echo "$CWD_WIN" | sed 's|\\|/|g')
 best_sid=""
 best_time=0
 
-for sf in "$HOME/.claude/sessions/"*.json; do
+for sf in "$SESSIONS_DIR/"*.json; do
   [ -f "$sf" ] || continue
   pid=$(basename "$sf" .json)
   if ! tasklist //FI "PID eq $pid" 2>/dev/null | grep -q "$pid"; then continue; fi
