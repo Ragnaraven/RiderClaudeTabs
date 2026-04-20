@@ -40,8 +40,20 @@ EOF
 
 2. Show the user the numbered list. Each entry shows: age, tab name, project, date, and session ID prefix.
 
-3. If `$ARGUMENTS` specifies a number or tab name, resume that session using:
-   `claude --resume <sessionId>` (add `--dangerously-skip-permissions` if `bypassPermissions` is true)
-   Then rename the tab: `bash ~/.claude/rider-plugin/rename-tab.sh "<tabName>"`
+3. If `$ARGUMENTS` specifies a number or tab name, **print** the resume command for that one session. Do NOT try to execute `claude --resume` yourself — it fails from inside an active Claude session.
+
+   Output the command exactly like this (adjust `--dangerously-skip-permissions` based on the entry's `bypassPermissions` flag):
+
+   ```
+   claude --resume <sessionId> --dangerously-skip-permissions
+   ```
+
+   Remind the user: "Run this yourself in the terminal (or prefix with `!` to run in this session)."
+
+   After resume the plugin auto-renames the tab, but they can also run:
+
+   ```
+   bash ~/.claude/rider-plugin/rename-tab.sh "<tabName>"
+   ```
 
 4. If `$ARGUMENTS` is empty, just display the list and let the user pick.
