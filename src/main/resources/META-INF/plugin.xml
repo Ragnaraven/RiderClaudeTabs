@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Namer</name>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -35,6 +35,13 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.0.1</h3>
+    <ul>
+      <li><code>/tabs-restore</code> and <code>/tabs-history</code> now print the
+        <code>claude --resume &lt;id&gt;</code> command instead of trying to run it — nested
+        <code>claude --resume</code> from inside an active session always failed.</li>
+    </ul>
+
     <h3>1.0.0 — Initial release</h3>
     <ul>
       <li>Auto-rename terminal tabs to match Claude Code conversation topic</li>
