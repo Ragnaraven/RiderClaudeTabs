@@ -58,6 +58,23 @@ history.json                           # closed sessions (90d default)
 config.json                            # user overrides
 ```
 
+## Running the tests
+
+```bash
+./gradlew test        # Unit + storage + slash-command scripts (~60 tests, <10s)
+./gradlew uiTest      # UI tests via Remote Robot (optional, needs a sandbox IDE)
+```
+
+For the UI tests, start a sandbox IDE in another terminal first:
+
+```bash
+./gradlew runIdeForUiTests
+```
+
+Then run `uiTest` — it connects over RMI on port 8082. If no sandbox is running, UI tests skip gracefully (so a plain `./gradlew test` stays green without one).
+
+No tests require network access, Anthropic API keys, or a real Claude install.
+
 ## Uninstall
 
 Plugins page → Uninstall → restart. All deployed files are removed.

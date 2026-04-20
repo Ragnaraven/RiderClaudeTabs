@@ -104,13 +104,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private fun loadConfig() {
             if (!CONFIG_FILE.exists()) return
             try {
-                val text = CONFIG_FILE.readText()
-                Regex(""""historyMaxAgeDays"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()?.let {
-                    if (it > 0) historyMaxAgeMs = it * 24 * 60 * 60 * 1000
-                }
-                Regex(""""snapshotKeepCount"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull()?.let {
-                    if (it >= 0) snapshotKeepCount = it
-                }
+                val cfg = ClaudeTabsHelpers.parseConfig(CONFIG_FILE.readText())
+                historyMaxAgeMs = cfg.historyMaxAgeMs
+                snapshotKeepCount = cfg.snapshotKeepCount
                 LOG.info("[ClaudeTabs] Config loaded: historyMaxAgeDays=${historyMaxAgeMs / (24*60*60*1000)}, snapshotKeepCount=$snapshotKeepCount")
             } catch (e: Exception) {
                 LOG.warn("[ClaudeTabs] Config load failed (using defaults): ${e.message}")
@@ -471,37 +467,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      *
      * All four are attempted; individual failures are logged at DEBUG and don't abort the others.
      */
-    /**
-     * True if [newName] is close enough to [currentName] that renaming is just churn.
-     *
-     * Used to skip redundant renames on `claude --resume` (where Claude's CLAUDE.md
-     * instruction triggers a fresh rename with a similar-but-not-identical name).
-     *
-     * Rules:
-     *  - Current empty/generic → never redundant (always allow the rename).
-     *  - Exact match (case-insensitive, whitespace-normalised) → redundant.
-     *  - Word-set overlap ≥ 0.6 (Jaccard) when both have ≥ 2 words → redundant.
-     */
-    private fun isRenameRedundant(currentName: String?, newName: String): Boolean {
-        if (currentName.isNullOrBlank() || isGenericTabName(currentName)) return false
-        val norm: (String) -> String = { it.trim().lowercase().replace(Regex("\\s+"), " ") }
-        if (norm(currentName) == norm(newName)) return true
-
-        val tokens: (String) -> Set<String> = { s ->
-            s.lowercase()
-                .replace(Regex("[^a-z0-9 ]"), " ")
-                .split(Regex("\\s+"))
-                .filter { it.length > 1 }
-                .toSet()
-        }
-        val cur = tokens(currentName)
-        val new = tokens(newName)
-        if (cur.size < 2 || new.size < 2) return false
-        val intersection = cur.intersect(new).size.toDouble()
-        val union = cur.union(new).size.toDouble()
-        val jaccard = if (union == 0.0) 0.0 else intersection / union
-        return jaccard >= 0.6
-    }
+    private fun isRenameRedundant(currentName: String?, newName: String): Boolean =
+        ClaudeTabsHelpers.isRenameRedundant(currentName, newName)
 
     private fun renameTab(project: Project, tab: TabInfo, name: String) {
         if (isRenameRedundant(tab.tabName, name)) {
@@ -923,7 +890,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
     /** Stable hash of the project path, used as the suffix for restore/snapshot file names. */
     private fun projectHash(project: Project): String =
-        (project.basePath ?: "default").replace("\\", "/").replace(":/", "--").replace("/", "-")
+        ClaudeTabsHelpers.projectHashForPath(project.basePath)
 
     private fun getStateFile(project: Project): File = File(STATE_DIR, "restore-${projectHash(project)}.json")
 
@@ -1187,17 +1154,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         return null
     }
 
-    /** Process names recognised as terminal shells (used by [findShellAncestor]). */
-    private val SHELL_NAMES = setOf(
-        "bash", "bash.exe", "sh", "sh.exe", "zsh", "fish",
-        "pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd.exe"
-    )
-
     /** @return true if [cmd] ends in a known shell executable name (any OS). */
-    private fun isShellCommand(cmd: String): Boolean {
-        val name = cmd.substringAfterLast('/').substringAfterLast('\\').lowercase()
-        return name in SHELL_NAMES
-    }
+    private fun isShellCommand(cmd: String): Boolean = ClaudeTabsHelpers.isShellCommand(cmd)
 
     /**
      * Walk up at most 5 levels from [claudePid] looking for the terminal shell process that hosts
@@ -1372,18 +1330,9 @@ $CLAUDE_MD_MARKER
     // UTILITIES
     // ══════════════════════════════════════════════════════════════
 
-    private fun extractJsonString(json: String, key: String): String? {
-        val m = Regex(""""$key"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""").find(json) ?: return null
-        return m.groupValues[1].replace("\\\\", "\\").replace("\\\"", "\"")
-    }
-
-    /** Tabs with generic names should never be saved for restore or grabbed for restore */
-    private fun isGenericTabName(name: String): Boolean {
-        val n = name.trim()
-        return n == "Local" || n.matches(Regex("Local \\(\\d+\\)")) ||
-            n == "bash" || n == "pwsh" || n == "PowerShell" || n == "cmd" ||
-            n.matches(Regex("bash \\(\\d+\\)")) || n.matches(Regex("pwsh \\(\\d+\\)"))
-    }
-
-    private fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
+    // Pure helpers delegated to ClaudeTabsHelpers so they can be unit-tested
+    // without needing an IntelliJ Project instance.
+    private fun extractJsonString(json: String, key: String): String? = ClaudeTabsHelpers.extractJsonString(json, key)
+    private fun isGenericTabName(name: String): Boolean = ClaudeTabsHelpers.isGenericTabName(name)
+    private fun esc(s: String): String = ClaudeTabsHelpers.esc(s)
 }
