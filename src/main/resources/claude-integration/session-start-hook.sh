@@ -31,7 +31,7 @@ if [ -n "$SID" ]; then
   # Primary: per-tab mapping — race-condition free
   TERM_SID="${TERM_SESSION_ID}"
   if [ -n "$TERM_SID" ]; then
-    echo "$SID" > "$MAP_DIR/$TERM_SID"
+    echo "$SID" >"$MAP_DIR/$TERM_SID"
   fi
 
   # Legacy queue — kept so older rename-tab.sh versions keep working
@@ -39,5 +39,5 @@ if [ -n "$SID" ]; then
   QUEUE_DIR="$HOME/.claude/rider-plugin/session-queue"
   mkdir -p "$QUEUE_DIR"
   TIMESTAMP=$(date +%s%N 2>/dev/null || date +%s)
-  echo "$SID" > "$QUEUE_DIR/$TIMESTAMP"
+  echo "$SID" >"$QUEUE_DIR/$TIMESTAMP"
 fi

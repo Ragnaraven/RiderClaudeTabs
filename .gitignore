@@ -9,3 +9,11 @@ build/
 # OS
 Thumbs.db
 .DS_Store
+
+# Nix
+/result
+/result-*
+# Workspace symlink to the dev-shell's resolved JDK (created by
+# devshell.startup.link-jdk in flake.nix). Keeps IntelliJ/Rider's
+# project-SDK path stable across nixpkgs bumps.
+/nix-jdk

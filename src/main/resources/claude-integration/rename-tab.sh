@@ -24,7 +24,7 @@
 
 NAME="$1"
 if [ -z "$NAME" ]; then
-  echo "Usage: bash ~/.claude/rider-plugin/rename-tab.sh \"Tab Name\""
+  echo 'Usage: bash ~/.claude/rider-plugin/rename-tab.sh "Tab Name"'
   exit 1
 fi
 
@@ -37,12 +37,12 @@ mkdir -p "$TABS_DIR"
 is_pid_alive() {
   local pid="$1"
   case "$(uname -s 2>/dev/null)" in
-    MINGW*|MSYS*|CYGWIN*)
-      tasklist //FI "PID eq $pid" 2>/dev/null | grep -q "$pid"
-      ;;
-    *)
-      kill -0 "$pid" 2>/dev/null
-      ;;
+  MINGW* | MSYS* | CYGWIN*)
+    tasklist //FI "PID eq $pid" 2>/dev/null | grep -q "$pid"
+    ;;
+  *)
+    kill -0 "$pid" 2>/dev/null
+    ;;
   esac
 }
 
@@ -54,7 +54,7 @@ TERM_SID="${TERM_SESSION_ID}"
 if [ -n "$TERM_SID" ] && [ -f "$MAP_DIR/$TERM_SID" ]; then
   sid=$(cat "$MAP_DIR/$TERM_SID")
   if [ -n "$sid" ]; then
-    echo "{\"name\":\"$NAME\"}" > "$TABS_DIR/$sid.json"
+    echo "{\"name\":\"$NAME\"}" >"$TABS_DIR/$sid.json"
     exit 0
   fi
 fi
@@ -88,7 +88,7 @@ for sf in "$SESSIONS_DIR/"*.json; do
 done
 
 if [ -n "$best_sid" ]; then
-  echo "{\"name\":\"$NAME\"}" > "$TABS_DIR/$best_sid.json"
+  echo "{\"name\":\"$NAME\"}" >"$TABS_DIR/$best_sid.json"
   exit 0
 fi
 

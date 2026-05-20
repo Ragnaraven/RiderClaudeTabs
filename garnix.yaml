@@ -1,0 +1,29 @@
+# Garnix CI configuration — https://garnix.io/docs/ci/yaml_config/
+#
+# Scope:
+# - One Linux arch (x86_64-linux) keeps minute usage low. The plugin is a
+#   pure JAR, so a single sandbox/Action build is sufficient verification.
+# - `builds.branch: main` restricts sandbox builds (treefmt, devShell) to
+#   pushes that land on the default branch — i.e. the merge commit when a
+#   PR is merged. PR branches themselves skip these.
+# - **Actions cannot be branch-restricted** — Garnix's schema has no
+#   per-action `branch` / `branches` / `if` key. `gradle-check` fires on
+#   every push regardless of branch. If that minute cost is unacceptable,
+#   the only lever is removing the action entirely (and losing CI build
+#   verification for the gradle plugin).
+
+builds:
+  branch: main
+  include:
+    - "checks.x86_64-linux.*"
+    - "devShells.x86_64-linux.default"
+  exclude: []
+
+actions:
+  # `./gradlew` needs network (downloads Gradle 8.5 + IntelliJ Platform SDK
+  # 2024.3 on first run), so the build invocation lives here rather than in
+  # flake.checks. Body in flake.nix at `apps.x86_64-linux.gradle-check`.
+  # Fires on every push to any branch — see note above.
+  - on: push
+    run: gradle-check
+    withRepoContents: true

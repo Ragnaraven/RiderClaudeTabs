@@ -7,7 +7,7 @@
 
 NAME="$1"
 if [ -z "$NAME" ]; then
-  echo "Usage: bash ~/.claude/rider-plugin/rename-tab.sh \"Tab Name\""
+  echo 'Usage: bash ~/.claude/rider-plugin/rename-tab.sh "Tab Name"'
   exit 1
 fi
 
@@ -22,7 +22,7 @@ TERM_SID="${TERM_SESSION_ID}"
 if [ -n "$TERM_SID" ] && [ -f "$MAP_DIR/$TERM_SID" ]; then
   sid=$(cat "$MAP_DIR/$TERM_SID")
   if [ -n "$sid" ]; then
-    echo "{\"name\":\"$NAME\"}" > "$TABS_DIR/$sid.json"
+    echo "{\"name\":\"$NAME\"}" >"$TABS_DIR/$sid.json"
     exit 0
   fi
 fi
@@ -45,12 +45,13 @@ for sf in "$SESSIONS_DIR/"*.json; do
   [ -z "$sid" ] && continue
   started=$(grep -o '"startedAt":[0-9]*' "$sf" | head -1 | sed 's/"startedAt"://')
   if [ -n "$started" ] && [ "$started" -gt "$best_time" ] 2>/dev/null; then
-    best_time="$started"; best_sid="$sid"
+    best_time="$started"
+    best_sid="$sid"
   fi
 done
 
 if [ -n "$best_sid" ]; then
-  echo "{\"name\":\"$NAME\"}" > "$TABS_DIR/$best_sid.json"
+  echo "{\"name\":\"$NAME\"}" >"$TABS_DIR/$best_sid.json"
   exit 0
 fi
 
