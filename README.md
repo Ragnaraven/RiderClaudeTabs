@@ -1,5 +1,7 @@
 # Claude Terminal Tab Persistence
 
+[![built with garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2FRagnaraven%2FRiderClaudeTabs)](https://garnix.io/repo/Ragnaraven/RiderClaudeTabs)
+
 A JetBrains Rider / IntelliJ plugin that persists [Claude Code](https://claude.com/claude-code) terminal sessions across IDE restarts — your tabs come back with their names and auto-resume their conversations.
 
 ## What it does
