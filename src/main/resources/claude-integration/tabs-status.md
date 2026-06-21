@@ -1,45 +1,52 @@
-Show a status report of currently-active Claude Code sessions tracked by the Rider plugin.
+Status report of currently-tracked Claude sessions (live in `active-sessions/`, plus the most recent eviction backlog entries).
 
-**Do NOT shell out to Node here** (except the one-shot project-resolver helper below). Read the JSON yourself — the user has explicitly asked for minimal terminal noise.
+By default this is scoped to the **current project**. Pass `--all` for everything across every project.
 
-By default this is scoped to the **current project**. Pass `--all` to see active sessions across every project.
+**Do NOT shell out to Node for reading** — read the JSON files yourself with **Read** and **Glob** for minimal terminal noise. The one helper invocation is the project resolver.
 
 ## Steps
 
-1. Decide scope:
-   - If `$ARGUMENTS` contains `--all` (case-insensitive, anywhere in the args), load every project's restore file (the original "all projects" behavior).
-   - Otherwise, resolve the current project. **Fast path (1.0.17+):** read `~/.claude/rider-plugin/project-index.json` with the **Read** tool. It's a JSON object `{"projects":[{"hash":"...","basePath":"...","name":"..."}, ...]}` maintained by the plugin on every project open/close. Find the entry whose `basePath` is an ancestor of (or equals) your current working directory (`pwd` from shell), pick its `hash` and `name`. This is ~5ms vs ~500-800ms for the Node fallback.
+1. Resolve the current project (unless `--all` is in `$ARGUMENTS`):
+   ```bash
+   node ~/.claude/rider-plugin/current-project.js
+   ```
+   Capture `root` and `name`.
 
-     **Slow fallback** only when the index is missing OR no ancestor matches (e.g. cwd is outside any tracked project):
-     ```bash
-     node ~/.claude/rider-plugin/current-project.js
-     ```
-     Capture `hash` and `name` from the JSON output. Read only `~/.claude/rider-plugin/restore-<hash>.json` with the **Read** tool.
+2. **Live section** — use the **Glob** tool to find every `~/.claude/rider-plugin/active-sessions/*.json`. Read each with **Read**. Each is `{ sid, cwd, pid, lastSeen, name }`.
 
-2. **Project-scoped read** — if the file doesn't exist or is empty, tell the user *"No active Claude sessions tracked for `<name>`. Run `/tabs-status --all` to see other projects."* and stop.
+   Filter (unless `--all`): keep entries whose `cwd`, after normalising (`\` → `/`, lowercase, trim trailing `/`), is `root`, starts with `root + "/"`, or starts with `root + "-"` (sibling worktrees).
 
-   **--all read** — use the **Glob** tool to find every `~/.claude/rider-plugin/restore-*.json`. If none match, tell the user *"No active Claude sessions tracked."* and stop. Each file is an array of `{ sessionId, cwd, tabName, bypassPermissions? }`. Group entries by project (basename of `cwd`).
-
-3. Print a **markdown table per project**, one row per session. Markdown tables are the only thing in Claude Code's renderer that gives us proper column alignment and inline styling — use them, not flat text. Bold the tab name, render the session prefix in `inline code`, and only include a `Mode` cell value when `bypassPermissions` is true (cell shows `bypass`, otherwise empty). Project name as a `## Heading` above each table:
+   If non-empty, render as a markdown table:
 
    ```markdown
-   ## MyApp (3 tabs)
+   ## Live — <name> (N tabs)
 
-   | # | Tab                         | Mode   | Session     |
-   |--:|:----------------------------|:-------|:------------|
-   | 1 | **Login Bug**               |        | `7740bd36`  |
-   | 2 | **Cert Renewal**            | bypass | `21c74a30`  |
-   | 3 | **Settings UI**             |        | `f20472c8`  |
+   | # | Tab note        | Session     | cwd                       | pid    | Last seen |
+   |--:|:----------------|:------------|:--------------------------|-------:|:----------|
+   | 1 | **Fix Auth Flow** | `aa11bb22` | `D:\Dev\MyApp`         | 33236  | 2s        |
+   | 2 | —               | `cc33dd44`  | `D:\Dev\MyApp`          | 32356  | 3s        |
    ```
 
-   When project-scoped, you'll only emit one table — that's fine.
+   Use bold for `name` when present; `—` when null. Render `Last seen` as relative age (`Ns` / `Nm Ss` etc., from `Date.now() - lastSeen`).
 
-4. After the per-project tables, **also read** `~/.claude/rider-plugin/last-restore.json` (Windows: `%USERPROFILE%\.claude\rider-plugin\last-restore.json`) **with the Read tool** if it exists. The file is a single JSON object: `{ "restoredAt": <ms>, "projectName": "...", "count": N, "sessions": [{"tabName":"...","sessionId":"..."}, ...] }`. If present, print one extra line right before the totals line:
+3. **Recently evicted section** — read `~/.claude/rider-plugin/session-backlog.json`. Same project filter as live. Take the most recent 10. Render only if non-empty:
 
-   `Sessions restored on this Rider start: <count> ({projectName}).`
+   ```markdown
+   ## Recently evicted (last 10)
 
-   When project-scoped, only show this line if `projectName` matches the current project name (case-insensitive). If the file is missing, malformed, or for a different project, skip the line silently.
+   | # | Age      | Tab note        | Session     | cwd               |
+   |--:|:---------|:----------------|:------------|:------------------|
+   | 1 | 42s      | **Login Bug**   | `ee55ff66`  | `D:\Dev\MyApp`  |
+   ```
 
-5. Last line (plain text):
-   - **Project-scoped**: `Total: <N> active session(s) for <name>.`
-   - **--all**: `Total: <N> active sessions across <P> projects.`
+4. **Restore info** — optionally read `~/.claude/rider-plugin/last-restore.json` (`{ "restoredAt": <ms>, "projectName": "...", "count": N, "sessions": [...] }`). If present AND `projectName` matches `<name>` (case-insensitive, unless `--all`), print one line:
+
+   `Sessions restored on this Rider start: <count> (<projectName>).`
+
+   Skip silently if missing/mismatched.
+
+5. Final line (plain text):
+   - **Project-scoped**: `Total: <N> live session(s) for <name>, <M> recently evicted.`
+   - **--all**: `Total: <N> live session(s), <M> recently evicted across <P> projects.`
+
+If both sections are empty, just say: *"No tracked Claude sessions for `<name>`. Open a terminal and run `claude` to start one."*

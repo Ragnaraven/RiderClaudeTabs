@@ -1,12 +1,14 @@
-Rename your Rider terminal tab AND snapshot this tab to /tabs-history so you can resume it later.
+Name this Rider terminal tab. Sets a persistent, user-chosen tab name for THIS Claude session — it outranks the auto-generated topic name, shows as `✳ <name>` on the tab within ~1s, and survives Rider restarts.
 
-If no name was provided, pick a concise name (3-5 words) based on the current conversation topic.
+## Steps
 
-**Speed-critical:** This is one bash command, not multiple sequential tool calls. Each Claude tool round-trip costs ~500ms; chaining the rename + snapshot + confirmation into a single script invocation cuts /tab's first-run wall time roughly in half.
+1. Determine the desired name:
+   - If `$ARGUMENTS` is non-empty, use it verbatim as the name (the user's exact words ARE the name — do not reinterpret or summarize them).
+   - If `$ARGUMENTS` is empty, pick a concise 3–5 word name describing this conversation's purpose.
 
-1. Run the combined handler. The script prints its own confirmation on success so no extra LLM step is needed:
+2. Set it:
    ```bash
-   bash ~/.claude/rider-plugin/tab.sh "$ARGUMENTS"
+   node ~/.claude/rider-plugin/tab-name.js "<name>"
    ```
 
-2. Show the script's output verbatim. The success line is `Tab renamed to '<name>' and backed up to history.` — relay that. If the script printed an error to stderr, show that instead.
+3. Confirm with the script's one-line output. If it fails with "could not determine this Claude session", tell the user the session isn't tracked yet (it appears within ~5s of starting) and to retry.

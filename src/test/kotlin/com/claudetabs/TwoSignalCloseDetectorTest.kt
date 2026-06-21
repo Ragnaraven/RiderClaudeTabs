@@ -86,6 +86,32 @@ class TwoSignalCloseDetectorTest {
         assertEquals(TwoSignalCloseDetector.Signal1.AddToPending("sid-real-close"), d)
     }
 
+    @Test fun signal1_appExiting_skipsBeforeAnythingElse() {
+        // IDE restart/quit (e.g. plugin-install restart) tears down every tab through the
+        // same callback as a single-tab X. appExiting must short-circuit FIRST so a window
+        // close is never mis-recorded as a pile of user tab-closes — the exact bug that put
+        // 12 live sessions into user-closed and blocked them from restoring.
+        val d = TwoSignalCloseDetector.decideOnRemoveQuery(
+            projectClosing = false, isTemporary = false, sid = "sid-1", appExiting = true,
+        )
+        assertEquals(TwoSignalCloseDetector.Signal1.SkipAppExiting, d)
+    }
+
+    @Test fun signal1_appExiting_outranksProjectClosingAndTemporary() {
+        val d = TwoSignalCloseDetector.decideOnRemoveQuery(
+            projectClosing = true, isTemporary = true, sid = "sid-1", appExiting = true,
+        )
+        assertEquals(TwoSignalCloseDetector.Signal1.SkipAppExiting, d)
+    }
+
+    @Test fun signal1_appExitingDefaultsFalse_normalCloseStillPends() {
+        // Omitting appExiting (default false) preserves the genuine single-tab-close path.
+        val d = TwoSignalCloseDetector.decideOnRemoveQuery(
+            projectClosing = false, isTemporary = false, sid = "sid-real",
+        )
+        assertEquals(TwoSignalCloseDetector.Signal1.AddToPending("sid-real"), d)
+    }
+
     // ══════════════════════════════════════════════════════════════
     // SIGNAL 2 -- confirmPending (process-dead + expiry)
     // ══════════════════════════════════════════════════════════════

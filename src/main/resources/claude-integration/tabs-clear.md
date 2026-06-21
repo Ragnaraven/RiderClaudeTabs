@@ -1,13 +1,11 @@
-Clear the Rider tab plugin's restore cache for **the current project** (or all projects with `--all`).
-
-This removes the project's `restore-<hash>.json` and any per-project snapshots so the next save starts clean. It does **not** touch `history.json` (history is meant to persist across clears so you can still resume past sessions).
+Clear the plugin's `active-sessions/` tracking for the current project (or all projects with `--all`). Does NOT touch `session-backlog.json` — the eviction history is preserved so you can still `/tabs-history` to recover something later.
 
 ## Steps
 
 1. Decide scope:
-   - If `$ARGUMENTS` contains `--all` (case-insensitive), wipe globally:
+   - If `$ARGUMENTS` contains `--all` (case-insensitive), wipe everything:
      ```bash
-     rm -f ~/.claude/rider-plugin/restore-*.json ~/.claude/rider-plugin/snapshots/*.json ~/.claude/rider-plugin/tabs/*.json && echo "Tab cache cleared (all projects)"
+     rm -f ~/.claude/rider-plugin/active-sessions/*.json && echo "Cleared all active-session tracking (backlog preserved)"
      ```
      Stop here.
 
@@ -15,15 +13,15 @@ This removes the project's `restore-<hash>.json` and any per-project snapshots s
    ```bash
    node ~/.claude/rider-plugin/current-project.js
    ```
-   Capture the `hash` value from the JSON output.
+   Capture `root` and `name`.
 
-3. Wipe just this project's cache. Two snapshot patterns are accepted because v1.0.6 changed the delimiter from `-` to `__` (legacy single-dash files may still be on disk):
+3. Use the **Glob** tool to list `~/.claude/rider-plugin/active-sessions/*.json`. **Read** each, parse `{ sid, cwd }`. Keep ones whose `cwd`, after normalising, is `root`, starts with `root + "/"`, or starts with `root + "-"` (sibling worktrees).
+
+4. Delete the matching files with the **Bash** tool (one rm command per match, or grouped — both fine):
    ```bash
-   rm -f ~/.claude/rider-plugin/restore-<hash>.json \
-         ~/.claude/rider-plugin/snapshots/<hash>__*.json \
-         ~/.claude/rider-plugin/snapshots/<hash>-*.json && \
-     echo "Tab cache cleared for <name>"
+   rm -f ~/.claude/rider-plugin/active-sessions/<sid1>.json ~/.claude/rider-plugin/active-sessions/<sid2>.json
    ```
-   Substitute `<hash>` and `<name>` from step 2's output.
 
-4. Confirm to the user: which project was cleared, and a reminder that `history.json` was preserved.
+5. Report: `Cleared N session(s) for <name>. Backlog preserved (use /tabs-history to recover).`
+
+6. One-line reminder: *"The next poll (~5s) will re-create per-sid files for sessions still alive. To truly stop auto-restore for a session, close its terminal tab in Rider — that records a persistent user-closed entry."*

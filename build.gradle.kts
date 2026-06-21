@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "com.claudetabs"
-version = "1.0.18"
+version = "2.0.0"
 
 repositories {
     mavenCentral()
@@ -21,10 +21,11 @@ repositories {
     }
 }
 
-// IntelliJ Platform 2026.1 minimum. The plugin uses createNewSession(...) for terminal
-// creation, which replaces the deprecated createShellWidget(...) — older builds don't
-// have the modernised API. Per JetBrains docs, 2025.3+ unified the Community/Ultimate
-// helper into intellijIdea() (intellijIdeaCommunity is legacy-only).
+// IntelliJ Platform 2026.1 minimum. The plugin uses TerminalToolWindowManager.
+// createShellWidget(...) for terminal creation — the supported public API (the official
+// Claude Code plugin's toolbar button uses the same call); the 5-arg createNewSession
+// overload is @ApiStatus.Internal. Per JetBrains docs, 2025.3+ unified the Community/
+// Ultimate helper into intellijIdea() (intellijIdeaCommunity is legacy-only).
 dependencies {
     intellijPlatform {
         intellijIdea("2026.1")

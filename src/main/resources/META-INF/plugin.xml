@@ -1,189 +1,204 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>1.0.18</version>
+    <version>2.0.0</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
     <h2>Claude Terminal Tab Persistence for Rider / IntelliJ</h2>
 
-    <p>Persists your <a href="https://claude.com/claude-code">Claude Code</a> terminal sessions across IDE
-    restarts — saved tabs come back with their names and auto-resume their conversations, so you can juggle
-    multiple Claude sessions without losing them when you close Rider.</p>
+    <p>Auto-restores your <a href="https://claude.com/claude-code">Claude Code</a> terminal sessions
+    across IDE restarts. The plugin tracks alive Claude sessions in <code>~/.claude/rider-plugin/active-sessions/</code>
+    and, on next project open, spawns one fresh terminal tab per saved session running
+    <code>claude --resume &lt;sid&gt;</code>.</p>
 
-    <h3>Features</h3>
+    <h3>2.0 redesign</h3>
+    <p>Ground-up rework. Earlier versions tried to coordinate tab titles with one-shot writes,
+    which lost races and left tabs as "Local". The new model:</p>
     <ul>
-      <li><b>Auto-rename terminal tabs</b> based on the Claude conversation topic (or a name you give it)</li>
-      <li><b>Race-condition-free</b> identification of each tab via <code>TERM_SESSION_ID</code> mapping</li>
-      <li><b>Session save/restore</b> across IDE restarts — your named tabs come back</li>
-      <li><b>Session history</b> — browse and resume past Claude sessions with <code>/tabs-history</code></li>
-      <li><b>Respects manual renames</b> — if you rename a tab yourself, the plugin backs off</li>
+      <li><b>The plugin owns Claude tab titles.</b> Every tab hosting a Claude session shows
+        <code>✳ &lt;name&gt;</code>, and the glyph animates while the session is thinking
+        (mirroring Claude's own busy/idle status). Titles are continuously enforced — a tab
+        clobbered to "Local" self-heals within half a second.</li>
+      <li><b>Names that stick.</b> Display name priority: your explicit name (Rider's
+        "Rename Tab" or <code>/tab</code>) &gt; Claude's auto-generated topic name &gt; the
+        cached topic. Renames are adopted and persisted across restarts, never fought.</li>
+      <li><b>One file per alive session.</b> <code>active-sessions/&lt;sid&gt;.json</code> —
+        race-safe, no per-project file conflicts.</li>
+      <li><b>Bounded eviction backlog.</b> <code>session-backlog.json</code> keeps the last 50
+        evicted sessions so you can recover them with <code>/tabs-history</code>.</li>
     </ul>
 
-    <h3>Slash Commands (installed into ~/.claude/commands/)</h3>
+    <h3>Slash Commands</h3>
     <ul>
-      <li><code>/tab &lt;name&gt;</code> — rename current tab and snapshot to history</li>
-      <li><code>/tabs-status</code> — report of all active Claude sessions</li>
-      <li><code>/tabs-backup</code> — manually snapshot current sessions to history</li>
-      <li><code>/tabs-history</code> — browse and resume past sessions</li>
-      <li><code>/tabs-restore</code> — restore saved sessions from last close</li>
-      <li><code>/tabs-clear</code> — clear the rename cache</li>
+      <li><code>/tab</code> — set this session's tab name explicitly (persists across restarts)</li>
+      <li><code>/tabs-status</code> — live sessions + recent eviction backlog for the current project</li>
+      <li><code>/tabs-backup</code> — explicit sync: write per-sid files for every alive Claude process</li>
+      <li><code>/tabs-history</code> — browse the eviction backlog and print a resume command</li>
+      <li><code>/tabs-restore</code> — list current per-sid files and print resume commands</li>
+      <li><code>/tabs-clear</code> — clear <code>active-sessions/</code> for the current project</li>
     </ul>
 
-    <p><b>Requirements:</b> Rider / IntelliJ 2024.3+ with the bundled Terminal plugin, and
-    <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a> installed. Currently Windows-focused
-    (the session-detection logic uses <code>tasklist</code>); macOS / Linux compatibility is in progress.</p>
+    <p><b>Requirements:</b> Rider / IntelliJ 2026.1+, <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a>,
+    Node.js (for the bundled helper scripts).</p>
 
-    <p><b>Compatibility:</b> Rider / IntelliJ 2024.3 through 2026.1+. On Rider 2026.1 the plugin coexists
-    with the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex)
-    and Anthropic's official Claude Code [Beta] plugin. <i>This plugin manages terminal-launched Claude CLI
-    sessions only</i> — chat tabs in the AI Agents panel are managed by JetBrains and are not auto-restored
-    here. Set Registry key <code>rider.claude.tabs.respectAiAgents</code> to <code>false</code> to disable
-    the coexistence notice in the log.</p>
+    <p><b>Coexists with</b> the JetBrains AI Assistant chat tool window (AI Agents panel: Junie /
+    Claude Agent / Codex) and Anthropic's official Claude Code [Beta] plugin. This plugin manages
+    <i>terminal-launched</i> Claude CLI sessions only — chat tabs in the AI Agents panel are
+    managed by JetBrains.</p>
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>2.0.0 — Ground-up rework: per-session tracking, title ownership, thinking animation</h3>
+
+    <h4>Crash &amp; restore reliability</h4>
+    <ul>
+      <li>Durable (fsync) writes — a hard crash can no longer zero saved session files.</li>
+      <li>A session is only ever deleted on an explicit tab close; window/IDE-close and
+        unconfirmed deaths demote to restore-pending instead.</li>
+      <li>Tabs restore in their saved left-to-right order.</li>
+      <li>No duplicate or empty ghost tabs on slow resumes; sturdier tab→session matching.</li>
+      <li>Backlog cap raised to 100.</li>
+    </ul>
+
+    <h4>Title ownership: <code>✳ name</code> + thinking animation</h4>
+    <ul>
+      <li><b>The plugin owns Claude tab titles and drives the animation.</b> A title
+        controller enforces <code>✳ &lt;name&gt;</code> on every tab hosting a Claude session
+        (~450ms tick) and cycles the glyph (<code>✳ ✶ ✷ ✸</code>) while the session's own
+        status says busy. Rationale: the native CLI animation lives in the terminal's
+        <i>application title</i>, which a custom tab name hides and which some shells swallow
+        — per-tab names and native animation are mutually exclusive, so the plugin provides
+        both itself. A tab clobbered to "Local" self-heals within one tick; this replaces
+        the one-shot title writes that lost races and left restored tabs unnamed.</li>
+      <li><b>Names from Claude's own metadata.</b> Claude Code maintains an auto-generated
+        topic name per session; the plugin mirrors it (prettified) as the default display
+        name. User-started tabs are matched by process ancestry and titled the same way.</li>
+      <li><b>Renames are adopted, not fought.</b> Rename a tab in Rider (or run
+        <code>/tab My Name</code> in the session) and that text becomes the persistent
+        <code>userName</code> — it outranks the auto topic, survives restarts, and keeps the
+        glyph + animation around it.</li>
+      <li><b>Single lifecycle owner.</b> <code>/tabs-backup</code> is purely additive now
+        (registers/refreshes live sessions, never deletes); only the plugin evicts, demotes,
+        or backlogs entries. A user-closed tab is moved to the backlog immediately with its
+        names, so an accidental close is always recoverable via <code>/tabs-history</code>.</li>
+    </ul>
+
+    <h4>Survive Rider restarts: observed vs unobserved deaths</h4>
+    <ul>
+      <li><b>Fixes "nothing restores after a Rider restart."</b> When Rider exits, every
+        Claude process dies with it. On the next start the poll loop saw all recorded pids
+        dead and evicted the entire saved state to the backlog before the restore loops ran
+        (one window's poll raced another window's restore and won by 2 seconds). The eviction
+        contract is now "evict deaths we OBSERVED": a one-shot startup reconcile rewrites
+        every dead-pid entry to <code>pid=null</code> (restore-pending, never evicted), so
+        only sessions that die while the plugin is actually watching get evicted.</li>
+      <li><b>Strike spacing.</b> The dead-strike tracker is shared across project windows in
+        one Rider JVM; two windows polling milliseconds apart could burn both K=2 strikes in
+        one logical round. Strikes now require ≥4s spacing to count.</li>
+      <li><b>Named from the first frame.</b> Restored tabs are created with their composed
+        <code>✳ &lt;saved name&gt;</code> title (user name &gt; cached topic &gt; "Claude"),
+        then the title controller keeps it correct — "Local" can no longer appear, even
+        transiently.</li>
+    </ul>
+
+    <h4>Spawn-attempt cap + sibling-project arbitration</h4>
+    <ul>
+      <li><b>Hard cap of 3 spawn attempts per sid per Rider session.</b> 2.0.1's retry-spawn
+        had no ceiling — a resume that consistently failed to register an alive Claude
+        (e.g. the CLI's large-session "resume from summary?" confirmation prompt holding
+        the process pre-registration) spawned a new terminal tab every 60 seconds, without
+        bound. After 3 attempts the entry stays in <code>active-sessions/</code> for manual
+        recovery and a warning lands in idea.log.</li>
+      <li><b>Sibling-project arbitration.</b> The worktree clause (<code>&lt;base&gt;-&lt;suffix&gt;</code>)
+        no longer lets a parent project's window claim a sibling <i>project's</i> sessions
+        (e.g. <code>MyApp</code> claiming <code>MyApp-mobile</code>). A dash-suffix cwd is
+        claimed only when no more-specific project base is known, where "known" = any open
+        Rider project + every entry in <code>project-index.json</code> (projects seen open
+        before). Genuine git worktrees are never opened as their own Rider projects, so the
+        parent still claims them; sibling projects wait for their own window.</li>
+      <li><code>project-index.json</code> maintenance restored (dropped in the 2.0 rewrite;
+        needed by the arbitration above and the <code>/tabs-status</code> fast path).</li>
+    </ul>
+
+    <h4>Migration-spawn safety net</h4>
+    <ul>
+      <li><b>pid=null entries never auto-evict.</b> 2.0's migration seeds <code>active-sessions/</code>
+        with <code>pid=null</code> until the first poll confirms a matching alive Claude. If
+        the on-restore spawn didn't materialise within two polls (Terminal tool window not
+        ready, etc.), the dead-strike logic was evicting the migration seed to the backlog
+        before the user ever saw a tab. Now <code>pid=null</code> entries are skipped by
+        the eviction path entirely — they sit until either confirmed alive or the user
+        explicitly clears via <code>/tabs-clear</code>.</li>
+      <li><b>Retry-spawn on every poll.</b> If an unconfirmed entry's cwd belongs to this
+        project and we haven't already spawned for its sid in this Rider session, the next
+        poll re-attempts <code>claude --resume</code> in a fresh terminal tab. Dedup is via
+        an in-memory <code>attemptedRestoreSpawnSids</code> set so a successful first spawn
+        isn't re-fired.</li>
+    </ul>
+
+    <h4>Storage model: per-sid files + bounded backlog</h4>
+    <ul>
+      <li><b>Tab titles are no longer managed by the plugin.</b> Rider's defaults ("Local",
+        "Local (2)") win. Use Rider's native "Rename Tab" if you want a label — Rider persists
+        it. Rationale: 1.x's naming layer was the proximate cause of every recurring bug —
+        rename storms thrashing the restore file, cross-project session pollution, sessions
+        evicted by transient detection misses, two tabs cross-wired to the same sid.</li>
+      <li><b>Per-sid storage.</b> One file per alive Claude session under
+        <code>~/.claude/rider-plugin/active-sessions/&lt;sid&gt;.json</code> instead of one
+        per-project <code>restore-&lt;hash&gt;.json</code>. Race-safe across multiple Rider
+        windows (atomic tmp+rename), idempotent writes, filtering moved to read-time.</li>
+      <li><b>Eviction backlog.</b> <code>~/.claude/rider-plugin/session-backlog.json</code> —
+        global, max 50 entries, newest first, prepended on each eviction with dedup-by-sid.
+        Browse via <code>/tabs-history</code>.</li>
+      <li><b>K=2 dead-strike eviction.</b> A per-sid file is deleted only after two consecutive
+        polls confirm the underlying Claude process is gone (PID file missing OR PID file's
+        sessionId differs from ours). Forgives transient detection misses without keeping
+        zombies past ~10s.</li>
+      <li><b>Worktree-sibling cwd tolerance.</b> A session whose cwd is
+        <code>&lt;projectBase&gt;-&lt;suffix&gt;</code> (typical git worktree shape) is
+        recognised as belonging to the parent project. Fixes the original bug where
+        <code>D:\Dev\MyApp-feature</code> sessions inside an MyApp Rider window were
+        rejected by the cwd filter.</li>
+      <li><b>One-time migration from 1.x.</b> First 2.0 launch reads every existing
+        <code>restore-&lt;hash&gt;.json</code>, seeds <code>active-sessions/</code> with
+        <code>pid=null</code> entries (first poll either confirms or starts the dead-strike
+        counter), and renames legacy files to <code>.pre-2.0</code> siblings. Old
+        <code>names.json</code> is preserved as <code>names.json.pre-2.0</code> (its content
+        isn't merged — restore-file <code>tabName</code> is more recent).</li>
+      <li><b><code>/tab</code> simplified.</b> Now a "force-save now" command. <code>$ARGUMENTS</code>
+        becomes an optional <code>metaName</code> note shown in <code>/tabs-status</code> listings —
+        <i>never</i> used as a tab title.</li>
+      <li><b><code>/tabs-backup</code> rewritten.</b> Explicit sync: scans
+        <code>~/.claude/sessions/</code> and writes per-sid files for every alive Claude,
+        evicting dead per-sid files (no K-strike grace — immediate). Reports
+        <code>synced: N added, M evicted, K already current</code>.</li>
+      <li><b>~65% net code reduction.</b> <code>ClaudeTabWatcherStartup.kt</code> 3200 → ~600 lines;
+        <code>ClaudeTabsStorage.kt</code> 615 → ~150 lines. Deleted:
+        <code>SpawnedWidgetRenameFastPath.kt</code>, <code>ImmediateRenamePersistence.kt</code>,
+        the rename-application chain (<code>renameTab</code>, <code>findTerminalTitle</code>,
+        <code>installTitleListener</code>, <code>watchTabsDirectory</code>,
+        <code>handlePidRename</code>, <code>handleTermSessionRename</code>,
+        <code>persistRenameImmediately</code>, <code>handleRename</code>), the
+        <code>canonicalSessionIdFor</code> 3-strategy resolver, <code>claimedByTabWalk</code>
+        cross-project arbitration, <code>sessionAliases</code> rotated→canonical mirroring,
+        and the entire <code>names.json</code> store.</li>
+      <li><b>Bundled scripts pruned.</b> Removed: <code>rename-tab.sh</code>,
+        <code>session-start-hook.sh</code>, <code>tab.sh</code>, <code>tab-backup.js</code>.
+        Added: <code>tab-now.js</code> (immediate per-sid write for the new <code>/tab</code>).
+        Kept: <code>current-project.js</code>, <code>backup-active.js</code> (rewritten).</li>
+    </ul>
+
     <h3>1.0.18</h3>
     <ul>
-      <li><b>Window-state serialization: tabs are tracked by which Rider window they live in, not by their working directory.</b> A Claude session opened from a sibling folder (e.g. a git worktree at <code>D:\Dev\MyApp-feature-branch</code>) whose terminal tab is hosted in the main project's Rider window is now correctly tracked in that project's restore file. Pre-1.0.18 the cwd-prefix filter dropped these sessions as "cross-project leaks" and they never auto-restored.</li>
-      <li><b>Worktree-resume transcript lookup:</b> when a session originally started in one folder is later resumed by sid from a different folder (typical worktree workflow: <code>cd ../MyApp-feature && claude --resume &lt;sid&gt;</code>), Claude keeps appending to the original transcript path. The transcript-existence check now falls back to scanning all project dirs after the cwd-derived path misses, so the session is no longer rejected with <code>skipNoTranscript</code> and lands in the restore file like any other.</li>
-      <li><b>Tab discovery is now authoritative.</b> The <code>poll()</code> tab-walk re-contributes to the saved session list (it was disabled in the early 1.0.17 work after a canonical-id collision caused stale sids to shadow real ones; the underlying collision is now fixed, so tab-walk is trustworthy again). <code>SessionsDirScanner</code> stays as a fallback for tabs the platform APIs lose.</li>
-      <li><b>DockManager-based 5th tab source:</b> popped-out terminal tabs in floating windows are now enumerated via <code>com.intellij.openapi.fileEditor.impl.DockManager.containers</code>. Reflective access with try/catch fallback &mdash; missing API on older IDEs degrades to "no popout coverage" rather than a crash. Combined with the existing 4 enumeration sources, this catches tabs across split panes, island groups, hidden-under-overflow, minimized tool windows, and popped-out floating windows.</li>
-      <li><b>Cross-project arbitration:</b> when two open project windows would both claim the same session, the project whose tab-walk found it wins. The other project's scanner defers. Prevents the same sid from being saved into two restore files.</li>
-      <li><b>Canonical-id cache correction:</b> <code>canonicalSessionIdFor</code> now always re-checks Strategy 1 (transcript-on-disk) before honoring cached results. A stale Strategy 3 mtime-fallback guess gets corrected the instant the real transcript appears. Fixes two distinct alive sids collapsing into one canonical (which previously caused the scanner to skip the second as <code>skipAlreadyHave</code> and the save loop to drop it from the restore file).</li>
-      <li><b><code>names.json</code> auto-applied to live tabs.</b> The poll loop now re-applies a stored name when the live tab title is generic ("Local"/"Claude") or an AI overlay glyph. Manual user-typed titles are still respected. Effect: setting a name via <code>/tab</code>, migration backfill, or direct <code>names.json</code> edit shows up on the tab strip within ~5 seconds.</li>
-      <li><b>Two-poll-grace eviction.</b> A sid missing from one poll's scanner output is no longer instantly evicted from the restore file &mdash; it's preserved one cycle (the grace), then evicted if still missing on the second poll. Forgives single-poll races (Claude restart, brief PID gap, scanner momentary skip) without keeping zombies forever. Worst-case eviction lag: ~10s at the 5s poll cadence.</li>
-      <li><b>Authoritative <code>saveState</code> with name preservation.</b> When the scanner returns a non-empty list, existing restore entries whose sid isn't in the new list are dropped (the eviction path for dead zombies and cross-project leaks). Descriptive names from the prior file are preserved when the scanner returns a generic name for the same sid &mdash; restore-file-only names from sessions that pre-date <code>names.json</code> survive.</li>
-      <li><b><code>/tabs-backup</code> rewritten.</b> Source switched from "whatever's in the restore file" to <code>~/.claude/sessions/*.json</code> (Claude's own alive list). Now actually backs up every currently-alive session, catching anything the poll lagged on or dropped. Updates both the restore file AND <code>history.json</code> in one go.</li>
-      <li>248+ unit tests &mdash; new scenarios cover canonical-id cache correction, two-poll-grace eviction + recovery, authoritative replace with descriptive-name preservation, the tab-walk-pollution regression shape, JSON cwd extraction with Windows-style double-backslash escapes, and the rewritten <code>/tabs-backup</code> behavior.</li>
-    </ul>
-
-    <h3>1.0.17</h3>
-    <ul>
-      <li><b>Saves no longer trust the live widget title for tab names.</b> A new <code>names.json</code> store keyed by sessionId is the durable source of truth. The save loop reads from there ahead of the legacy fallback chain, so the JetBrains AI Assistant overlay corrupting the live title with a status glyph (e.g. <code>&#x2733; Claude Code</code>) can no longer reach the saved name. Fixes restored tabs coming back as <code>&#x2733; Claude Code</code> instead of their real names.</li>
-      <li><b>3-tier rolling backup of the restore file.</b> New <code>backups/active-sessions-&lt;projectHash&gt;-{1,2,3}.json</code>, rotated on every non-empty save. Load fallback now: live &rarr; backup-1 &rarr; backup-2 &rarr; backup-3 &rarr; existing snapshots/. Recovery from a corrupted live file is automatic, with an idea.log line confirming which tier was used.</li>
-      <li><b>User-closed sessions persist to disk.</b> New <code>user-closed-&lt;projectHash&gt;.json</code> per project, hydrated on plugin startup and atomically appended at close-verify time. Pre-1.0.17 this was in-memory only &mdash; a hard kill / Task Manager / power loss between the X-click and the next save resurrected the just-closed tab on restart.</li>
-      <li><b>Empty-write bypass closed.</b> <code>removeFromRestoreImmediately</code> used to write the restore file directly, skipping the empty-write guard. On false-positive close events during IDE-update tab thrash this wiped every session to <code>[]</code>. Now routed through <code>saveState</code>, which preserves the file when subtraction would empty it.</li>
-      <li><b>Startup-grace gate on poll().</b> During the first 60s with restore-spawn still pending, the save loop is a no-op. Avoids empty-active overwrites while the spawned tabs are still warming up.</li>
-      <li><b>AI overlay regex extended for U+2731&ndash;U+273F</b> (Dingbats heavy-asterisk family). The old range stopped at U+28FF and missed <code>&#x2733;</code> (U+2733) &mdash; the glyph Claude Code currently emits.</li>
-      <li><b>Names follow resumed sessions.</b> When the poll loop sees a rotated&rarr;canonical sessionId after <code>claude --resume</code>, the canonical sid's name is mirrored onto the rotated sid in <code>names.json</code>, so future lookups under either id resolve.</li>
-      <li><b>/tabs-status is now ~10x faster.</b> Plugin maintains <code>project-index.json</code> on every project open; the skill reads it (~5ms) instead of cold-starting Node (~500&ndash;800ms on Windows). Total drops from ~900ms to under 100ms. Node fallback retained for the no-ancestor-match edge case.</li>
-      <li>Startup self-test banner in idea.log surfaces the load-bearing API state (terminal tool window, frontend/backend tab managers, DockManager, names.json health) for diagnosability across future IDE drifts.</li>
-      <li>223 unit tests &mdash; 23 new covering names.json upsert/cache/alias/prune, persistent userClosed round-trip + per-project isolation, backup rotation, load fallback through backup tiers, and dingbats regex coverage.</li>
-    </ul>
-
-    <h3>1.0.16</h3>
-    <ul>
-      <li><b>Fixes X-button closes being silently dropped right after restart</b> — the 30-second startup grace introduced in 1.0.15 was too coarse: it correctly ignored Rider's tool-window re-layout events, but it also ate legitimate user closes that happened in the same window (the most natural moment to close an unwanted tab is right after seeing it auto-restore). The grace is gone; a contentRemoved is now disambiguated by capturing the underlying <code>TerminalWidget</code> and checking 1.5 seconds later whether it's still attached to any <code>Content</code> in the tool window. Shuffles re-bind the widget to a fresh Content within the same swing tick; real closes leave it orphaned. Works regardless of how recently the plugin attached.</li>
-      <li><b>Restore file rewritten synchronously on confirmed close</b> — used to wait for the next 5-second poll, which meant a user who clicked X then immediately closed Rider could lose the close (the next poll never runs). Now the verify step writes the restore file atomically the moment the close is confirmed.</li>
-      <li>Verify delay shortened 3s → 1.5s. Widget-attachment is decidable as soon as Rider completes the swing tick that holds the shuffle.</li>
-    </ul>
-
-    <h3>1.0.15</h3>
-    <ul>
-      <li><b>Fixes "tabs go missing after restart"</b> — the <code>ContentManagerListener</code> was treating Rider's tool-window re-layout events (fired while restoring tabs, splits, popouts at startup) as user closes, then subtracting those sessions from the restore file forever. A 30-second startup grace where every <code>contentRemoved</code> was ignored, plus a 3-second deferred process-alive check for events past the grace. (Superseded by the 1.0.16 widget-attachment check, which catches the same re-layout case without the false-negative on fast user closes.)</li>
-      <li><b>Fixes descriptive tab names being silently replaced with "Local"</b> across restart. The save-loop union was unconditionally letting the live tab title overlay the saved name, so a freshly-spawned tab whose title still read "Local" (Claude hadn't repainted yet after <code>--resume</code>) would clobber the descriptive name on disk within 5 seconds. Now a generic name can never beat a descriptive one — other fields (cwd, bypass) still propagate.</li>
-      <li><b>Clears Marketplace verifier warning</b> on the spawn-new-tab call. <code>TerminalToolWindowManager.createNewSession</code> is annotated <code>@ApiStatus.Internal</code> in 2025.x+ and the verifier rejected the direct invocation. The call is now reflective, so there's no compile-time binary reference for the verifier to flag; runtime behaviour is unchanged.</li>
-      <li>Extensive logging on every close-detection branch — search <code>idea.log</code> for <code>[ClaudeTabs][close]</code> and <code>[ClaudeTabs][verify]</code> to see exactly why each event was kept or ignored.</li>
-    </ul>
-
-    <h3>1.0.14</h3>
-    <ul>
-      <li>Bundled shell scripts (<code>rename-tab.sh</code>, <code>session-start-hook.sh</code>) now ship with LF line endings, fixing the <code>$'\r': command not found</code> error on macOS / Linux (issue #1). Three layers of defense: <code>.gitattributes</code> pin, normalised source files, and runtime CR stripping at deploy time.</li>
-      <li>Minimum platform bumped to IntelliJ 2026.1 (build 261). Migrated off the deprecated <code>createShellWidget</code> to <code>createNewSession</code>; built against IntelliJ Platform Gradle Plugin 2.x with Kotlin 2.3.</li>
-      <li>Restore file is now a high-water-mark union of existing + new sessions, minus sessions the user explicitly closed. A missed poll can no longer evict a session that's actually still there.</li>
-      <li><b>Tab-X / right-click → Close Tab / Close Others / Close All</b> are recognised as user-initiated closes; the session is dropped from auto-restore. <b>Window-X / project shutdown</b> is NOT a close — sessions survive across IDE restarts as intended.</li>
-      <li><code>/tab</code> (and right-click → Rename Session) now persists the new name to the restore file and a fresh snapshot immediately, instead of waiting for the next 5-second poll. Crash-safe across the gap.</li>
-      <li>Restore file writes are atomic (tmp + rename). Snapshot filenames use a double-underscore delimiter so sibling projects with overlapping path prefixes (e.g. <code>foo</code> vs <code>foo-mobile</code>) can no longer cross-prune each other.</li>
-      <li>Auto-restored tabs (and Rider's workspace.xml-restored shells) no longer disappear from save tracking. Fixes "only 2 of 5 tabs come back" on Rider 2026.1.</li>
-      <li>Restored terminal tabs actually run <code>claude --resume</code> on spawn — previously shells started cold and only the focused tab ever executed the resume.</li>
-      <li>Restore file is never deleted on an empty poll. A single transient "0 active sessions" cycle can no longer wipe your saved multi-session state.</li>
-      <li>Generic saved names ("Local", "Local (2)") no longer pin <code>userDefinedTitle</code>, so the resumed Claude chat title surfaces naturally.</li>
-      <li>Tab enumeration now sweeps <code>ContentManager</code> as a fallback — fixes <code>/tab</code> reporting "no tab found" for restored sessions whose tab the reworked managers don't list.</li>
-      <li>Direct widget tracking for tabs the plugin spawns — <code>/tab</code> renames go straight to the cached widget reference without re-enumerating, so restored sessions can always be renamed even when the reworked managers don't list them.</li>
-      <li>Save loop now scans <code>~/.claude/sessions/</code> directly (filtered by project cwd) instead of relying solely on the platform's tab APIs to enumerate which Claude processes are alive. Fixes "10 tabs spawned, only 1 saved" on Rider 2026.1 where freshly-spawned widgets don't expose their <code>ttyConnector</code> via reflection.</li>
-    </ul>
-
-    <h3>1.0.13</h3>
-    <ul>
-      <li>Auto-restore opens saved sessions in fresh tabs — fixes wrong-chat-in-wrong-tab when multiple projects are open.</li>
-    </ul>
-
-    <h3>1.0.12</h3>
-    <ul>
-      <li>Auto-restore now covers sessions in unnamed tabs too.</li>
-      <li><code>/tabs-history</code> survives crashes (sessions recorded within a minute of starting).</li>
-    </ul>
-
-    <h3>1.0.11</h3>
-    <ul>
-      <li>Fixes restore and history when multiple projects are open at once.</li>
-    </ul>
-
-    <h3>1.0.10</h3>
-    <ul>
-      <li>Fixes "no tabs auto-restored on load" caused by sessions leaking between sibling projects.</li>
-    </ul>
-
-    <h3>1.0.9</h3>
-    <ul>
-      <li><code>/tab</code> is roughly 2× faster on first use.</li>
-    </ul>
-
-    <h3>1.0.8</h3>
-    <ul>
-      <li>Stops silently wiping <code>history.json</code> on transient read failures (AV, OneDrive, indexer locks).</li>
-      <li>Atomic writes for <code>history.json</code>.</li>
-    </ul>
-
-    <h3>1.0.7</h3>
-    <ul>
-      <li>All <code>/tabs-*</code> commands now scope to the current project by default. Pass <code>--all</code> for the global view.</li>
-      <li><code>/tabs-clear</code> preserves <code>history.json</code>.</li>
-    </ul>
-
-    <h3>1.0.6</h3>
-    <ul>
-      <li>Restore works again after a PC restart that preserves tab titles.</li>
-      <li><code>/tabs-history</code> defaults to the current project.</li>
-      <li>Fixes snapshot mixups between projects with similar paths (e.g. <code>MyApp</code> vs <code>MyApp-mobile</code>).</li>
-    </ul>
-
-    <h3>1.0.5</h3>
-    <ul>
-      <li>Compatibility with Rider 2026.1 — coexists with the JetBrains AI Assistant / Claude Agent panel.</li>
-      <li>Tab names hold against the AI Assistant title overlay.</li>
-      <li>Resuming a session no longer fails with "No conversation found" after Claude rotates the session id.</li>
-    </ul>
-
-    <h3>1.0.3</h3>
-    <ul>
-      <li><code>/tabs-history</code>, <code>/tabs-restore</code>, <code>/tabs-status</code> render as markdown tables.</li>
-      <li>History age column shows seconds for recent entries.</li>
-    </ul>
-
-    <h3>1.0.2</h3>
-    <ul>
-      <li>Cleaner slash-command output — no more Node script dumps in the terminal.</li>
-      <li><code>/tabs-history</code> and <code>/tabs-restore</code> show a built-in choice menu.</li>
-    </ul>
-
-    <h3>1.0.1</h3>
-    <ul>
-      <li><code>/tabs-restore</code> and <code>/tabs-history</code> print the <code>claude --resume</code> command instead of trying to run it (nested resume always failed).</li>
-    </ul>
-
-    <h3>1.0.0 — Initial release</h3>
-    <ul>
-      <li>Auto-rename terminal tabs to match the active Claude conversation.</li>
-      <li>Session save/restore across IDE restarts.</li>
-      <li>Slash commands: <code>/tab</code>, <code>/tabs-status</code>, <code>/tabs-backup</code>, <code>/tabs-history</code>, <code>/tabs-restore</code>, <code>/tabs-clear</code>.</li>
-      <li>Auto-install of scripts, commands, and permissions on startup; clean uninstall on removal.</li>
+      <li>Window-state serialization, worktree-resume transcript lookup, DockManager-based
+        5th tab source, cross-project arbitration, canonical-id cache correction,
+        <code>names.json</code> auto-apply, two-poll-grace eviction, authoritative
+        <code>saveState</code> with name preservation. Superseded by the 2.0 redesign.</li>
     </ul>
     ]]></change-notes>
 
-    <!-- IntelliJ Platform 2026.1 (build 261) and newer. No untilBuild — forward compatible.
-         Earlier builds lack the ShellStartupOptions-based createShellWidget API this plugin uses. -->
+    <!-- IntelliJ Platform 2026.1 (build 261) and newer. No untilBuild — forward compatible. -->
     <idea-version since-build="261"/>
 
     <depends>com.intellij.modules.platform</depends>
@@ -193,11 +208,7 @@
         <postStartupActivity implementation="com.claudetabs.ClaudeTabWatcherStartup"/>
         <registryKey key="rider.claude.tabs.respectAiAgents"
                      defaultValue="true"
-                     description="Defer to JetBrains AI Assistant / Anthropic Claude Code plugin when present (informational log only as of 1.0.5). Set to false for legacy 1.0.3 behavior."
-                     restartRequired="false"/>
-        <registryKey key="rider.claude.tabs.verboseLogs"
-                     defaultValue="false"
-                     description="Bypass rate-limiting on high-frequency log lines (AI overlay re-apply, restore-pending). When true, every event logs. When false, rate-limited to once per minute per key. Equivalent to enabling DEBUG logging for #com.claudetabs."
+                     description="Defer to JetBrains AI Assistant / Anthropic Claude Code plugin when present (informational log only)."
                      restartRequired="false"/>
     </extensions>
 </idea-plugin>
