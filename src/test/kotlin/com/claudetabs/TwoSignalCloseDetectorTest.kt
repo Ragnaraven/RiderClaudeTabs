@@ -284,4 +284,99 @@ class TwoSignalCloseDetectorTest {
         assertEquals(setOf("phantom"), s2.expired)
         assertTrue(s2.confirmed.isEmpty())
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // UNATTRIBUTED-CLOSE ATTRIBUTION -- attributeCloses (the Rule 2 fix)
+    // ══════════════════════════════════════════════════════════════
+    //
+    // An X on an UNCLAIMED tab reaches the listener with no sid (reflection digs failed), so it
+    // records only a timestamp token. This ties each token to a project-owned session that was
+    // alive last poll and is gone now. Crash-safe: a crash fires no token, and if more sessions
+    // vanished than there are tokens, nothing is attributed (protects Rule 4).
+
+    @Test fun attribute_oneCloseOneVanish_attributesIt() {
+        val r = TwoSignalCloseDetector.attributeCloses(
+            unattributedCloses = listOf(1000L),
+            vanished = listOf("closed-sid"),
+            now = 2000L,
+            expiryMs = 30_000L,
+        )
+        assertEquals(setOf("closed-sid"), r.closedSids)
+        assertTrue(r.remainingCloses.isEmpty())
+    }
+
+    @Test fun attribute_noVanish_keepsTokenForNextPoll() {
+        // The process hasn't died yet (tab closed this instant); the token must survive to be
+        // matched on a later poll when the vanish is observed.
+        val r = TwoSignalCloseDetector.attributeCloses(
+            unattributedCloses = listOf(1000L),
+            vanished = emptyList(),
+            now = 2000L,
+            expiryMs = 30_000L,
+        )
+        assertTrue(r.closedSids.isEmpty())
+        assertEquals(listOf(1000L), r.remainingCloses)
+    }
+
+    @Test fun attribute_moreVanishedThanTokens_attributesNothing_protectsRule4() {
+        // One X-close token, but TWO sessions vanished — a crash coincided with the close. We
+        // must not risk marking a crashed (still-wanted) session user-closed. Attribute nothing.
+        val r = TwoSignalCloseDetector.attributeCloses(
+            unattributedCloses = listOf(1000L),
+            vanished = listOf("closed-sid", "crashed-sid"),
+            now = 2000L,
+            expiryMs = 30_000L,
+        )
+        assertTrue(r.closedSids.isEmpty())
+        assertEquals(listOf(1000L), r.remainingCloses) // token retained (may resolve next poll)
+    }
+
+    @Test fun attribute_twoClosesTwoVanish_attributesBoth() {
+        val r = TwoSignalCloseDetector.attributeCloses(
+            unattributedCloses = listOf(1000L, 1500L),
+            vanished = listOf("a", "b"),
+            now = 2000L,
+            expiryMs = 30_000L,
+        )
+        assertEquals(setOf("a", "b"), r.closedSids)
+        assertTrue(r.remainingCloses.isEmpty())
+    }
+
+    @Test fun attribute_twoClosesOneVanish_attributesOne_keepsSurplusToken() {
+        // Two tabs X'd, only one process dead so far. Attribute the one; keep the other token
+        // (oldest consumed first) so the second death resolves next poll.
+        val r = TwoSignalCloseDetector.attributeCloses(
+            unattributedCloses = listOf(1000L, 1500L),
+            vanished = listOf("a"),
+            now = 2000L,
+            expiryMs = 30_000L,
+        )
+        assertEquals(setOf("a"), r.closedSids)
+        assertEquals(listOf(1500L), r.remainingCloses) // 1000 (oldest) consumed
+    }
+
+    @Test fun attribute_expiredToken_isDroppedNotMatched() {
+        // A token older than the window is stale (its vanish never came — maybe a veto). Drop it,
+        // and don't attribute the (unrelated) vanish to it.
+        val r = TwoSignalCloseDetector.attributeCloses(
+            unattributedCloses = listOf(1000L),
+            vanished = listOf("unrelated-death"),
+            now = 40_000L,        // token is 39s old, past 30s expiry
+            expiryMs = 30_000L,
+        )
+        assertTrue(r.closedSids.isEmpty())
+        assertTrue(r.remainingCloses.isEmpty()) // expired token pruned
+    }
+
+    @Test fun attribute_noTokens_neverAttributes_pureCrashSafety() {
+        // No close event at all → a vanished session is a crash/restart, must NOT be closed.
+        val r = TwoSignalCloseDetector.attributeCloses(
+            unattributedCloses = emptyList(),
+            vanished = listOf("crashed"),
+            now = 2000L,
+            expiryMs = 30_000L,
+        )
+        assertTrue(r.closedSids.isEmpty())
+        assertTrue(r.remainingCloses.isEmpty())
+    }
 }

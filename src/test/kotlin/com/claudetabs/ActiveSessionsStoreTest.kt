@@ -50,6 +50,62 @@ class ActiveSessionsStoreTest {
         assertEquals(2L, r.lastSeen)
     }
 
+    // ── updateName: the title controller's ONLY allowed write ─────────
+
+    @Test fun updateName_neverTouchesPid_andCannotResurrectDemotedPid() {
+        val s = newStore()
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 1234L, lastSeen = 1L)
+        // Poll demotes to restore-pending (process died)...
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = null, lastSeen = 2L)
+        // ...then a racing name-capture lands. It must not bring pid=1234 back.
+        assertTrue(s.updateName("sid-a", name = "Captured Topic"))
+        val r = s.read("sid-a")!!
+        assertNull("name write must not resurrect the demoted pid", r.pid)
+        assertEquals("Captured Topic", r.name)
+    }
+
+    @Test fun updateName_noOpsOnMissingEntry_neverRecreatesEvictedFile() {
+        val s = newStore()
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 1L, lastSeen = 1L)
+        s.delete("sid-a") // close path evicted it
+        assertFalse("update after evict must no-op", s.updateName("sid-a", name = "Zombie"))
+        assertNull("evicted entry must stay gone", s.read("sid-a"))
+    }
+
+    @Test fun updateName_userNameVariant_persistsRename() {
+        val s = newStore()
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 1L, lastSeen = 1L, name = "Topic")
+        assertTrue(s.updateName("sid-a", userName = "My Name"))
+        val r = s.read("sid-a")!!
+        assertEquals("My Name", r.userName)
+        assertEquals("topic untouched by a userName-only update", "Topic", r.name)
+    }
+
+    // ── restoreAttempts: ghost-decay counter ──────────────────────────
+
+    @Test fun restoreAttempts_bumpIncrements_aliveWriteResets() {
+        val s = newStore()
+        s.writeOrUpdate(sid = "sid-g", cwd = "/x", pid = null, lastSeen = 1L)
+        s.bumpRestoreAttempts("sid-g")
+        s.bumpRestoreAttempts("sid-g")
+        assertEquals(2, s.read("sid-g")!!.restoreAttempts)
+        // Session observed alive → counter starts over; only never-alive ghosts decay.
+        s.writeOrUpdate(sid = "sid-g", cwd = "/x", pid = 99L, lastSeen = 2L)
+        assertEquals(0, s.read("sid-g")!!.restoreAttempts)
+    }
+
+    @Test fun restoreAttempts_missingInLegacyFile_parsesAsZero() {
+        val s = newStore()
+        val legacy = """{"sid":"sid-old","cwd":"/x","pid":null,"lastSeen":5,"name":null,"userName":null,"ordinal":null}"""
+        assertEquals(0, s.parse(legacy)!!.restoreAttempts)
+    }
+
+    @Test fun bumpRestoreAttempts_missingEntry_noOps() {
+        val s = newStore()
+        s.bumpRestoreAttempts("sid-none") // must not throw or create a file
+        assertNull(s.read("sid-none"))
+    }
+
     @Test fun writeOrUpdate_nonNullMetaNameOverwrites() {
         val s = newStore()
         s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 1L, lastSeen = 1L, name = "original")

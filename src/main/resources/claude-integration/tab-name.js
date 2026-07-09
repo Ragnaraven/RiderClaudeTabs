@@ -77,16 +77,23 @@ function parentMap() {
 
 const claude = claudePids();
 
-// Primary: walk own ancestry (script → shell → claude → ...), max 12 hops.
-let sid = null;
-const parents = parentMap();
-let cur = process.pid;
-for (let hop = 0; hop < 12 && cur; hop++) {
-  if (claude.has(cur)) { sid = claude.get(cur).sid; break; }
-  cur = parents.get(cur) || null;
+// Primary: the session id Claude exports to every child process via env. Exact and instant —
+// no ancestry guessing, no PowerShell, and (crucially) it disambiguates a RESUMED chat or many
+// chats sharing one cwd, which the cwd fallback below cannot. This is the fix for "/tab failed
+// on a resumed chat": ancestry + cwd could both fail when several tabs of one project share a cwd.
+let sid = (process.env.CLAUDE_CODE_SESSION_ID || '').trim() || null;
+
+// Fallback 1 (older Claude with no env var): walk own ancestry script → shell → claude, max 12.
+if (!sid) {
+  const parents = parentMap();
+  let cur = process.pid;
+  for (let hop = 0; hop < 12 && cur; hop++) {
+    if (claude.has(cur)) { sid = claude.get(cur).sid; break; }
+    cur = parents.get(cur) || null;
+  }
 }
 
-// Fallback: exactly one session whose cwd matches ours.
+// Fallback 2: exactly one alive session whose cwd matches ours.
 if (!sid) {
   const here = process.cwd().replace(/\//g, '\\').toLowerCase();
   const matches = [...claude.values()].filter(
@@ -96,19 +103,46 @@ if (!sid) {
 }
 
 if (!sid) {
-  console.error('could not determine this Claude session (ancestry walk and cwd fallback both failed)');
+  console.error('could not determine this Claude session (env, ancestry, and cwd all failed)');
   process.exit(2);
 }
 
 const file = path.join(activeDir, sid + '.json');
 const existing = readJsonSafe(file) || {};
+// cwd: prefer what we already track; else the matching live session's cwd; else here.
+const liveForSid = [...claude.values()].find((s) => s.sid === sid);
 const entry = {
   sid,
-  cwd: existing.cwd || (claude.get(cur) ? claude.get(cur).cwd : null) || process.cwd(),
+  cwd: existing.cwd || (liveForSid && liveForSid.cwd) || process.cwd(),
   pid: existing.pid !== undefined ? existing.pid : null,
   lastSeen: existing.lastSeen || Date.now(),
   name: existing.name !== undefined ? existing.name : null,
   userName: name,
 };
 atomicWrite(file, JSON.stringify(entry));
+
+// Poke the name into this tab's own terminal title via OSC title escapes. Two jobs: instant
+// feedback on the tab even before the IDE plugin reacts, and a rendezvous — a pty is private to
+// one tab, so the plugin claims a user-opened / `claude --resume` tab by matching its displayed
+// title to this name even when its process/cwd reflection digs fail on the reworked terminal.
+//
+// CRITICAL: write to process.stdout (fd 1), which IS the pty. JediTerm parses OSC 0/2 from the
+// pty stream and surfaces it as the tab's applicationTitle — which the plugin's title-handshake
+// then reads to claim the tab. The old CONOUT$ write did NOT reach JediTerm's title parser, so
+// "Local"/resume tabs stayed unnamed and unclaimable (the reported /tab bug). Send both OSC 0
+// (icon+title) and OSC 2 (title) for terminals that honor only one. OSC title sequences are
+// non-destructive (no cursor move / clear), so writing mid-session doesn't disturb Claude's TUI.
+try {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+  const STAR = String.fromCharCode(0x2733); // ✳ — the plugin's idle glyph, so it re-owns cleanly
+  const seq = ESC + ']0;' + STAR + ' ' + name + BEL + ESC + ']2;' + STAR + ' ' + name + BEL;
+  try { process.stdout.write(seq); } catch { /* stdout not a tty */ }
+  // Also poke the controlling console directly, as a fallback for runners that redirect stdout.
+  try {
+    const tty = process.platform === 'win32' ? '\\\\.\\CONOUT$' : '/dev/tty';
+    fs.writeFileSync(tty, seq);
+  } catch { /* no controlling console */ }
+} catch { /* best effort */ }
+
 console.log(`tab name set: "${name}" (session ${sid.slice(0, 8)})`);

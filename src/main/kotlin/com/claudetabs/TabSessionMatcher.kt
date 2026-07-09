@@ -38,17 +38,20 @@ internal object TabSessionMatcher {
     fun extractPidFromWidget(widget: TerminalWidget?): Long? {
         widget ?: return null
 
-        try {
-            val getter = widget.javaClass.methods.find { it.name == "getTtyConnector" && it.parameterCount == 0 }
-            val connector = getter?.invoke(widget)
-            if (connector is ProcessTtyConnector) return connector.process.pid()
-            if (connector != null) {
+        // 0. Most stable: the PUBLIC ShellTerminalWidget.getProcessTtyConnector() (and the
+        //    older getTtyConnector()). These are public API, not private fields, so they
+        //    survive terminal reworks. Try them by name on whatever widget we hold.
+        for (method in listOf("getProcessTtyConnector", "getTtyConnector")) {
+            try {
+                val getter = widget.javaClass.methods.find { it.name == method && it.parameterCount == 0 } ?: continue
+                val connector = getter.invoke(widget) ?: continue
+                if (connector is ProcessTtyConnector) return connector.process.pid()
                 try {
                     (connector.javaClass.getMethod("getProcess").invoke(connector) as? Process)?.let { return it.pid() }
-                } catch (_: Exception) { /* fall through to field walk */ }
+                } catch (_: Exception) { /* try next */ }
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] extractPidFromWidget $method probe failed: ${e.message}")
             }
-        } catch (e: Exception) {
-            LOG.debug("[ClaudeTabs] extractPidFromWidget getTtyConnector probe failed: ${e.message}")
         }
 
         var cls: Class<*>? = widget.javaClass
@@ -106,6 +109,24 @@ internal object TabSessionMatcher {
     }
 
     /**
+     * The tab's current working directory via the PUBLIC `ShellTerminalWidget.getCurrentDirectory()`
+     * accessor, or null if unavailable. Used to claim a tab by cwd when the PID dig fails — a
+     * stable, reflection-light bridge (public method, not a private field).
+     */
+    fun extractCwdFromWidget(widget: TerminalWidget?): String? {
+        widget ?: return null
+        return try {
+            val getter = widget.javaClass.methods.find { it.name == "getCurrentDirectory" && it.parameterCount == 0 }
+            (getter?.invoke(widget) as? String)?.takeIf { it.isNotBlank() }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** Normalise a path for cwd comparison: backslashes → '/', trailing '/' stripped, lowercased. */
+    fun normalizeCwd(path: String): String = path.replace("\\", "/").trimEnd('/').lowercase()
+
+    /**
      * True if walking the parent chain from [claudePid] reaches [shellPid] within
      * [maxHops] hops. [parentOf] returns a PID's parent or null; tests inject a fake,
      * production uses [osParentOf].
@@ -129,5 +150,51 @@ internal object TabSessionMatcher {
         ProcessHandle.of(pid).orElse(null)?.parent()?.orElse(null)?.pid()
     } catch (_: Exception) {
         null
+    }
+
+    /**
+     * Title-handshake claim (pure core). The /tab script pokes `✳ <name>` into ITS OWN tab's
+     * tty (OSC title escape) right after persisting the session's `userName`. A pty is private
+     * to one tab, so an unclaimed tab whose displayed title strips to exactly one unclaimed
+     * session's userName IS that session's tab — no process or cwd introspection needed, which
+     * is what makes this work on user-opened tabs where every reflection dig fails.
+     *
+     * Claims only unambiguous pairs: the userName must be unique among [sidToUserName] AND
+     * exactly one tab in [tabTitles] must show it. Returns tab index → sid.
+     */
+    fun matchTitlesToSessions(
+        sidToUserName: Map<String, String?>,
+        tabTitles: List<String?>,
+    ): Map<Int, String> {
+        val tabsByName = HashMap<String, MutableList<Int>>()
+        tabTitles.forEachIndexed { i, raw ->
+            val stripped = raw?.let { TitleModel.stripGlyph(it) }?.trim()
+            if (!stripped.isNullOrEmpty()) tabsByName.getOrPut(stripped) { mutableListOf() }.add(i)
+        }
+        val sidsByName = sidToUserName.entries
+            .filter { !it.value.isNullOrBlank() }
+            .groupBy({ it.value!!.trim() }, { it.key })
+        val claims = HashMap<Int, String>()
+        for ((name, sids) in sidsByName) {
+            val tabs = tabsByName[name] ?: continue
+            if (sids.size == 1 && tabs.size == 1) claims[tabs[0]] = sids[0]
+        }
+        return claims
+    }
+
+    /**
+     * Resolve the single session whose display name equals [vanishedTitle] — used to identify,
+     * at the instant a tab closes, WHICH session's tab it was, so the close can be persisted
+     * immediately (before a later poll, so it survives an instant Rider quit).
+     *
+     * [candidates] maps sid → its display name (userName, else prettified topic name). Matches by
+     * exact trimmed equality. Returns the sid ONLY when exactly one candidate matches — an
+     * ambiguous or absent match returns null and the caller falls back to vanish-attribution.
+     */
+    fun resolveUniqueByDisplayName(candidates: Map<String, String?>, vanishedTitle: String): String? {
+        val target = vanishedTitle.trim()
+        if (target.isEmpty()) return null
+        val matches = candidates.entries.filter { (_, name) -> !name.isNullOrBlank() && name.trim() == target }
+        return if (matches.size == 1) matches[0].key else null
     }
 }

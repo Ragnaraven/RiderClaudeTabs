@@ -131,6 +131,16 @@ class ClaudeTabsHelpersTest {
         assertFalse(ClaudeTabsHelpers.hasTranscriptAnywhere(projects, "", "D:\\Dev\\X"))
     }
 
+    // ── transcriptFile — resolves the .jsonl path ────────────────────────
+
+    @Test fun transcriptFile_returnsFileOnHit_nullOnMiss() {
+        val projects = tmp.newFolder("projects")
+        val dir = File(projects, "D--Dev-Foo").apply { mkdirs() }
+        val f = File(dir, "sid-1.jsonl").apply { writeText("[]") }
+        assertEquals(f, ClaudeTabsHelpers.transcriptFile(projects, "sid-1", "D:\\Dev\\Foo"))
+        assertNull(ClaudeTabsHelpers.transcriptFile(projects, "missing", "D:\\Dev\\Foo"))
+    }
+
     // ── extractResumeIdFromArgs ──────────────────────────────────────
 
     @Test fun extractResumeIdFromArgs_dashDashResumeWithSpace() {

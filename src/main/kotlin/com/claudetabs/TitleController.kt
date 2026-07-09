@@ -95,20 +95,32 @@ internal class TitleController(
         ApplicationManager.getApplication().invokeLater({
             if (project.isDisposed) return@invokeLater
             val adoptions = mutableListOf<Pair<String, String>>()
+            val nameCaptures = mutableListOf<Pair<String, String>>()
             for (s in snaps) {
-                val observed = try {
-                    s.widget.terminalTitle.userDefinedTitle
+                val title = try {
+                    s.widget.terminalTitle
                 } catch (_: Throwable) {
                     // Widget mid-teardown — prune; close detection owns the rest.
                     ctx.spawnedWidgets.remove(s.sid, s.widget)
                     ctx.lastAppliedTitle.remove(s.sid)
                     continue
                 }
+                val observed = try { title.userDefinedTitle } catch (_: Throwable) { null }
+                // Capture the name Rider is actually showing — Claude sets the terminal's
+                // applicationTitle via an escape sequence even when it never writes the topic to
+                // its session file. Reading it here means a name that ever appears on a tab gets
+                // persisted and round-trips on restore, independent of what Claude wrote to disk.
+                val capturedTopic = try {
+                    TitleModel.cleanCapturedName(title.applicationTitle)
+                } catch (_: Throwable) { null }
+                if (capturedTopic != null && capturedTopic != s.cachedTopic && s.userName == null) {
+                    nameCaptures.add(s.sid to capturedTopic)
+                }
                 val d = TitleModel.tick(
                     observed = observed,
                     lastApplied = ctx.lastAppliedTitle[s.sid],
                     userName = s.userName,
-                    liveTopic = s.liveTopic,
+                    liveTopic = s.liveTopic ?: capturedTopic,
                     cachedTopic = s.cachedTopic,
                     busy = s.busy,
                     frameIndex = f,
@@ -120,7 +132,7 @@ internal class TitleController(
                 }
                 if (d.apply != null) {
                     try {
-                        s.widget.terminalTitle.change { userDefinedTitle = d.apply }
+                        title.change { userDefinedTitle = d.apply }
                         ctx.lastAppliedTitle[s.sid] = d.apply
                     } catch (e: Exception) {
                         LOG.debug("[ClaudeTabs][title] apply failed for sid=${s.sid}: ${e.message}")
@@ -130,18 +142,40 @@ internal class TitleController(
             if (adoptions.isNotEmpty()) {
                 scope.launch { persistAdoptions(adoptions) }
             }
+            if (nameCaptures.isNotEmpty()) {
+                scope.launch { persistNameCaptures(nameCaptures) }
+            }
         }, ModalityState.nonModal())
+    }
+
+    /** Persist topics captured off the live terminal title into the entry's cached `name`, so
+     *  the name survives restart even if Claude never wrote it to its session file. Written as
+     *  `name` (cached topic), never `userName` — an explicit /tab or rename still outranks it. */
+    private fun persistNameCaptures(captures: List<Pair<String, String>>) {
+        for ((sid, topic) in captures) {
+            try {
+                val e = storage.activeSessions.read(sid) ?: continue
+                if (e.name == topic || e.userName != null) continue
+                // Name-ONLY locked update: can't echo a stale pid over the poll's demote, and
+                // no-ops if the entry was evicted between the read above and this write.
+                if (storage.activeSessions.updateName(sid, name = topic)) {
+                    LOG.info("[ClaudeTabs][title] Captured tab name '$topic' for sid=$sid from terminal title")
+                }
+            } catch (ex: Exception) {
+                LOG.warn("[ClaudeTabs][title] failed to persist captured name for sid=$sid: ${ex.message}")
+            }
+        }
     }
 
     private fun persistAdoptions(adoptions: List<Pair<String, String>>) {
         for ((sid, name) in adoptions) {
             try {
-                val e = storage.activeSessions.read(sid) ?: continue
-                storage.activeSessions.writeOrUpdate(
-                    sid = sid, cwd = e.cwd, pid = e.pid, lastSeen = e.lastSeen,
-                    userName = name,
-                )
-                pendingUserNames.remove(sid, name)
+                // Same safe write as captures: never touches pid/lastSeen, never recreates a
+                // deleted entry. Failure (entry gone) keeps the pendingUserNames overlay, so
+                // the rename still shows on the tab for the rest of the session.
+                if (storage.activeSessions.updateName(sid, userName = name)) {
+                    pendingUserNames.remove(sid, name)
+                }
             } catch (ex: Exception) {
                 LOG.warn("[ClaudeTabs][title] failed to persist userName for sid=$sid: ${ex.message}")
             }

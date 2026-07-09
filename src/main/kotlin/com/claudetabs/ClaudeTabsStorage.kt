@@ -74,6 +74,16 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         true
     }
 
+    /** Remove [sid] from the user-closed set for [projectHash] — used when a session that was
+     *  recorded closed is observed ALIVE again (the user re-opened or `claude --resume`'d it),
+     *  which is positive proof they did NOT want it gone. Idempotent. */
+    fun removeUserClosed(projectHash: String, sid: String): Boolean = synchronized(userClosedLock) {
+        val current = loadUserClosed(projectHash)
+        if (sid !in current) return@synchronized false
+        saveUserClosed(projectHash, current - sid)
+        true
+    }
+
     /** Prune entries whose sid no longer satisfies [sidStillExists]. */
     fun pruneUserClosed(projectHash: String, sidStillExists: (sid: String) -> Boolean): Int =
         synchronized(userClosedLock) {

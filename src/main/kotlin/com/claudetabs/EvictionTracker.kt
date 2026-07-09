@@ -32,15 +32,6 @@ internal class EvictionTracker(
     private val strikes = ConcurrentHashMap<String, Int>()
     private val lastStrikeAt = ConcurrentHashMap<String, Long>()
 
-    /** Sids this JVM has POSITIVELY observed alive at least once. Eviction (a destructive
-     *  delete) is gated on membership here: a per-sid file whose recorded pid is dead but
-     *  which we never watched run — a stale entry seeded from disk, a manual reseed, a
-     *  backup-active.js write, anything added after the once-per-JVM startup reconcile — must
-     *  NOT be deleted on the strength of a pid we never confirmed. Such entries are demoted to
-     *  restore-pending instead. Append-only for the JVM's life (an evicted sid that genuinely
-     *  resumes is simply seen alive again). */
-    private val everSeenAlive: MutableSet<String> = ConcurrentHashMap.newKeySet()
-
     /** Record a DEAD poll for [sid]. Returns true if this strike pushed [sid] to or past the
      *  eviction threshold (caller should now evict).
      *
@@ -58,17 +49,13 @@ internal class EvictionTracker(
         return next >= strikesNeeded
     }
 
-    /** Record an ALIVE poll for [sid] — resets its counter and marks it confirmed-alive. */
+    /** Record an ALIVE poll for [sid] — resets its dead-strike counter. */
     fun recordAlive(sid: String) {
         strikes.remove(sid)
         lastStrikeAt.remove(sid)
-        everSeenAlive.add(sid)
     }
 
-    /** True if this JVM has ever observed [sid] alive. Gates the destructive eviction path. */
-    fun hasBeenSeenAlive(sid: String): Boolean = sid in everSeenAlive
-
-    /** Forget [sid] entirely (e.g. on actual eviction). */
+    /** Forget [sid] entirely (e.g. once it's been demoted to restore-pending). */
     fun forget(sid: String) {
         strikes.remove(sid)
         lastStrikeAt.remove(sid)

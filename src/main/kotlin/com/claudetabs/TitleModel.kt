@@ -3,43 +3,134 @@ package com.claudetabs
 /**
  * Pure title logic for Claude terminal tabs — zero IDE imports, fully unit-testable.
  *
- * The plugin OWNS `userDefinedTitle` for every tab hosting a Claude session. The title is
- * always `<glyph> <DisplayName>`; the glyph cycles through [FRAMES] while the session is
- * busy (Claude thinking) and sits at the first frame when idle. [TitleController] calls
- * [tick] every ~450ms per tab and applies/persists whatever it decides.
+ * The plugin OWNS `userDefinedTitle` for every tab hosting a Claude session (the only way to
+ * get a per-tab NAME — Claude's native title is generic and git-bash swallows its escapes, so
+ * without ownership tabs fall back to "Local").
  *
- * Display-name priority: explicit user-chosen name (IDE tab rename or /tab skill, stored
- * as `userName`) > Claude's live auto topic name > the cached topic name from the per-sid
- * file > "Claude".
+ * Look (user-specified):
+ *  - IDLE  → a static STAR at the left, then the name: `✳ Name` (matches native `✳ Claude Code`).
+ *  - BUSY  → a DOT that TRAVELS left → centre → right across a 3-cell field while thinking:
+ *            `· Name` → ` · Name` → `  ·Name`, then loops.
+ * The three busy frames are the exact same characters (one dot + two non-breaking fillers) just
+ * reordered, so the tab NEVER resizes mid-animation. Idle uses a star instead of a dot — that one
+ * glyph swap on the idle↔busy flip is intentional (star idle, travelling dot while thinking). The
+ * filler is a NON-BREAKING space so the IDE's tab label can't collapse the field.
+ *
+ * Display-name priority: explicit user-chosen name (IDE tab rename or /tab skill, stored as
+ * `userName`) > Claude's live auto topic name > the cached topic name from the per-sid file
+ * > "Claude".
  */
 internal object TitleModel {
 
-    /** Animation frames. Frame 0 doubles as the static idle glyph. */
-    val FRAMES = listOf("✳", "✶", "✷", "✸")
+    /** Idle indicator — Claude's star — held static at the left, matching native `✳ Claude Code`. */
+    const val STAR = "✳"
 
-    fun glyph(busy: Boolean, frameIndex: Int): String =
-        if (busy) FRAMES[Math.floorMod(frameIndex, FRAMES.size)] else FRAMES[0]
+    /** Thinking indicator — a dot that TRAVELS left → centre → right across the field while the
+     *  session is busy. Idle = star; busy = travelling dot. */
+    const val DOT = "·"
 
-    /** `"✳ Fix Auth Rotation"` */
+    /** Field the indicator occupies/travels across (3 cells), and the static index used when idle
+     *  (1 = centre, so the idle star isn't stranded far to the left of the name). */
+    const val BUSY_WIDTH = 3
+    const val IDLE_POS = 1
+
+    /** Non-breaking space filler — renders as a space but IDE tab labels don't trim it, so the
+     *  fixed-width field survives even where regular leading/trailing spaces would be stripped. */
+    private const val NB = " "
+
+    /** Legacy/recognition prefixes: the star + dot, plus old builds' spinner frames — so a title
+     *  from any state or past build is re-owned, never mistaken for a user rename. */
+    val OUR_GLYPHS: List<String> = listOf(STAR, DOT, "✶", "✷", "✸")
+
+    /** Generic terminal titles that are NOT real names — Claude's own defaults plus the IDE's
+     *  shell placeholders. A captured title matching one of these carries no information. */
+    private val GENERIC_TITLES = setOf("claude", "claude code")
+
+    /** Shell-set titles that masquerade as a name when Claude isn't actively setting the terminal
+     *  title: git-bash (`MINGW64:/d/Dev/X`, `MSYS`, `CYGWIN`) and bare filesystem paths
+     *  (`D:\Dev\X`, `/d/Dev/X`). Anchored at the start so a real topic that merely CONTAINS a
+     *  slash (`Make a/b mode a toggle button`) is NOT rejected — only path/shell shapes are. */
+    private val SHELL_TITLE = Regex("""^(MINGW\d*|MSYS\w*|CYGWIN)""", RegexOption.IGNORE_CASE)
+    private val PATH_TITLE = Regex("""^([A-Za-z]:[\\/]|[\\/])""")
+
+    /**
+     * Clean a title read straight off the live terminal (its `applicationTitle`, set by Claude's
+     * escape sequence) into the bare topic worth persisting — or null if it's blank, one of our
+     * own glyph-wrapped titles, a generic shell placeholder, or just Claude's default. This is
+     * how a name shows up on a tab and gets captured even when Claude never wrote it to the
+     * session file: we read what Rider is displaying and persist that.
+     */
+    fun cleanCapturedName(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        // Strip ALL leading animation decoration up to the first letter/digit — whitespace (incl.
+        // non-breaking), our own glyph, AND Claude's native spinner glyphs (dots, stars, braille,
+        // bullets). On a tab opened by the official Claude button, Claude animates the terminal
+        // title itself; without this we'd capture a FRAME of that animation (e.g. "· Build…") into
+        // the name and then render our own indicator in front of it → a double dot.
+        // Reject shell-set titles / filesystem paths on the RAW value first — these appear when
+        // Claude isn't actively owning the terminal title and must never be captured as a name.
+        // Checked before decoration-stripping, which would eat a leading "/" or "C:\".
+        val trimmed = raw.trim()
+        if (SHELL_TITLE.containsMatchIn(trimmed)) return null
+        if (PATH_TITLE.containsMatchIn(trimmed)) return null
+        val bare = trimmed.trimStart { !it.isLetterOrDigit() }.trim()
+        if (bare.isEmpty()) return null
+        // Reject generics on the bare value (case-sensitive prettify would turn "pwsh" into the
+        // non-generic-looking "Pwsh" and slip past these checks).
+        if (ClaudeTabsHelpers.isGenericTabName(bare)) return null
+        if (bare.lowercase() in GENERIC_TITLES) return null
+        // Prettify so a captured slug (`fix-auth`) becomes `Fix Auth`; spaced names and their
+        // casing (`Build data importer for spreadsheets`) pass through untouched.
+        val pretty = ClaudeTabsHelpers.prettifySessionName(bare) ?: return null
+        // Re-check after prettify in case it reveals a generic (`claude-code` → `Claude Code`).
+        if (pretty.lowercase() in GENERIC_TITLES) return null
+        return pretty
+    }
+
+    /** The fixed-width prefix with [glyph] at [pos]; all other cells are non-breaking fillers. */
+    private fun field(glyph: String, pos: Int): String =
+        (0 until BUSY_WIDTH).joinToString("") { if (it == pos) glyph else NB }
+
+    /**
+     * Ping-pong index across the field: 0,1,2,1,0,1,2,1,… i.e. L → C → R → C → L → repeat. The
+     * dot bounces back through the centre rather than wrapping, so it never jumps R→L.
+     */
+    fun bouncePos(frame: Int): Int {
+        val period = 2 * (BUSY_WIDTH - 1)          // 4 for a 3-cell field
+        val m = Math.floorMod(frame, period)
+        return if (m < BUSY_WIDTH) m else period - m
+    }
+
+    /**
+     * Idle: static star centred (` ✳  Name`). Busy: a dot bounces left → centre → right →
+     * centre → left (`·   Name` → ` ·  Name` → `  · Name` → ` ·  Name` → …). A constant
+     * non-breaking separator sits between the field and the name in EVERY state, so the rightmost
+     * dot always has a space after it AND the name's position is identical across idle and every
+     * busy frame (the separator is uniform, so it can't resize the tab on the idle↔busy flip). All
+     * busy frames share one character multiset, so the width is constant while thinking too.
+     */
     fun compose(displayName: String, busy: Boolean, frameIndex: Int): String =
-        "${glyph(busy, frameIndex)} $displayName"
+        if (busy) "${field(DOT, bouncePos(frameIndex))}$NB$displayName"
+        else "${field(STAR, IDLE_POS)}$NB$displayName"
 
-    /** True iff [title] starts with one of our frame glyphs — i.e. a title this plugin wrote
-     *  (possibly in a previous IDE session). Anchored to exactly our glyph set so foreign
-     *  decorations (`✦ x`, `· x`) do NOT count as ours. */
+    /** True iff [title] (after trimming) starts with one of our glyphs — a title this plugin
+     *  wrote (possibly a previous IDE session). Foreign decorations (`✦ x`) do NOT count.
+     *  Kotlin's `trim()` strips non-breaking spaces too, so a centre/right dot frame (leading
+     *  filler) is still recognised. */
     fun isOurFormat(title: String?): Boolean {
         if (title.isNullOrBlank()) return false
         val t = title.trim()
-        return FRAMES.any { t.startsWith(it) }
+        return OUR_GLYPHS.any { t.startsWith(it) }
     }
 
-    /** Remove a leading our-glyph (+ whitespace). Non-our-format titles pass through trimmed. */
+    /** Strip our leading glyph (+ surrounding whitespace, incl. non-breaking), leaving the bare
+     *  display name. Since the animation only moves the indicator (the name text is unchanged),
+     *  every frame strips to the same name — so a frame change never reads as a rename.
+     *  Non-our-format titles pass through trimmed unchanged (a user's literal name is preserved). */
     fun stripGlyph(title: String): String {
         val t = title.trim()
-        for (f in FRAMES) {
-            if (t.startsWith(f)) return t.removePrefix(f).trim()
-        }
-        return t
+        val g = OUR_GLYPHS.firstOrNull { t.startsWith(it) } ?: return t
+        return t.removePrefix(g).trim()
     }
 
     /** First non-blank of: explicit user name, live topic, cached topic; else "Claude". */
@@ -59,13 +150,13 @@ internal object TitleModel {
     /**
      * One enforcement step for one tab.
      *
-     * Rename detection: [observed] counts as a user rename when it is non-blank, differs
-     * from [lastApplied], is not a generic default ("Local"…), and either
+     * Rename detection: [observed] counts as a user rename when it is non-blank, differs from
+     * [lastApplied], is not a generic default ("Local"…), and either
      *  - is not our format at all (plain rename), or
-     *  - is our format but its text differs from [lastApplied]'s text (the rename dialog
-     *    pre-fills the current `✳ …` title; the user edited around the glyph).
-     * An our-format title with [lastApplied] == null is NOT a rename — it's our own stale
-     * title surviving an IDE restart; re-own it.
+     *  - is our format but its stripped text differs from [lastApplied]'s stripped text.
+     * An our-format title with [lastApplied] == null is NOT a rename — it's our own stale title
+     * surviving an IDE restart; re-own it. (A mere indicator-position change strips to the same
+     * name, so it never registers as a rename.)
      */
     fun tick(
         observed: String?,

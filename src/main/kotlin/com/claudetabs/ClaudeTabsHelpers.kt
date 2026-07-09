@@ -173,17 +173,27 @@ internal object ClaudeTabsHelpers {
      * The cwd → subdir encoding matches Claude's: backslash → forward-slash, then `:/` →
      * `--`, then `/` → `-`.
      */
-    fun hasTranscriptAnywhere(projectsDir: java.io.File, sessionId: String, cwd: String?): Boolean {
-        if (sessionId.isBlank()) return false
+    fun hasTranscriptAnywhere(projectsDir: java.io.File, sessionId: String, cwd: String?): Boolean =
+        transcriptFile(projectsDir, sessionId, cwd) != null
+
+    /**
+     * Resolve the transcript file `<sessionId>.jsonl` for [sessionId], or null if none exists.
+     * Same lookup order as [hasTranscriptAnywhere] (cwd-derived subdir fast path, then a scan of
+     * every immediate subdir for the cross-cwd resume case).
+     */
+    fun transcriptFile(projectsDir: java.io.File, sessionId: String, cwd: String?): java.io.File? {
+        if (sessionId.isBlank()) return null
         if (!cwd.isNullOrBlank()) {
             val h = cwd.replace("\\", "/").replace(":/", "--").replace("/", "-")
-            if (java.io.File(java.io.File(projectsDir, h), "$sessionId.jsonl").exists()) return true
+            val f = java.io.File(java.io.File(projectsDir, h), "$sessionId.jsonl")
+            if (f.exists()) return f
         }
-        val dirs = projectsDir.listFiles { f -> f.isDirectory } ?: return false
+        val dirs = projectsDir.listFiles { f -> f.isDirectory } ?: return null
         for (d in dirs) {
-            if (java.io.File(d, "$sessionId.jsonl").exists()) return true
+            val f = java.io.File(d, "$sessionId.jsonl")
+            if (f.exists()) return f
         }
-        return false
+        return null
     }
 
     // ══════════════════════════════════════════════════════════════

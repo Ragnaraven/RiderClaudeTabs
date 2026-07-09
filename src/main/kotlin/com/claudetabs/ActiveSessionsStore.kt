@@ -35,6 +35,11 @@ internal class ActiveSessionsStore(val dir: File) {
          *  poll observed it. Drives same-order restore so the user doesn't have to re-arrange
          *  15 tabs after every crash/restart. Null = position unknown (restored last). */
         val ordinal: Int? = null,
+        /** How many consecutive restores have attempted this entry WITHOUT the session ever
+         *  being observed alive since. Bumped by the restore loop before each spawn; reset to 0
+         *  by [writeOrUpdate] whenever a live pid is recorded. Entries that hit the restore
+         *  loop's generation cap are retired to the backlog instead of resurrected forever. */
+        val restoreAttempts: Int = 0,
     )
 
     /** Serialises read-modify-write cycles within this JVM: the poll loop and the title
@@ -73,12 +78,39 @@ internal class ActiveSessionsStore(val dir: File) {
         val resolvedName = name ?: existing?.name
         val resolvedUserName = userName ?: existing?.userName
         val resolvedOrdinal = ordinal ?: existing?.ordinal
-        val entry = Entry(sid, cwd, pid, lastSeen, resolvedName, resolvedUserName, resolvedOrdinal)
+        // A live pid means the session came alive — its restore-generation counter starts over.
+        val resolvedAttempts = if (pid != null) 0 else existing?.restoreAttempts ?: 0
+        val entry = Entry(sid, cwd, pid, lastSeen, resolvedName, resolvedUserName, resolvedOrdinal, resolvedAttempts)
         atomicWrite(fileFor(sid), serialise(entry))
     }
 
-    /** Delete the per-sid file. Idempotent — non-existent file is not an error. */
-    fun delete(sid: String): Boolean {
+    /**
+     * Locked update of ONLY the display-name fields. Unlike [writeOrUpdate] it can never touch
+     * pid/lastSeen (so a racing name-capture can't resurrect a pid the poll just demoted) and it
+     * NO-OPS when the entry no longer exists (so it can't recreate a file the close path just
+     * evicted). This is the only write the title controller is allowed to make.
+     */
+    fun updateName(sid: String, name: String? = null, userName: String? = null): Boolean =
+        synchronized(rmwLock) {
+            val existing = read(sid) ?: return false
+            val entry = existing.copy(
+                name = name ?: existing.name,
+                userName = userName ?: existing.userName,
+            )
+            atomicWrite(fileFor(sid), serialise(entry))
+            true
+        }
+
+    /** Locked increment of [Entry.restoreAttempts] — the restore loop's ghost-decay counter.
+     *  No-op when the entry doesn't exist. */
+    fun bumpRestoreAttempts(sid: String): Unit = synchronized(rmwLock) {
+        val existing = read(sid) ?: return
+        atomicWrite(fileFor(sid), serialise(existing.copy(restoreAttempts = existing.restoreAttempts + 1)))
+    }
+
+    /** Delete the per-sid file. Idempotent — non-existent file is not an error. Takes the RMW
+     *  lock so a concurrent read-modify-write can't interleave with (and undo) the deletion. */
+    fun delete(sid: String): Boolean = synchronized(rmwLock) {
         val f = fileFor(sid)
         if (!f.exists()) return false
         return try { f.delete() } catch (_: Exception) { false }
@@ -96,6 +128,7 @@ internal class ActiveSessionsStore(val dir: File) {
         if (e.userName == null) append("null")
         else append("\"").append(ClaudeTabsHelpers.esc(e.userName)).append("\"")
         append(",\"ordinal\":").append(e.ordinal?.toString() ?: "null")
+        append(",\"restoreAttempts\":").append(e.restoreAttempts)
         append("}")
     }
 
@@ -110,7 +143,9 @@ internal class ActiveSessionsStore(val dir: File) {
             ?: ClaudeTabsHelpers.extractJsonString(text, "metaName")
         val userName = ClaudeTabsHelpers.extractJsonString(text, "userName")
         val ordinal = Regex(""""ordinal"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull()
-        return Entry(sid, cwd, pid, lastSeen, name, userName, ordinal)
+        // Missing on files written by older builds → 0 (backward compatible).
+        val restoreAttempts = Regex(""""restoreAttempts"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        return Entry(sid, cwd, pid, lastSeen, name, userName, ordinal, restoreAttempts)
     }
 
     private fun atomicWrite(target: File, content: String) = DurableIo.writeAtomic(target, content)
