@@ -5,6 +5,7 @@ import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.terminal.ui.TerminalWidget
+import com.intellij.ui.content.Content
 import kotlinx.coroutines.*
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -39,6 +40,10 @@ internal class TitleController(
      *  can't be reverted by a tick that races the async persistence. */
     private val pendingUserNames = ConcurrentHashMap<String, String>()
 
+    /** sid → last base name logged for a reworked tab (dedup so the per-frame animation apply
+     *  doesn't spam idea.log; only a real name change re-logs). */
+    private val lastLoggedReworkedName = ConcurrentHashMap<String, String>()
+
     fun start(scope: CoroutineScope): Job = scope.launch {
         while (isActive) {
             try {
@@ -61,11 +66,50 @@ internal class TitleController(
         val busy: Boolean,
     )
 
+    /** Per-tick state for a widget-less reworked (agent-button) tab, titled via its own
+     *  [ReworkedTerminalBridge.titlesByContent] TerminalTitle rather than a classic widget. */
+    private data class ReworkedSnap(
+        val content: Content,
+        val sid: String,
+        val userName: String?,
+        val liveTopic: String?,
+        val cachedTopic: String?,
+        val busy: Boolean,
+    )
+
     private fun tickOnce(scope: CoroutineScope) {
         if (project.isDisposed) return
         val widgets = ctx.spawnedWidgets.entries.toList()
-        if (widgets.isEmpty()) return
+        // Reworked agent tabs are bound Content-only (no classic widget), so they never appear in
+        // spawnedWidgets and the widget path below can't title them. Collect them separately and
+        // push the name onto the Content directly.
+        val widgetlessBound = ctx.contentToSid.entries
+            .filter { (_, sid) -> sid !in ctx.spawnedWidgets.keys }
+            .map { it.key to it.value }
+        if (widgets.isEmpty() && widgetlessBound.isEmpty()) return
         frame++
+
+        // Off-EDT: gather per-reworked-tab state (userName, live/cached topic, busy). Applied on the
+        // EDT below via the tab's own TerminalTitle — the SAME path as classic widgets.
+        val reworkedSnaps = widgetlessBound.mapNotNull { (content, sid) ->
+            val entry = storage.activeSessions.read(sid) ?: return@mapNotNull null
+            var busy = false
+            var liveTopic: String? = null
+            val pid = entry.pid
+            if (pid != null) {
+                val pidFile = File(storage.sessionsDir, "$pid.json")
+                if (pidFile.exists()) {
+                    val text = try { pidFile.readText() } catch (_: Exception) { null }
+                    if (text != null && ClaudeTabsHelpers.extractJsonString(text, "sessionId") == sid) {
+                        busy = ClaudeTabsHelpers.extractJsonString(text, "status") == "busy"
+                        liveTopic = ClaudeTabsHelpers.prettifySessionName(
+                            ClaudeTabsHelpers.extractJsonString(text, "name")
+                        )
+                    }
+                }
+            }
+            ReworkedSnap(content, sid, pendingUserNames[sid] ?: entry.userName, liveTopic, entry.name, busy)
+        }
 
         // Off-EDT: all file reads. Capped to sids that actually have widgets.
         val snaps = widgets.mapNotNull { (sid, widget) ->
@@ -89,13 +133,58 @@ internal class TitleController(
             val userName = pendingUserNames[sid] ?: entry.userName
             Snapshot(sid, widget, userName, liveTopic, entry.name, busy)
         }
-        if (snaps.isEmpty()) return
+        if (snaps.isEmpty() && reworkedSnaps.isEmpty()) return
 
         val f = frame
         ApplicationManager.getApplication().invokeLater({
             if (project.isDisposed) return@invokeLater
             val adoptions = mutableListOf<Pair<String, String>>()
             val nameCaptures = mutableListOf<Pair<String, String>>()
+            // Widget-less reworked (agent-button) tabs: drive their OWN TerminalView.title through
+            // the exact same TitleModel path as classic widgets. Content.displayName is ignored by
+            // the reworked renderer — the title comes from TerminalView.getTitle().
+            if (reworkedSnaps.isNotEmpty()) {
+                val rTitles = ReworkedTerminalBridge.titlesByContent(project)
+                for (r in reworkedSnaps) {
+                    val title = rTitles[r.content] ?: continue
+                    val observed = try { title.userDefinedTitle } catch (_: Throwable) { null }
+                    val capturedTopic = try {
+                        TitleModel.cleanCapturedName(title.applicationTitle)
+                    } catch (_: Throwable) { null }
+                    if (capturedTopic != null && capturedTopic != r.cachedTopic && r.userName == null &&
+                        !looksLikeCommandOrSecret(capturedTopic)
+                    ) {
+                        nameCaptures.add(r.sid to capturedTopic)
+                    }
+                    val d = TitleModel.tick(
+                        observed = observed,
+                        lastApplied = ctx.lastAppliedTitle[r.sid],
+                        userName = r.userName,
+                        liveTopic = r.liveTopic ?: capturedTopic,
+                        cachedTopic = r.cachedTopic,
+                        busy = r.busy,
+                        frameIndex = f,
+                    )
+                    if (d.adoptName != null) {
+                        pendingUserNames[r.sid] = d.adoptName
+                        adoptions.add(r.sid to d.adoptName)
+                        LOG.info("[ClaudeTabs][title] Adopting user rename '${d.adoptName}' for reworked sid=${r.sid}")
+                    }
+                    if (d.apply != null) {
+                        try {
+                            title.change { userDefinedTitle = d.apply }
+                            ctx.lastAppliedTitle[r.sid] = d.apply
+                            val base = TitleModel.resolveDisplayName(r.userName, r.liveTopic ?: capturedTopic, r.cachedTopic)
+                            if (!base.isNullOrBlank() && lastLoggedReworkedName[r.sid] != base) {
+                                lastLoggedReworkedName[r.sid] = base
+                                LOG.info("[ClaudeTabs][title] Reworked tab sid=${r.sid} → name '$base' (applied via TerminalView.title)")
+                            }
+                        } catch (e: Throwable) {
+                            LOG.debug("[ClaudeTabs][title] reworked title apply failed for sid=${r.sid}: ${e.message}")
+                        }
+                    }
+                }
+            }
             for (s in snaps) {
                 val title = try {
                     s.widget.terminalTitle
@@ -113,8 +202,16 @@ internal class TitleController(
                 val capturedTopic = try {
                     TitleModel.cleanCapturedName(title.applicationTitle)
                 } catch (_: Throwable) { null }
-                if (capturedTopic != null && capturedTopic != s.cachedTopic && s.userName == null) {
+                // NEVER persist a shell command / env dump as the session name. Claude sets a short
+                // Title-Case topic; a shell (e.g. `some-cli --token=… run …`) sets the whole argv,
+                // which has leaked secret env values into active-sessions/*.json and the log. Reject
+                // anything that looks like a command line rather than a conversation topic.
+                if (capturedTopic != null && capturedTopic != s.cachedTopic && s.userName == null &&
+                    !looksLikeCommandOrSecret(capturedTopic)
+                ) {
                     nameCaptures.add(s.sid to capturedTopic)
+                } else if (capturedTopic != null && looksLikeCommandOrSecret(capturedTopic)) {
+                    LOG.debug("[ClaudeTabs][title] Skipped non-topic tab title for sid=${s.sid} (looks like a command/secret, len=${capturedTopic.length})")
                 }
                 val d = TitleModel.tick(
                     observed = observed,
@@ -146,6 +243,21 @@ internal class TitleController(
                 scope.launch { persistNameCaptures(nameCaptures) }
             }
         }, ModalityState.nonModal())
+    }
+
+    /**
+     * True when a captured tab title looks like a shell command / env dump rather than a Claude
+     * conversation topic — used to keep secrets and argv strings out of the persisted session name.
+     * Claude topics are short Title-Case phrases; command lines carry `=`, `--`, path separators,
+     * long secret-like tokens, or are simply very long.
+     */
+    private fun looksLikeCommandOrSecret(name: String): Boolean {
+        if (name.length > 50) return true
+        if (name.contains('=') || name.contains("--") || name.contains('\\')) return true
+        if (name.count { it == ':' } >= 2 || name.count { it == '/' } >= 2) return true
+        // A single CONTIGUOUS run of 20+ alphanumerics is a token/secret, not a real word.
+        if (Regex("[A-Za-z0-9]{20,}").containsMatchIn(name)) return true
+        return false
     }
 
     /** Persist topics captured off the live terminal title into the entry's cached `name`, so

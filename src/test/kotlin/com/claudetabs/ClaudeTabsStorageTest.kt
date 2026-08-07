@@ -149,4 +149,40 @@ class ClaudeTabsStorageTest {
         assertEquals(1, removed)
         assertEquals(setOf("sid-keep"), st.loadUserClosed("h1"))
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // OPEN-TABS SNAPSHOT — the restore discriminator
+    // ══════════════════════════════════════════════════════════════
+
+    @Test fun openTabs_missingFileIsNull_notEmpty() {
+        // null vs emptySet is load-bearing: null → legacy restore-all fallback, empty → restore
+        // nothing. A brand-new project must read null, never an empty authoritative snapshot.
+        val st = newStorage()
+        assertNull(st.loadOpenTabs("h1"))
+    }
+
+    @Test fun openTabs_emptySnapshotIsAuthoritativeEmpty() {
+        // A poll that saw zero open tabs writes []; that must load as empty (restore nothing),
+        // distinct from the missing-file null.
+        val st = newStorage()
+        st.saveOpenTabs("h1", emptySet())
+        assertEquals(emptySet<String>(), st.loadOpenTabs("h1"))
+    }
+
+    @Test fun openTabs_roundTrip() {
+        val st = newStorage()
+        st.saveOpenTabs("h1", setOf("sid-a", "sid-b"))
+        assertEquals(setOf("sid-a", "sid-b"), st.loadOpenTabs("h1"))
+        // A later poll overwrites (not merges) — a tab that closed drops out entirely.
+        st.saveOpenTabs("h1", setOf("sid-a"))
+        assertEquals(setOf("sid-a"), st.loadOpenTabs("h1"))
+    }
+
+    @Test fun openTabs_perProjectIsolation() {
+        val st = newStorage()
+        st.saveOpenTabs("h1", setOf("sid-1"))
+        st.saveOpenTabs("h2", setOf("sid-2"))
+        assertEquals(setOf("sid-1"), st.loadOpenTabs("h1"))
+        assertEquals(setOf("sid-2"), st.loadOpenTabs("h2"))
+    }
 }

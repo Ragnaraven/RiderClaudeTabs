@@ -6,7 +6,7 @@ import org.junit.Test
 /**
  * Regression test for a real-world failure where pruneStaleRestoreEntries dropped valid
  * restore entries because extractJsonString returned the cwd WITHOUT backslashes
- * (e.g. "D:DevProject" instead of "D:\Dev\Project"). The file content was a hand-written
+ * (e.g. "D:pathtoproject" instead of "D:\path\to\project"). The file content was a hand-written
  * recovery restore file with the same JSON encoding the plugin itself produces via
  * [ClaudeTabsStorage.serialiseSessions].
  *

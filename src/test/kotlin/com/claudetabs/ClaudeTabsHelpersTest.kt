@@ -170,4 +170,53 @@ class ClaudeTabsHelpersTest {
     @Test fun extractResumeIdFromArgs_nullArgs() {
         assertNull(ClaudeTabsHelpers.extractResumeIdFromArgs(null))
     }
+
+    // ── computeOpenSnapshot ─────────────────────────────────────────
+
+    private val WARMUP = 45_000L
+
+    @Test fun computeOpenSnapshot_presentAreAlwaysIncluded() {
+        val snap = ClaudeTabsHelpers.computeOpenSnapshot(
+            prev = setOf("a"), present = setOf("a", "b"),
+            materializedSids = emptySet(), lastSpawnAttempt = emptyMap(), now = 1000, warmupMs = WARMUP,
+        )
+        assertEquals(setOf("a", "b"), snap)
+    }
+
+    @Test fun computeOpenSnapshot_warmupKeepsJustSpawnedNotYetPresent() {
+        // "s" was in prev, isn't present yet, spawned 1s ago, never materialized → kept (warming).
+        val snap = ClaudeTabsHelpers.computeOpenSnapshot(
+            prev = setOf("s"), present = emptySet(),
+            materializedSids = emptySet(), lastSpawnAttempt = mapOf("s" to 1_000L), now = 2_000L, warmupMs = WARMUP,
+        )
+        assertEquals(setOf("s"), snap)
+    }
+
+    @Test fun computeOpenSnapshot_materializedThenAbsentIsNotResurrected() {
+        // THE REGRESSION: "s" spawned 1s ago (inside warmup) AND already materialized, now absent
+        // (user ×'d it). Must NOT be re-added — otherwise the tab can never be killed.
+        val snap = ClaudeTabsHelpers.computeOpenSnapshot(
+            prev = setOf("s"), present = emptySet(),
+            materializedSids = setOf("s"), lastSpawnAttempt = mapOf("s" to 1_000L), now = 2_000L, warmupMs = WARMUP,
+        )
+        assertEquals(emptySet<String>(), snap)
+    }
+
+    @Test fun computeOpenSnapshot_warmupExpiresAfterWindow() {
+        // Spawned long ago, never materialized, still absent → warmup no longer protects it.
+        val snap = ClaudeTabsHelpers.computeOpenSnapshot(
+            prev = setOf("s"), present = emptySet(),
+            materializedSids = emptySet(), lastSpawnAttempt = mapOf("s" to 1_000L), now = 1_000L + WARMUP + 1, warmupMs = WARMUP,
+        )
+        assertEquals(emptySet<String>(), snap)
+    }
+
+    @Test fun computeOpenSnapshot_absentWithNoSpawnStampIsDropped() {
+        // A zombie carries no recent spawn stamp → never re-admitted.
+        val snap = ClaudeTabsHelpers.computeOpenSnapshot(
+            prev = setOf("z"), present = emptySet(),
+            materializedSids = emptySet(), lastSpawnAttempt = emptyMap(), now = 5_000L, warmupMs = WARMUP,
+        )
+        assertEquals(emptySet<String>(), snap)
+    }
 }

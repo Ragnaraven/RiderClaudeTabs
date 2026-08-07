@@ -40,7 +40,7 @@ Restart Rider after editing.
 
 ## Compatibility
 
-- Rider / IntelliJ 2024.3+
+- Rider / IntelliJ 2026.1+
 - Windows primary. macOS / Linux should work but less tested.
 - Requires Claude Code CLI (provides the `node` runtime the plugin's scripts use).
 
@@ -49,19 +49,16 @@ Restart Rider after editing.
 All under `~/.claude/rider-plugin/`:
 
 ```
-rename-tab.sh, session-start-hook.sh   # shell integration
-tabs/{sessionId}.json                  # rename requests
-session-map/{TERM_SESSION_ID}          # per-tab session mapping
-restore-<project>.json                 # current state (auto-restore target)
-snapshots/<project>-<timestamp>.json   # rolling backups
-history.json                           # closed sessions (90d default)
-config.json                            # user overrides
+active-sessions/<sid>.json      # one file per alive session (name, order, cwd)
+open-tabs-<project>.json        # the open-tab snapshot restored on next launch
+session-backlog.json            # last 50 evicted sessions (for /tabs-history)
+config.json                     # user overrides
 ```
 
 ## Running the tests
 
 ```bash
-./gradlew test        # Unit + storage + slash-command scripts (~60 tests, <10s)
+./gradlew test        # Unit + storage + slash-command scripts (fast, no IDE needed)
 ./gradlew uiTest      # UI tests via Remote Robot (optional, needs a sandbox IDE)
 ```
 

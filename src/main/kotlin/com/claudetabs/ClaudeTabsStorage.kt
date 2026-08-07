@@ -95,6 +95,69 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         }
 
     // ══════════════════════════════════════════════════════════════
+    // OPEN-TABS SNAPSHOT — per-project set of sids alive (tab open) at the last normal poll
+    // ══════════════════════════════════════════════════════════════
+    //
+    // The restore contract's discriminator (see project memory `tab-restore-contract`): a
+    // session reopens IFF it was still open at the last shutdown — NOT "every session ever
+    // recorded that we didn't catch an X on". Each normal poll writes the sids whose Claude
+    // process is alive (= tab open) for the project. Pressing a tab's X kills its process, so
+    // it drops out on the next poll with no close-event to detect — which is why an X can never
+    // be "missed". The write is FROZEN during teardown so window-close / IDE-quit process deaths
+    // (not user closes) can't shrink it; the last normal snapshot is what restore reads, and a
+    // hard crash / PC restart leaves that same snapshot intact so every open tab reopens.
+
+    private val openTabsLock = Any()
+
+    fun openTabsFile(projectHash: String): File = File(stateDir, "open-tabs-$projectHash.json")
+
+    /** The alive-tab snapshot for [projectHash]. Returns null when NO snapshot has ever been
+     *  written (missing file) so the caller can fall back to legacy restore-all exactly once;
+     *  returns a possibly-empty set when a snapshot exists (empty = nothing was open). */
+    fun loadOpenTabs(projectHash: String): Set<String>? = synchronized(openTabsLock) {
+        val f = openTabsFile(projectHash)
+        if (!f.exists()) return@synchronized null
+        val text = try { f.readText() } catch (_: Exception) { return@synchronized null }
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || trimmed == "[]") return@synchronized emptySet()
+        Regex("\"([^\"]+)\"").findAll(trimmed).map { it.groupValues[1] }.toSet()
+    }
+
+    /** Persist the alive-tab snapshot for [projectHash] via atomic write. */
+    fun saveOpenTabs(projectHash: String, sids: Set<String>) = synchronized(openTabsLock) {
+        val f = openTabsFile(projectHash)
+        f.parentFile?.mkdirs()
+        val content = if (sids.isEmpty()) "[]" else sids.joinToString(
+            prefix = "[\n",
+            postfix = "\n]",
+            separator = ",\n",
+        ) { "  \"${ClaudeTabsHelpers.esc(it)}\"" }
+        writeAtomic(f, content)
+    }
+
+    /**
+     * One-time 2.3.0 migration: overwrite EVERY existing open-tabs snapshot with authoritative-
+     * empty. Pre-2.3 polls counted any alive claude process as an open tab, so closed-tab
+     * zombies were adopted into snapshots and re-restored forever (the flood). Those snapshots
+     * are unsalvageable — no record distinguishes their real tabs from adopted zombies — so the
+     * only honest reset is empty: the first launch restores nothing, and every tab the user
+     * actually opens is re-adopted (attachment-gated now) within one poll and persists from
+     * then on. Guarded by a marker file; returns the number of snapshots reset (0 = already ran).
+     */
+    fun resetSnapshotsOnce(): Int = synchronized(openTabsLock) {
+        val marker = File(stateDir, ".migrated-2.3.0-snapshot-reset")
+        if (marker.exists()) return@synchronized 0
+        stateDir.mkdirs()
+        var reset = 0
+        stateDir.listFiles { f -> f.isFile && f.name.startsWith("open-tabs-") && f.name.endsWith(".json") }
+            ?.forEach { f ->
+                try { writeAtomic(f, "[]"); reset++ } catch (_: Exception) { /* best effort */ }
+            }
+        try { marker.writeText("reset $reset snapshot(s)") } catch (_: Exception) { }
+        reset
+    }
+
+    // ══════════════════════════════════════════════════════════════
     // ATOMIC WRITE
     // ══════════════════════════════════════════════════════════════
 

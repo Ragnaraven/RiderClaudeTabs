@@ -124,6 +124,10 @@ internal object ClaudeTabsHelpers {
     fun projectHashForPath(basePath: String?): String =
         (basePath ?: "default").replace("\\", "/").replace(":/", "--").replace("/", "-")
 
+    /** Normalise a path for cwd comparison: backslashes → '/', trailing '/' stripped, lowercased.
+     *  (Salvaged from the deleted TabSessionMatcher — the one bridge the hand-open adopter needs.) */
+    fun normalizeCwd(path: String): String = path.replace("\\", "/").trimEnd('/').lowercase()
+
     /**
      * True if [cwd] is the project base path, a descendant of it, OR a sibling worktree.
      *
@@ -219,5 +223,40 @@ internal object ClaudeTabsHelpers {
             }
         }
         return null
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // OPEN-TABS SNAPSHOT
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Compute the open-tabs snapshot for one poll: the present sids, plus **warmup stickiness** for
+     * just-spawned sids whose async widget→Content link hasn't landed yet.
+     *
+     * Warmup keeps a previously-snapshotted sid that is (a) not yet present and (b) spawned within
+     * [warmupMs] — bridging the gap between `spawnOwnedTab` returning and the tab's Content appearing
+     * in the tool window. It must NOT keep a sid that has **already materialized** ([materializedSids]):
+     * once a tab was present, a later absence is a real × close. Omitting that check resurrects a tab
+     * ×'d within [warmupMs] of restore on every poll (field-verified: "can't kill it").
+     *
+     * @param prev previous on-disk snapshot for this project
+     * @param present sids whose Content is present in the tool window right now
+     * @param materializedSids sids observed present at least once this session
+     * @param lastSpawnAttempt sid → last spawn attempt time (ms)
+     */
+    fun computeOpenSnapshot(
+        prev: Set<String>,
+        present: Set<String>,
+        materializedSids: Set<String>,
+        lastSpawnAttempt: Map<String, Long>,
+        now: Long,
+        warmupMs: Long,
+    ): Set<String> {
+        val warming = prev.filter { sid ->
+            sid !in present &&
+                sid !in materializedSids &&
+                lastSpawnAttempt[sid]?.let { (now - it) < warmupMs } == true
+        }
+        return present + warming
     }
 }

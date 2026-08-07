@@ -15,3 +15,8 @@ build/
 # OS
 Thumbs.db
 .DS_Store
+
+# Local design/scratch docs (not shipped)
+ARCHITECTURE.md
+FINDINGS.md
+V3-REWRITE-PROMPT.md
