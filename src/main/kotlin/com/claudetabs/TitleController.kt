@@ -93,45 +93,15 @@ internal class TitleController(
         // EDT below via the tab's own TerminalTitle — the SAME path as classic widgets.
         val reworkedSnaps = widgetlessBound.mapNotNull { (content, sid) ->
             val entry = storage.activeSessions.read(sid) ?: return@mapNotNull null
-            var busy = false
-            var liveTopic: String? = null
-            val pid = entry.pid
-            if (pid != null) {
-                val pidFile = File(storage.sessionsDir, "$pid.json")
-                if (pidFile.exists()) {
-                    val text = try { pidFile.readText() } catch (_: Exception) { null }
-                    if (text != null && ClaudeTabsHelpers.extractJsonString(text, "sessionId") == sid) {
-                        busy = ClaudeTabsHelpers.extractJsonString(text, "status") == "busy"
-                        liveTopic = ClaudeTabsHelpers.prettifySessionName(
-                            ClaudeTabsHelpers.extractJsonString(text, "name")
-                        )
-                    }
-                }
-            }
-            ReworkedSnap(content, sid, pendingUserNames[sid] ?: entry.userName, liveTopic, entry.name, busy)
+            val live = readLiveStatus(sid, entry.pid)
+            ReworkedSnap(content, sid, displayableUserName(sid, entry.userName), live.topic, displayableCachedTopic(entry.name, live), live.busy)
         }
 
         // Off-EDT: all file reads. Capped to sids that actually have widgets.
         val snaps = widgets.mapNotNull { (sid, widget) ->
             val entry = storage.activeSessions.read(sid) ?: return@mapNotNull null
-            var busy = false
-            var liveTopic: String? = null
-            val pid = entry.pid
-            if (pid != null) {
-                val pidFile = File(storage.sessionsDir, "$pid.json")
-                if (pidFile.exists()) {
-                    val text = try { pidFile.readText() } catch (_: Exception) { null }
-                    // sid must match — guards against PID recycling.
-                    if (text != null && ClaudeTabsHelpers.extractJsonString(text, "sessionId") == sid) {
-                        busy = ClaudeTabsHelpers.extractJsonString(text, "status") == "busy"
-                        liveTopic = ClaudeTabsHelpers.prettifySessionName(
-                            ClaudeTabsHelpers.extractJsonString(text, "name")
-                        )
-                    }
-                }
-            }
-            val userName = pendingUserNames[sid] ?: entry.userName
-            Snapshot(sid, widget, userName, liveTopic, entry.name, busy)
+            val live = readLiveStatus(sid, entry.pid)
+            Snapshot(sid, widget, displayableUserName(sid, entry.userName), live.topic, displayableCachedTopic(entry.name, live), live.busy)
         }
         if (snaps.isEmpty() && reworkedSnaps.isEmpty()) return
 
@@ -152,7 +122,8 @@ internal class TitleController(
                         TitleModel.cleanCapturedName(title.applicationTitle)
                     } catch (_: Throwable) { null }
                     if (capturedTopic != null && capturedTopic != r.cachedTopic && r.userName == null &&
-                        !looksLikeCommandOrSecret(capturedTopic)
+                        !looksLikeCommandOrSecret(capturedTopic) &&
+                        stableIdleCapture(r.sid, capturedTopic, r.busy)
                     ) {
                         nameCaptures.add(r.sid to capturedTopic)
                     }
@@ -207,7 +178,8 @@ internal class TitleController(
                 // which has leaked secret env values into active-sessions/*.json and the log. Reject
                 // anything that looks like a command line rather than a conversation topic.
                 if (capturedTopic != null && capturedTopic != s.cachedTopic && s.userName == null &&
-                    !looksLikeCommandOrSecret(capturedTopic)
+                    !looksLikeCommandOrSecret(capturedTopic) &&
+                    stableIdleCapture(s.sid, capturedTopic, s.busy)
                 ) {
                     nameCaptures.add(s.sid to capturedTopic)
                 } else if (capturedTopic != null && looksLikeCommandOrSecret(capturedTopic)) {
@@ -243,6 +215,96 @@ internal class TitleController(
                 scope.launch { persistNameCaptures(nameCaptures) }
             }
         }, ModalityState.nonModal())
+    }
+
+    private data class LiveStatus(val busy: Boolean, val topic: String?, val derivedTopic: String? = null)
+
+    /**
+     * A persisted userName that is just a DEFAULT tab title ("Claude Code" — the agent launcher's
+     * initial name, adopted as a "rename" by earlier builds) must not outrank real topic names.
+     * Ignore it for display; the stored value is left alone (harmless once never honored).
+     */
+    private fun displayableUserName(sid: String, stored: String?): String? {
+        val n = pendingUserNames[sid] ?: stored ?: return null
+        return n.takeUnless { ClaudeTabsHelpers.isGenericTabName(it) }
+    }
+
+    /**
+     * The cached topic, unless it is a previously-cached CLI-derived placeholder (this build stops
+     * caching those, but entries polluted by earlier builds still hold e.g. "Project D3" — showing
+     * it would defeat the derived-name filter until a real topic overwrites it).
+     */
+    private fun displayableCachedTopic(cached: String?, live: LiveStatus): String? =
+        cached?.takeUnless { it == live.derivedTopic }
+
+    /** sids already logged as stale-busy (dedup so the 450ms tick doesn't spam the log). */
+    private val staleBusyLogged = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Read busy + live topic from the session's `sessions/<pid>.json`. The sessionId must match
+     * the sid (guards against PID recycling). `busy` additionally requires the process to be
+     * ALIVE: the CLI writes `status:"busy"` at turn start and only flips it back on completion,
+     * so a claude killed mid-turn leaves a stale "busy" on disk — without the liveness check the
+     * tab keeps animating until the poll demotes the pid several strikes later. Note "waiting"
+     * (permission prompt / input needed) and "shell" (background shell while idle) are distinct
+     * CLI statuses and intentionally do NOT animate.
+     */
+    private fun readLiveStatus(sid: String, pid: Long?): LiveStatus {
+        if (pid == null) return LiveStatus(busy = false, topic = null)
+        val pidFile = File(storage.sessionsDir, "$pid.json")
+        if (!pidFile.exists()) return LiveStatus(busy = false, topic = null)
+        val text = try { pidFile.readText() } catch (_: Exception) { null }
+            ?: return LiveStatus(busy = false, topic = null)
+        if (ClaudeTabsHelpers.extractJsonString(text, "sessionId") != sid) {
+            return LiveStatus(busy = false, topic = null)
+        }
+        // The CLI writes a PLACEHOLDER name (cwd basename + suffix, e.g. "myapp-d3") with
+        // nameSource:"derived" before the conversation has a real topic. Prettifying and showing
+        // it produced useless tab names ("Myapp D3"); treat derived as no-name so the tab falls
+        // back to the captured terminal title / cached topic / "Claude" until a real topic lands.
+        val pretty = ClaudeTabsHelpers.prettifySessionName(
+            ClaudeTabsHelpers.extractJsonString(text, "name")
+        )
+        val derived = ClaudeTabsHelpers.extractJsonString(text, "nameSource") == "derived"
+        val topic = if (derived) null else pretty
+        var busy = ClaudeTabsHelpers.extractJsonString(text, "status") == "busy"
+        if (busy && !processAlive(pid)) {
+            busy = false
+            if (staleBusyLogged.add(sid)) {
+                LOG.info("[ClaudeTabs][title] Ignoring stale busy for sid=$sid — process $pid is dead (killed mid-turn); animation stopped")
+            }
+        } else if (!busy) {
+            staleBusyLogged.remove(sid)
+        }
+        return LiveStatus(busy, topic, derivedTopic = if (derived) pretty else null)
+    }
+
+    private fun processAlive(pid: Long): Boolean = try {
+        java.lang.ProcessHandle.of(pid).map { it.isAlive }.orElse(false)
+    } catch (_: Throwable) {
+        false
+    }
+
+    /** Last topic OBSERVED per sid, not yet persisted — the capture debounce state. */
+    private val pendingTopicCapture = HashMap<String, String>()
+
+    /**
+     * Capture debounce: a tab title is only persisted as the session name when the session is
+     * IDLE and the same title was observed on two consecutive ticks. While Claude runs a tool,
+     * the pty title churns with transient subprocess titles at roughly tick cadence
+     * (field-captured: a test runner's worker names were being persisted as session names,
+     * flickering against the real topic ~1/sec); idle-only + two-tick stability filters that
+     * churn, while a real topic — stable for minutes — passes on its second tick. Cosmetic-only:
+     * this affects the cached display name, never tab↔session identity.
+     */
+    private fun stableIdleCapture(sid: String, topic: String, busy: Boolean): Boolean {
+        if (busy) return false // tool-run churn window — never capture while busy
+        val stable = pendingTopicCapture[sid] == topic
+        pendingTopicCapture[sid] = topic
+        if (!stable) {
+            LOG.debug("[ClaudeTabs][title] topic candidate for sid=$sid awaiting stability (one more tick)")
+        }
+        return stable
     }
 
     /**

@@ -38,9 +38,45 @@ internal object ClaudeTabsHelpers {
      */
     fun isGenericTabName(name: String): Boolean {
         val n = name.trim()
+        // "Claude Code" is the terminal AI-agents launcher's DEFAULT tab title — treating it as a
+        // real name made the rename-adoption path persist it as an explicit userName, which then
+        // outranked the session's actual topic forever (field-observed: tabs stuck on the default).
         return n == "Local" || n.matches(Regex("Local \\(\\d+\\)")) ||
             n == "bash" || n == "pwsh" || n == "PowerShell" || n == "cmd" ||
-            n.matches(Regex("bash \\(\\d+\\)")) || n.matches(Regex("pwsh \\(\\d+\\)"))
+            n.matches(Regex("bash \\(\\d+\\)")) || n.matches(Regex("pwsh \\(\\d+\\)")) ||
+            n.equals("Claude", ignoreCase = true) ||
+            n.equals("Claude Code", ignoreCase = true) ||
+            n.matches(Regex("Claude Code \\(\\d+\\)", RegexOption.IGNORE_CASE))
+    }
+
+    /** Shell default tab names (lowercased) — what the IDE titles a plain terminal tab. */
+    private val SHELL_TAB_NAMES = setOf(
+        "local", "bash", "git bash", "sh", "zsh", "fish", "pwsh", "powershell",
+        "windows powershell", "cmd", "command prompt", "wsl", "terminal",
+    )
+
+    /**
+     * True when a tab's observable titles say it is a PLAIN SHELL tab, not a Claude tab. Used to
+     * keep the FIFO / last-resort adoption passes from binding a session to a bash/pwsh tab the
+     * user opened alongside Claude tabs (field-observed: a plain shell tab got a session's glyph
+     * and name because, on the reworked terminal, an unbound shell tab is just as "undetermined"
+     * as an unbound Claude tab).
+     *
+     * Anything claude-ish in ANY title wins immediately (the agent launcher titles its tabs
+     * "Claude Code", and our own glyph format never looks like a shell) — only then do shell
+     * signals count: a known shell default name, a path-shaped title (shells set the window title
+     * to their cwd, e.g. `MINGW64:/path/to/project` or `C:\path`), or a `user@host` prompt shape.
+     * All titles unreadable → NOT shell (binding stays possible when the bridge is dark).
+     */
+    fun titleLooksLikeShellTab(titles: Collection<String?>): Boolean {
+        val real = titles.filterNotNull().map { it.trim() }.filter { it.isNotEmpty() }
+        if (real.any { it.contains("claude", ignoreCase = true) }) return false
+        return real.any { t ->
+            t.lowercase() in SHELL_TAB_NAMES ||
+                t.matches(Regex("(?i)(local|bash|pwsh) \\(\\d+\\)")) ||
+                t.contains('\\') || t.contains(":/") || t.count { c -> c == '/' } >= 2 ||
+                Regex("^\\S+@\\S+").containsMatchIn(t)
+        }
     }
 
     /**
@@ -258,5 +294,50 @@ internal object ClaudeTabsHelpers {
                 lastSpawnAttempt[sid]?.let { (now - it) < warmupMs } == true
         }
         return present + warming
+    }
+
+    /**
+     * Defer BULK removals from the snapshot by one poll — the teardown safety net.
+     *
+     * Field evidence: during IDE quit the terminal kills pty processes *before* any close listener
+     * fires, and agent tabs self-close when their process dies — so a poll that lands in that
+     * window sees several tabs vanish at once, exactly like a burst of × clicks, and rewrites the
+     * snapshot without them. Those tabs are then gone on the next launch.
+     *
+     * The two cases are distinguishable by shape and by time:
+     *  - a real × removes ONE tab → a single absent sid commits immediately (an ×'d tab must never
+     *    resurrect, even when the user quits right after closing it);
+     *  - teardown (or a mass close) removes SEVERAL at once → the shrink is deferred one poll. If
+     *    the vanish was teardown, the next poll never runs (or runs frozen behind the teardown
+     *    flags) and the tabs survive; if the user genuinely ×'d several tabs within one poll
+     *    window, the next poll (~seconds later) confirms and commits the removal.
+     *
+     * @param prev the on-disk snapshot from the previous poll
+     * @param computed this poll's freshly computed snapshot ([computeOpenSnapshot] output)
+     * @param pendingRemovals sid → first-observed-absent time (ms); MUTATED to carry deferral
+     *   state across polls. A sid present again is dropped from it; a committed sid is removed.
+     * @return the snapshot to actually persist this poll
+     */
+    fun applyRemovalDeferral(
+        prev: Set<String>,
+        computed: Set<String>,
+        pendingRemovals: MutableMap<String, Long>,
+        now: Long,
+    ): Set<String> {
+        val absent = prev - computed
+        // Anything present again is no longer a removal candidate.
+        pendingRemovals.keys.retainAll(absent)
+        if (absent.isEmpty()) return computed
+        if (absent.size == 1) {
+            // Single × — commit immediately. The × contract outranks the teardown net here.
+            pendingRemovals.clear()
+            return computed
+        }
+        // Bulk vanish — commit only sids already deferred by an earlier poll; hold fresh ones.
+        val confirmed = absent.filter { it in pendingRemovals }.toSet()
+        val fresh = absent - confirmed
+        for (sid in fresh) pendingRemovals[sid] = now
+        for (sid in confirmed) pendingRemovals.remove(sid)
+        return computed + fresh
     }
 }

@@ -144,7 +144,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** One-shot guard for [reconcileStaleEntriesOnStartup] across the JVM. */
         private val reconciledThisJvm = java.util.concurrent.atomic.AtomicBoolean(false)
 
-        private const val PLUGIN_VERSION = "3.0.0"
+        private const val PLUGIN_VERSION = "3.0.1"
 
         /** The official Claude Code plugin's "open Claude in the terminal" action (its toolbar
          *  button + Ctrl+Esc). Replaced at startup with [NewClaudeSessionAction] so the button the
@@ -184,8 +184,21 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
         /** True once the IDE begins shutting down (quit OR restart). Freezes the snapshot so a
          *  shutdown's tab-removal burst can't be mistaken for user ×-closes. */
-        @Volatile private var appClosing = false
+        @Volatile private var appShuttingDown = false
         private val appClosingSubscribed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /**
+         * The EARLIEST platform quit signal: `ApplicationEx.isExitInProgress` is set synchronously
+         * the moment exit is REQUESTED — before any lifecycle listener fires and before tool
+         * windows dispose. Listener flags alone lose the teardown race: field evidence showed the
+         * terminal killing pty processes (agent tabs self-close on process death, exactly like ×
+         * clicks) several seconds before `projectClosing`/`appWillBeClosed` fired, so a poll in
+         * that window recorded the closures as user closes and shrank the final snapshot.
+         */
+        private fun appExitInProgress(): Boolean = try {
+            (ApplicationManager.getApplication() as? com.intellij.openapi.application.ex.ApplicationEx)
+                ?.isExitInProgress == true
+        } catch (_: Throwable) { false }
 
         internal fun ctxOf(project: Project): ProjectCtx =
             projectCtx.getOrPut(project.locationHash) { ProjectCtx() }
@@ -415,6 +428,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Set by [com.intellij.openapi.project.ProjectManagerListener.projectClosing]. */
         @Volatile var projectClosing: Boolean = false
 
+        /** sid → first time (ms) it was observed absent while OTHER sids vanished in the same
+         *  poll. Bulk removals defer one poll before committing — the teardown-race safety net
+         *  ([ClaudeTabsHelpers.applyRemovalDeferral]). */
+        val pendingSnapshotRemovals: MutableMap<String, Long> = ConcurrentHashMap()
+
+        /** Dedup for the teardown-freeze log line (one line per distinct reason, not per poll). */
+        @Volatile var lastTeardownWhy: String? = null
+
+        /** Dedup for the recordTabOrder teardown-freeze log line. */
+        @Volatile var tabOrderFrozenLogged: Boolean = false
+
         /** sid → last spawn attempt (ms) — retry cooldown + snapshot warmup stickiness. */
         val restoreSpawnLastAttempt = ConcurrentHashMap<String, Long>()
 
@@ -563,15 +587,24 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         reconcileStaleEntriesOnStartup()
         takeOverOfficialClaudeButton()
 
-        // App-shutdown subscription (once per JVM). appWillBeClosed fires before project teardown,
-        // for both quit and restart, so the snapshot freeze covers a clean shutdown too.
+        // App-shutdown subscription (once per JVM). BOTH lifecycle hooks set the flag — appClosing
+        // fires earlier in the exit sequence than appWillBeClosed — but neither is sufficient by
+        // itself: pty teardown can precede both (field-verified), which is why pollOnce ALSO checks
+        // [appExitInProgress] directly every poll. The listeners exist for the logs and as backup.
         if (appClosingSubscribed.compareAndSet(false, true)) {
             try {
                 val app = ApplicationManager.getApplication()
                 app.messageBus.connect(app).subscribe(
                     com.intellij.ide.AppLifecycleListener.TOPIC,
                     object : com.intellij.ide.AppLifecycleListener {
-                        override fun appWillBeClosed(isRestart: Boolean) { appClosing = true }
+                        override fun appClosing() {
+                            appShuttingDown = true
+                            LOG.info("[ClaudeTabs] appClosing — all open-tabs snapshots frozen")
+                        }
+                        override fun appWillBeClosed(isRestart: Boolean) {
+                            appShuttingDown = true
+                            LOG.info("[ClaudeTabs] appWillBeClosed(isRestart=$isRestart) — all open-tabs snapshots frozen")
+                        }
                     },
                 )
             } catch (e: Exception) {
@@ -692,7 +725,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
         // Step 1: every alive Claude process → per-sid file. No attachment/ancestry gating — that
         // was falsified (dead chains on live tabs). Openness is a present tab, computed in step 1c.
-        data class Scan(val pid: Long, val sid: String, val cwd: String, val name: String?)
+        data class Scan(val pid: Long, val sid: String, val cwd: String, val name: String?, val argvSid: String?)
         val scans = mutableListOf<Scan>()
         storage.sessionsDir.listFiles { f -> f.isFile && f.name.endsWith(".json") }?.forEach { sf ->
             val pid = sf.nameWithoutExtension.toLongOrNull() ?: return@forEach
@@ -704,8 +737,15 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val info = ph.info()
             val procInfo = SessionsDirScanner.ProcessInfo(info.command().orElse(""), info.commandLine().orElse(""))
             if (!SessionsDirScanner.looksLikeClaude(procInfo)) return@forEach
-            val claudeName = ClaudeTabsHelpers.prettifySessionName(ClaudeTabsHelpers.extractJsonString(text, "name"))
-            scans.add(Scan(pid, sid, cwd, claudeName))
+            // nameSource:"derived" marks a CLI placeholder (cwd basename + suffix), not a real
+            // conversation topic — caching it as the entry's name produced useless tab titles.
+            val claudeName =
+                if (ClaudeTabsHelpers.extractJsonString(text, "nameSource") == "derived") null
+                else ClaudeTabsHelpers.prettifySessionName(ClaudeTabsHelpers.extractJsonString(text, "name"))
+            // The sid this process was LAUNCHED with — its argv never changes, so it still names
+            // the tab the plugin bound at birth even after an in-app conversation switch.
+            val argvSid = OwnedTerminalSpawner.sessionIdFromCommandLine(procInfo.commandLine)
+            scans.add(Scan(pid, sid, cwd, claudeName, argvSid))
         }
         for ((sid, group) in scans.groupBy { it.sid }) {
             val s = group.first()
@@ -721,10 +761,36 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
         }
 
+        // Step 1a½: detect in-app conversation switches. A process whose session file names a
+        // DIFFERENT sid than its own argv has been re-pointed by the user (claude's in-app resume
+        // picker switches the live process to an old conversation; the argv keeps the launch sid).
+        // The launch sid is the one the plugin bound the tab to at birth, so the pair
+        // (launch sid → live sid) tells bindSessions exactly which tab binding to re-point.
+        // Field evidence for why this matters: a re-pointed tab stays bound to a stub sid that
+        // never registers a session entry, silently drops out of the snapshot, and the
+        // conversation the user is ACTIVELY WORKING IN is lost on restart.
+        val flipCandidates = mutableMapOf<String, MutableList<String>>() // launch sid → live sids
+        for ((sid, group) in scans.groupBy { it.sid }) {
+            val launchSid = group.first().argvSid ?: continue
+            if (launchSid == sid) continue
+            flipCandidates.getOrPut(launchSid) { mutableListOf() }.add(sid)
+        }
+        val argvFlips = mutableMapOf<String, String>()
+        for ((launchSid, liveSids) in flipCandidates) {
+            if (liveSids.size == 1) {
+                argvFlips[launchSid] = liveSids.single()
+            } else {
+                LOG.info(
+                    "[ClaudeTabs][rebind] ${liveSids.size} live sessions all carry launch sid=$launchSid " +
+                        "in their argv — ambiguous, rebinding nothing (live=$liveSids)",
+                )
+            }
+        }
+
         // Step 1b: bind sessions to owned widgets. Submitted before 1c so newly-bound Contents
         // are reflected in this same poll's presentSids.
         val aliveByCwd = sidToCwd.filter { (_, cwd) -> claimsCwd(cwd, project) }.toMap()
-        ApplicationManager.getApplication().invokeLater { bindSessions(project, aliveByCwd) }
+        ApplicationManager.getApplication().invokeLater { bindSessions(project, aliveByCwd, argvFlips.toMap()) }
 
         // Step 1c: record left-to-right order + recompute openness.
         ApplicationManager.getApplication().invokeLater { recordTabOrder(project) }
@@ -749,8 +815,20 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
 
         // Step 2b: persist the open-tabs snapshot for THIS project (frozen during teardown).
-        val teardown = c.projectClosing || appClosing || try { project.isDisposed } catch (_: Throwable) { false }
-        if (!teardown && !project.basePath.isNullOrBlank()) {
+        // `isExitInProgress` is checked EVERY poll because it is the only signal guaranteed to be
+        // set before the terminal starts killing ptys at quit (which self-closes agent tabs,
+        // indistinguishable from × clicks) — the listener-set flags arrive seconds too late.
+        val exitInProgress = appExitInProgress()
+        val teardown = c.projectClosing || appShuttingDown || exitInProgress ||
+            try { project.isDisposed } catch (_: Throwable) { false }
+        if (teardown) {
+            val why = "projectClosing=${c.projectClosing} appShuttingDown=$appShuttingDown " +
+                "exitInProgress=$exitInProgress"
+            if (c.lastTeardownWhy != why) {
+                c.lastTeardownWhy = why
+                LOG.info("[ClaudeTabs][snapshot] teardown detected ($why) — snapshot FROZEN, keeping last durable write")
+            }
+        } else if (!project.basePath.isNullOrBlank()) {
             val hash = projectHash(project)
             val present = c.presentSids.filter { sid ->
                 storage.activeSessions.read(sid)?.let { claimsCwd(it.cwd, project) } == true
@@ -769,11 +847,30 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 now = now,
                 warmupMs = SPAWN_WARMUP_MS,
             )
+            // Teardown-race safety net: a poll that would drop SEVERAL sids at once (the shape of
+            // pty teardown racing ahead of every close signal) defers the shrink one poll; a
+            // single × still commits instantly. See applyRemovalDeferral for the full contract.
+            val persisted = ClaudeTabsHelpers.applyRemovalDeferral(prev, snapshot, c.pendingSnapshotRemovals, now)
+            val removed = prev - persisted
+            val deferred = (prev - snapshot) - removed
             try {
-                storage.saveOpenTabs(hash, snapshot)
-                LOG.debug("[ClaudeTabs][snapshot] $hash → ${snapshot.size} open (present=${present.size} warmup=${snapshot.size - present.size})")
+                storage.saveOpenTabs(hash, persisted)
+                if (persisted != prev) {
+                    val added = persisted - prev
+                    LOG.info(
+                        "[ClaudeTabs][snapshot] $hash ${prev.size}→${persisted.size} open" +
+                            (if (added.isNotEmpty()) " added=$added" else "") +
+                            (if (removed.isNotEmpty()) " removed=$removed" else ""),
+                    )
+                }
+                if (deferred.isNotEmpty()) {
+                    LOG.info(
+                        "[ClaudeTabs][snapshot] ${deferred.size} tab(s) vanished in one poll — removal DEFERRED " +
+                            "one poll for confirmation (bulk vanish = teardown signature): $deferred",
+                    )
+                }
             } catch (e: Exception) {
-                LOG.debug("[ClaudeTabs] open-tabs snapshot write failed: ${e.message}")
+                LOG.warn("[ClaudeTabs] open-tabs snapshot write failed: ${e.message}")
             }
         }
 
@@ -838,12 +935,38 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      *
      * @param aliveByCwd sid → cwd for sessions seen alive this poll that belong to this project
      */
-    private fun bindSessions(project: Project, aliveByCwd: Map<String, String>) {
+    private fun bindSessions(
+        project: Project,
+        aliveByCwd: Map<String, String>,
+        argvFlips: Map<String, String> = emptyMap(),
+    ) {
         if (project.isDisposed) return
         val c = ctx(project)
         try {
             val tw = TerminalToolWindowManager.getInstance(project).toolWindow ?: return
             val now = System.currentTimeMillis()
+
+            // (A0) Argv-anchored re-point — follow in-app conversation switches. Runs FIRST so a
+            // switched-to session is bound to its true tab before the pending-new reconcile below
+            // could mistake it for a mint's real sid, and before the adopt passes could try to
+            // pair it as an unowned session. Exact by construction: the argv ties the pid to the
+            // tab (via the birth binding), the session scan ties the pid to the live sid. This is
+            // inherently project-scoped — the launch sid is only bound in the project holding the
+            // tab. The old sid's session entry is KEPT (it may be a real conversation the user
+            // switched away from; it simply leaves the snapshot when its tab binding moves on).
+            for ((launchSid, liveSid) in argvFlips) {
+                val boundNow = c.contentToSid.values.toHashSet().apply { addAll(c.spawnedWidgets.keys) }
+                if (launchSid !in boundNow) continue // tab not in this project, or already re-pointed
+                if (liveSid in boundNow) {
+                    LOG.debug("[ClaudeTabs][rebind] live sid=$liveSid already bound — not re-pointing from $launchSid")
+                    continue
+                }
+                repointTabBinding(c, launchSid, liveSid)
+                LOG.info(
+                    "[ClaudeTabs][rebind] In-app conversation switch: tab launched as sid=$launchSid " +
+                        "now hosts sid=$liveSid — binding re-pointed, snapshot follows the live conversation",
+                )
+            }
 
             // (A) Reconcile owned pending-new tabs.
             for ((uuid, pending) in c.pendingNew.toMap()) {
@@ -936,17 +1059,43 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 tabsByCwd.getOrPut(ClaudeTabsHelpers.normalizeCwd(cwd)) { mutableListOf() }.add(content to w)
             }
 
+            // Title gate for the order/count-based passes below: on the reworked terminal an
+            // unbound PLAIN SHELL tab is just as cwd-unreadable as an unbound Claude tab, so FIFO
+            // and last-resort adoption could bind a session to a bash/pwsh tab the user opened
+            // alongside (field-observed: a shell tab wearing a session's glyph and name). A tab
+            // whose readable titles say "shell" is excluded from those passes; anything claude-ish
+            // in a title, or no readable title at all, keeps the tab eligible.
+            val bridgeTitles = ReworkedTerminalBridge.titlesByContent(project)
+            fun observableTitles(content: Content, w: TerminalWidget?): List<String?> {
+                val t = bridgeTitles[content] ?: try { w?.terminalTitle } catch (_: Throwable) { null }
+                return listOf(
+                    try { t?.userDefinedTitle } catch (_: Throwable) { null },
+                    try { t?.applicationTitle } catch (_: Throwable) { null },
+                    try { t?.defaultTitle } catch (_: Throwable) { null },
+                    try { content.displayName } catch (_: Throwable) { null },
+                )
+            }
+            val (shellTabs, claudeCandidates) = undetermined.partition {
+                ClaudeTabsHelpers.titleLooksLikeShellTab(observableTitles(it.first, it.second))
+            }
+            if (shellTabs.isNotEmpty()) {
+                LOG.info(
+                    "[ClaudeTabs][adopt] ${shellTabs.size} unbound tab(s) titled like plain shells — " +
+                        "excluded from FIFO/last-resort session binding",
+                )
+            }
+
             // (B1) FIFO injection-order binding — the BURST case. Several agent-button tabs opened
             // together in one project all land in `undetermined` (Claude owns the pty → cwd
             // unreadable), so the strict 1:1 rule refuses them. But each got a known --session-id
             // injected IN ORDER, and new Contents append to the ContentManager in that same order, so
             // pair still-unbound undetermined tabs to still-unclaimed injected sids in FIFO order.
-            val fifoBound = fifoBindInjected(c, undetermined, widgetOfContent, aliveByCwd, now)
+            val fifoBound = fifoBindInjected(c, claudeCandidates, widgetOfContent, aliveByCwd, now)
 
             // (B2) Hand-open 1:1 adoption for anything the exact + FIFO passes didn't bind.
             val boundSids = c.contentToSid.values.toHashSet().apply { addAll(c.spawnedWidgets.keys) }
             val unownedSessions = aliveByCwd.filterKeys { it !in boundSids }
-            val stillUndetermined = undetermined.filter { !c.contentToSid.containsKey(it.first) }
+            val stillUndetermined = claudeCandidates.filter { !c.contentToSid.containsKey(it.first) }
             val pairs = HashMap<Pair<Content, TerminalWidget?>, String>()
             if (unownedSessions.isNotEmpty()) {
                 val sessionsByCwd = unownedSessions.entries
@@ -987,8 +1136,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // Always-on scan diagnostic (deduped): if adoption isn't happening, idea.log must say why.
             val summary = "[ClaudeTabs][adopt-scan] unownedSessions=${unownedSessions.size} " +
                 "bridgedWidgets=${widgetOfContent.size} readableTabs=${tabsByCwd.values.sumOf { it.size }} " +
-                "undetermined=${undetermined.size} fifoBound=$fifoBound adopted=${pairs.size} " +
-                "fifoQueue=${c.pendingInjectedSids.size}"
+                "undetermined=${undetermined.size} shellTitled=${shellTabs.size} fifoBound=$fifoBound " +
+                "adopted=${pairs.size} fifoQueue=${c.pendingInjectedSids.size}"
             if (summary != c.lastAdoptSummary) { c.lastAdoptSummary = summary; LOG.info(summary) }
         } catch (e: Exception) {
             val msg = "${e.javaClass.simpleName}: ${e.message}"
@@ -1054,6 +1203,23 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         return bound2
     }
 
+    /**
+     * Re-point a tab's bindings from [oldSid] to [newSid] WITHOUT deleting the old sid's session
+     * entry — the in-app-resume path. Unlike [rebindOwnedTab] (whose old sid is a provisional mint
+     * with no conversation behind it), here the old sid may be a REAL conversation the user
+     * switched away from; its entry and transcript must survive so it stays resumable later. It
+     * simply leaves `presentSids` (and hence the snapshot) once no tab binding points at it.
+     * Handles widget-less (reworked/agent-button) tabs: durability works off `contentToSid` alone.
+     */
+    private fun repointTabBinding(c: ProjectCtx, oldSid: String, newSid: String) {
+        c.spawnedWidgets.remove(oldSid)?.let { c.spawnedWidgets[newSid] = it }
+        c.contentToSid.entries.firstOrNull { it.value == oldSid }?.key?.let { c.contentToSid[it] = newSid }
+        c.lastAppliedTitle.remove(oldSid)
+        c.restoreSpawnLastAttempt.remove(oldSid)?.let { c.restoreSpawnLastAttempt[newSid] = it }
+        if (c.materializedSids.remove(oldSid)) c.materializedSids.add(newSid)
+        c.everHadWidget.add(newSid)
+    }
+
     /** Re-point an owned tab's bindings from [oldSid] (the minted uuid) to [newSid] (the id Claude
      *  actually persisted), and delete the provisional minted-uuid entry — the real sid's entry is
      *  written by the poll's session scan. */
@@ -1094,6 +1260,20 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         try {
             if (project.isDisposed) return
             val c = ctx(project)
+            // Teardown guard: during quit the terminal kills ptys and agent tabs self-close, so
+            // Contents leave the manager exactly like × clicks. Recomputing presence / pruning
+            // bindings from that dissolving state would poison presentSids (and via it any late
+            // snapshot write) — freeze the model too, not just the write.
+            if (c.projectClosing || appShuttingDown || appExitInProgress()) {
+                if (!c.tabOrderFrozenLogged) {
+                    c.tabOrderFrozenLogged = true
+                    LOG.info(
+                        "[ClaudeTabs] recordTabOrder FROZEN — teardown in progress; keeping " +
+                            "last-known presence (${c.presentSids.size} sid(s))",
+                    )
+                }
+                return
+            }
             val tw = TerminalToolWindowManager.getInstance(project).toolWindow ?: return
 
             // One-shot: poke the poll loop on tab add/remove. This is NOT close detection (the

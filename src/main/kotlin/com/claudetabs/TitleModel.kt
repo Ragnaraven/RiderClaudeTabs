@@ -133,9 +133,12 @@ internal object TitleModel {
         return t.removePrefix(g).trim()
     }
 
-    /** First non-blank of: explicit user name, live topic, cached topic; else "Claude". */
+    /** First non-blank of: explicit user name, live topic, cached topic; else "Claude".
+     *  A generic default ("Claude Code" — the agent launcher's initial tab title, adopted as a
+     *  "rename" by earlier builds and still present in stored entries) never counts as a user
+     *  name: it must not outrank the session's real topic. */
     fun resolveDisplayName(userName: String?, liveTopic: String?, cachedTopic: String?): String =
-        userName?.takeIf { it.isNotBlank() }
+        userName?.takeIf { it.isNotBlank() && !ClaudeTabsHelpers.isGenericTabName(it) }
             ?: liveTopic?.takeIf { it.isNotBlank() }
             ?: cachedTopic?.takeIf { it.isNotBlank() }
             ?: "Claude"

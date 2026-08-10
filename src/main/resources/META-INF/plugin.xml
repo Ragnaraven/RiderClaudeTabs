@@ -51,47 +51,19 @@
     ]]></description>
 
     <change-notes><![CDATA[
-    <h3>3.0.0 — Redone once more: own the terminal, assign the session id</h3>
-    <p>Every earlier build created tabs it didn't fully own, then <i>guessed</i> which Claude
-    session lived in each one (reflection PID digs, process-ancestry walks, title handshakes,
-    cwd/time correlation). On Rider's reworked out-of-process terminal those signals are
-    unreliable, so identity drifted and the restore/close logic kept mis-firing. 3.0 deletes the
-    guessing entirely and replaces it with a mapping the plugin simply <i>holds</i>.</p>
-    <ul>
-      <li><b>The plugin owns every Claude tab and assigns its session id at launch.</b> New
-        sessions run <code>claude --session-id &lt;uuid&gt;</code> with a plugin-minted UUID;
-        restore runs <code>claude --resume &lt;sid&gt;</code>. Either way the plugin holds
-        <code>widget ↔ Content ↔ sid</code> from birth — identity is a stored fact, never
-        re-derived. Tabs opened via the terminal's own "Claude Code" agent button are captured
-        too: a launch-time <code>--session-id</code> is injected and read back, and tabs created
-        together are bound in creation (FIFO) order so a burst is never lost.</li>
-      <li><b>Openness = a present tab.</b> A tab is open while its Content is present in the
-        terminal tool window. An <b>×</b> removes the Content and drops exactly that one tab — no
-        close event needed. Window-close, quit, crash, and reboot never shrink the set: the
-        crash-atomic open-tabs snapshot is frozen during teardown, so every open tab reopens,
-        named and animated, in order. Months-old sessions on disk never had a present tab, so
-        they never flood back.</li>
-      <li><b>Titles driven natively.</b> Reworked (agent-button) tabs are titled through their own
-        <code>TerminalView</code> title, the same handle classic tabs use — so <code>/tab</code>
-        names, auto topics, and the thinking animation all show identically regardless of how the
-        tab was created.</li>
-      <li><b>Secrets kept out of names.</b> A shell can set the terminal title to its full argv
-        (including secret env values); titles that look like a command line or carry long
-        secret-like tokens are never captured as a session name.</li>
-      <li><b>Deleted:</b> the entire reflection/ancestry/title-heuristic matcher and the falsified
-        process-attachment model and its reaper — the plugin never force-kills a process. It only
-        reads and creates.</li>
-    </ul>
+    <h3>3.0.0 — Own the terminal</h3>
+    <p>Ground-up rewrite. The plugin creates every Claude tab itself and assigns its session id
+    at launch — tab ↔ session identity is a stored fact, never guessed. Only an <b>×</b> closes
+    a tab; window-close, quit, crash, and reboot restore every open tab, named and animated, in
+    order. Real topic names win over placeholders and launcher defaults, transient tool titles
+    are never captured, shell tabs are never mis-bound, and the plugin never kills a process.</p>
 
-    <h3>2.0.0 — Per-session tracking, title ownership, thinking animation</h3>
-    <p>Ground-up rework: one file per alive session
-    (<code>active-sessions/&lt;sid&gt;.json</code>) with crash-atomic (fsync) writes, a bounded
-    eviction backlog, the <code>✳ name</code> title + busy/idle animation, and restore in saved
-    tab order. Superseded in identity handling by the 3.0 own-the-terminal model above.</p>
+    <h3>2.0.0</h3>
+    <p>Per-session files with crash-atomic writes, eviction backlog, title ownership + thinking
+    animation. Superseded by 3.0.</p>
 
     <h3>1.0.18</h3>
-    <p>Window-state serialization, worktree-resume transcript lookup, cross-project arbitration,
-    two-poll-grace eviction. Superseded by the 2.0 and 3.0 redesigns.</p>
+    <p>Heuristic identity matching (ancestry walks, window-state serialization). Superseded.</p>
     ]]></change-notes>
 
     <!-- IntelliJ Platform 2026.1 (build 261) and newer. No untilBuild — forward compatible. -->

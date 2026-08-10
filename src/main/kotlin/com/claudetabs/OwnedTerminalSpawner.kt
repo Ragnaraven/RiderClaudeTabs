@@ -73,6 +73,19 @@ internal object OwnedTerminalSpawner {
     }
 
     /**
+     * Session id carried by a raw command-line STRING — the `ProcessHandle.info().commandLine()`
+     * form used by the poll's process scan. A claude process's argv permanently carries the sid it
+     * was LAUNCHED with, even after the user switches conversations inside it (in-app resume), so
+     * this is the anchor that ties a live pid back to the tab the plugin bound at birth.
+     * Tokenised on whitespace: the session flags and their UUID values never contain spaces, so
+     * quoting/spaces in the executable path cannot break the flag scan.
+     */
+    fun sessionIdFromCommandLine(line: String?): String? {
+        if (line.isNullOrBlank()) return null
+        return sessionIdFromCommand(line.trim().split(Regex("\\s+")))
+    }
+
+    /**
      * Strict unambiguous 1:1 pairing used to adopt a HAND-OPENED tab (one the plugin didn't
      * spawn) into a session. Both sides are grouped by a shared key (the normalised cwd). A key
      * is bound ONLY when it has exactly one session AND exactly one tab — any ambiguity (0 or

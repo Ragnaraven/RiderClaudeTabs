@@ -113,6 +113,23 @@ class OwnedTerminalSpawnerTest {
         assertEquals(null, OwnedTerminalSpawner.sessionIdFromCommand(listOf("claude", "--resume")))
     }
 
+    @Test fun sessionIdFromCommandLine_parsesRawProcessArgvString() {
+        val sid = "11111111-2222-4333-8444-555555555555"
+        // ProcessHandle.info().commandLine() form: one whitespace-joined string.
+        assertEquals(sid, OwnedTerminalSpawner.sessionIdFromCommandLine("""C:\path\to\claude.exe --session-id $sid"""))
+        assertEquals(sid, OwnedTerminalSpawner.sessionIdFromCommandLine("claude --resume $sid"))
+        assertEquals(sid, OwnedTerminalSpawner.sessionIdFromCommandLine("claude --session-id=$sid"))
+        assertEquals(sid, OwnedTerminalSpawner.sessionIdFromCommandLine("  claude   -r   $sid  "))
+    }
+
+    @Test fun sessionIdFromCommandLine_rejectsBlankPlainAndNonUuid() {
+        assertEquals(null, OwnedTerminalSpawner.sessionIdFromCommandLine(null))
+        assertEquals(null, OwnedTerminalSpawner.sessionIdFromCommandLine(""))
+        assertEquals(null, OwnedTerminalSpawner.sessionIdFromCommandLine("""C:\path\to\claude.exe"""))
+        assertEquals(null, OwnedTerminalSpawner.sessionIdFromCommandLine("claude --session-id not-a-uuid"))
+        assertEquals(null, OwnedTerminalSpawner.sessionIdFromCommandLine("some-other-tool --resume 12345"))
+    }
+
     @Test fun injectionRoundTrip_injectedCommandReadsBackTheSameSid() {
         // The contract the customizer + exact-adopt pass rely on: append the two tokens, read the
         // same sid back from the widget's shell command.

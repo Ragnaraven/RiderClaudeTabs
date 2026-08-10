@@ -219,4 +219,106 @@ class ClaudeTabsHelpersTest {
         )
         assertEquals(emptySet<String>(), snap)
     }
+
+    // ── applyRemovalDeferral (teardown-race safety net) ─────────────
+
+    @Test fun removalDeferral_singleAbsentSidCommitsImmediately() {
+        // One tab ×'d → removed this very poll. An ×'d tab must never resurrect, even if the
+        // user quits right after closing it.
+        val pending = mutableMapOf<String, Long>()
+        val out = ClaudeTabsHelpers.applyRemovalDeferral(
+            prev = setOf("a", "b", "c"), computed = setOf("a", "b"), pendingRemovals = pending, now = 1_000L,
+        )
+        assertEquals(setOf("a", "b"), out)
+        assertTrue(pending.isEmpty())
+    }
+
+    @Test fun removalDeferral_bulkVanishIsDeferredOnePollThenCommitted() {
+        // Several tabs vanish in ONE poll — the teardown signature. The first poll keeps them
+        // (nothing lost if the app dies right now); a second consecutive absent poll — which only
+        // runs when the teardown flags are clear — confirms and commits.
+        val pending = mutableMapOf<String, Long>()
+        val first = ClaudeTabsHelpers.applyRemovalDeferral(
+            prev = setOf("a", "b", "c"), computed = setOf("a"), pendingRemovals = pending, now = 1_000L,
+        )
+        assertEquals(setOf("a", "b", "c"), first)
+        assertEquals(setOf("b", "c"), pending.keys)
+        val second = ClaudeTabsHelpers.applyRemovalDeferral(
+            prev = first, computed = setOf("a"), pendingRemovals = pending, now = 6_000L,
+        )
+        assertEquals(setOf("a"), second)
+        assertTrue(pending.isEmpty())
+    }
+
+    @Test fun removalDeferral_reappearingSidCancelsItsPendingRemoval() {
+        val pending = mutableMapOf<String, Long>()
+        ClaudeTabsHelpers.applyRemovalDeferral(
+            prev = setOf("a", "b", "c"), computed = setOf("a"), pendingRemovals = pending, now = 1_000L,
+        )
+        // "b" is present again next poll (transient vanish); only "c" remains absent — and as a
+        // SINGLE absent sid it commits.
+        val out = ClaudeTabsHelpers.applyRemovalDeferral(
+            prev = setOf("a", "b", "c"), computed = setOf("a", "b"), pendingRemovals = pending, now = 6_000L,
+        )
+        assertEquals(setOf("a", "b"), out)
+        assertTrue(pending.isEmpty())
+    }
+
+    @Test fun removalDeferral_mixedFreshAndConfirmedCommitsOnlyConfirmed() {
+        val pending = mutableMapOf("b" to 1_000L, "c" to 1_000L)
+        // "b"/"c" were deferred by an earlier poll; "d" vanishes fresh in this bulk poll.
+        val out = ClaudeTabsHelpers.applyRemovalDeferral(
+            prev = setOf("a", "b", "c", "d"), computed = setOf("a"), pendingRemovals = pending, now = 6_000L,
+        )
+        assertEquals(setOf("a", "d"), out) // b+c committed (confirmed), d held one more poll
+        assertEquals(setOf("d"), pending.keys)
+    }
+
+    @Test fun removalDeferral_noAbsenceIsANoOpAndClearsStalePending() {
+        val pending = mutableMapOf("stale" to 1_000L)
+        val out = ClaudeTabsHelpers.applyRemovalDeferral(
+            prev = setOf("a"), computed = setOf("a", "new"), pendingRemovals = pending, now = 2_000L,
+        )
+        assertEquals(setOf("a", "new"), out)
+        assertTrue(pending.isEmpty())
+    }
+
+    // ── Generic tab names: launcher defaults must never become a persisted user rename ──
+
+    @Test fun genericTabName_includesAgentLauncherDefaults() {
+        assertTrue(ClaudeTabsHelpers.isGenericTabName("Claude Code"))
+        assertTrue(ClaudeTabsHelpers.isGenericTabName("claude code"))
+        assertTrue(ClaudeTabsHelpers.isGenericTabName("Claude Code (2)"))
+        assertTrue(ClaudeTabsHelpers.isGenericTabName("Claude"))
+        assertTrue(ClaudeTabsHelpers.isGenericTabName("Local"))
+        // Real names stay adoptable.
+        assertTrue(!ClaudeTabsHelpers.isGenericTabName("Fix Auth Token Rotation"))
+        assertTrue(!ClaudeTabsHelpers.isGenericTabName("Claude Refactor Plan"))
+    }
+
+    // ── Shell-titled tab detection: keeps FIFO/last-resort from binding a session to a shell ──
+
+    @Test fun shellTabTitle_detectsShellDefaultsAndPromptShapes() {
+        assertTrue(ClaudeTabsHelpers.titleLooksLikeShellTab(listOf("Local", null, null, null)))
+        assertTrue(ClaudeTabsHelpers.titleLooksLikeShellTab(listOf(null, "MINGW64:/path/to/project", "Local", null)))
+        assertTrue(ClaudeTabsHelpers.titleLooksLikeShellTab(listOf(null, """C:\path\to\project""", null, null)))
+        assertTrue(ClaudeTabsHelpers.titleLooksLikeShellTab(listOf("Git Bash", null, null, null)))
+        assertTrue(ClaudeTabsHelpers.titleLooksLikeShellTab(listOf(null, "user@host /path/to/project", null, null)))
+        assertTrue(ClaudeTabsHelpers.titleLooksLikeShellTab(listOf("Local (2)", null, null, null)))
+    }
+
+    @Test fun shellTabTitle_claudeishTitleAlwaysWinsOverShellSignals() {
+        // The agent launcher titles its tabs "Claude Code" — never a shell, even when another
+        // field carries a path-shaped application title.
+        assertTrue(!ClaudeTabsHelpers.titleLooksLikeShellTab(listOf("Claude Code", "MINGW64:/path/to/project", null, null)))
+        assertTrue(!ClaudeTabsHelpers.titleLooksLikeShellTab(listOf(null, null, "claude", null)))
+    }
+
+    @Test fun shellTabTitle_topicTitlesAndUnreadableTitlesStayEligible() {
+        // A real conversation topic is not a shell signal.
+        assertTrue(!ClaudeTabsHelpers.titleLooksLikeShellTab(listOf(null, "Fix Auth Token Rotation", null, null)))
+        // All titles unreadable → cannot rule the tab out (bridge dark ≠ shell).
+        assertTrue(!ClaudeTabsHelpers.titleLooksLikeShellTab(listOf(null, null, null, null)))
+        assertTrue(!ClaudeTabsHelpers.titleLooksLikeShellTab(emptyList()))
+    }
 }
