@@ -19,6 +19,29 @@ class ActiveSessionsStoreTest {
 
     private fun newStore(): ActiveSessionsStore = ActiveSessionsStore(tmp.newFolder("active-sessions"))
 
+    @Test fun root_roundTripsAndDefaultsToWindows() {
+        val s = newStore()
+        // Explicit WSL root round-trips.
+        s.writeOrUpdate(sid = "sid-wsl", cwd = "d:/Dev/ProjectA", pid = 42L, lastSeen = 1L, root = "wsl:DistroA")
+        assertEquals("wsl:DistroA", s.read("sid-wsl")!!.root)
+        // Root omitted on a later update → preserved, never flipped back to windows
+        // (flipping would resume the session under the wrong installation/account).
+        s.writeOrUpdate(sid = "sid-wsl", cwd = "d:/Dev/ProjectA", pid = null, lastSeen = 2L)
+        assertEquals("wsl:DistroA", s.read("sid-wsl")!!.root)
+        // Never written (pre-3.1 file shape) → windows.
+        s.writeOrUpdate(sid = "sid-win", cwd = "/x", pid = 1L, lastSeen = 1L)
+        assertEquals(SessionRoot.Windows.ID, s.read("sid-win")!!.root)
+    }
+
+    @Test fun root_missingFieldParsesAsWindows() {
+        val s = newStore()
+        // A file written by a pre-3.1 build has no "root" key at all.
+        val legacy = """{"sid":"sid-old","cwd":"/x","pid":7,"lastSeen":5,"name":null,"userName":null,"ordinal":null,"restoreAttempts":0}"""
+        val e = s.parse(legacy)
+        assertNotNull(e)
+        assertEquals(SessionRoot.Windows.ID, e!!.root)
+    }
+
     @Test fun writeOrUpdate_createsFile_andReadRoundTrips() {
         val s = newStore()
         s.writeOrUpdate(sid = "sid-1", cwd = "D:\\Dev\\MyApp", pid = 12345L, lastSeen = 1_000_000L, name = "Notes")

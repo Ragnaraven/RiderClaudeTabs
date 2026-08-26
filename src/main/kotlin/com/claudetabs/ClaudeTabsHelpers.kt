@@ -27,6 +27,10 @@ internal object ClaudeTabsHelpers {
     /** Escape backslashes and double-quotes for embedding into a JSON string literal. */
     fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
 
+    /** Extract a non-negative integer-valued field from flat [json], or null. */
+    fun extractJsonLong(json: String, key: String): Long? =
+        Regex(""""$key"\s*:\s*(\d+)""").find(json)?.groupValues?.get(1)?.toLongOrNull()
+
     // ══════════════════════════════════════════════════════════════
     // TAB NAME HELPERS
     // ══════════════════════════════════════════════════════════════
@@ -55,28 +59,184 @@ internal object ClaudeTabsHelpers {
         "windows powershell", "cmd", "command prompt", "wsl", "terminal",
     )
 
+    /** Filler characters the CLI pads its title with. Not stripped by [String.trim] (none of them
+     *  is a Java whitespace character), so the anchored tests must remove them explicitly. The
+     *  BRAILLE PATTERN BLANK belongs here rather than in the busy-frame range below: it RENDERS as
+     *  whitespace, so a title leading with it carries no Claude signal at all. */
+    private const val TITLE_FILLERS = " \t\u00A0\u2007\u202F\u2800"
+
+    /** Leading glyphs a Claude-hosting terminal wears: the plugin's own `✳`, and the CLI's own
+     *  spinner characters. The braille block (U+2801..U+28FF, tested separately) carries claude's
+     *  busy animation frames — U+2800 is excluded, being the blank pattern (see TITLE_FILLERS). */
+    private val CLAUDE_TITLE_GLYPHS = setOf('✳', '·', '✶', '✷', '✸')
+
     /**
-     * True when a tab's observable titles say it is a PLAIN SHELL tab, not a Claude tab. Used to
-     * keep the FIFO / last-resort adoption passes from binding a session to a bash/pwsh tab the
-     * user opened alongside Claude tabs (field-observed: a plain shell tab got a session's glyph
-     * and name because, on the reworked terminal, an unbound shell tab is just as "undetermined"
-     * as an unbound Claude tab).
+     * True when [t] is a title a Claude-hosting terminal wears. Both shapes are START-ANCHORED,
+     * once the CLI's filler padding is trimmed:
      *
-     * Anything claude-ish in ANY title wins immediately (the agent launcher titles its tabs
-     * "Claude Code", and our own glyph format never looks like a shell) — only then do shell
-     * signals count: a known shell default name, a path-shaped title (shells set the window title
-     * to their cwd, e.g. `MINGW64:/path/to/project` or `C:\path`), or a `user@host` prompt shape.
-     * All titles unreadable → NOT shell (binding stays possible when the bridge is dark).
+     *  - the first character is a plugin/CLI glyph or a braille busy frame — `✳ <topic>` while
+     *    idle, `⠂ <topic>` / `⠐ <topic>` while busy;
+     *  - or the title STARTS WITH "claude": the CLI's own process title during startup is
+     *    literally `claude`, and the agent launcher's default tab title is `Claude Code`.
+     *
+     * Claude sets that title on its host terminal itself, so it is the one positive signal a
+     * hand-opened tab running `claude` ever emits.
+     *
+     * Why not a SUBSTRING match on "claude" (what this did until the verdict began granting FIFO
+     * eligibility and immediate commit): a shell titles its window with its cwd or its prompt, and
+     * users of THIS plugin disproportionately have "claude" somewhere in their repo paths — a
+     * title like `MINGW64:/path/to/claude-tools` or `user@host:~/claude-x` then defeats the whole
+     * shell gate and hands a plain shell tab a session. Nothing Claude emits ever carries the word
+     * anywhere but at the front.
+     */
+    fun looksLikeClaudeTitle(t: String): Boolean {
+        val s = t.trimStart { it in TITLE_FILLERS }
+        val first = s.firstOrNull() ?: return false
+        if (s.startsWith("claude", ignoreCase = true)) return true
+        return first in CLAUDE_TITLE_GLYPHS || first in '\u2801'..'\u28FF'
+    }
+
+    /**
+     * True when a tab's observable titles say it is a PLAIN SHELL tab, not a Claude tab. A tab
+     * this returns true for is excluded from EVERY correlation pass — it can never receive a
+     * session (field-observed: a plain shell tab got a session's glyph and name because, on the
+     * reworked terminal, an unbound shell tab is just as "undetermined" as an unbound Claude tab).
+     *
+     * Anything claude-ish in ANY title wins immediately ([looksLikeClaudeTitle]) — only then do
+     * shell signals count: a known shell default name, a path-shaped title (shells set the window
+     * title to their cwd, e.g. `MINGW64:/path/to/project` or `C:\path`), or a `user@host` prompt
+     * shape. All titles unreadable → NOT shell (binding stays possible when the bridge is dark).
+     *
+     * Why the claude-ish exit must outrank EVERY shell slot: a tab wears the generic "Local"
+     * defaultTitle (and the matching Content.displayName) forever, whatever runs inside it, so
+     * without the rescue one shell-shaped slot condemns the whole tab.
+     *
+     * HOW FAR THAT RESCUE REACHES (verified on 2026.1 — do not re-derive): the slot that could
+     * carry claude's own process title is `applicationTitle`, and on a REWORKED tab it is written
+     * only when the advanced setting `terminal.show.application.title` is enabled — default OFF,
+     * with no per-tab opt-in (runtime proof: a tab hosting the CLI reported `application=null` for
+     * its whole life). So on reworked tabs this function has no positive signal to find and will
+     * call a CLI-hosting tab a shell; the rescue is in practice a CLASSIC-tab affordance. That is
+     * not a hole in adoption: a hand-opened reworked tab is bound by the EXACT passes (launch argv
+     * naming the session, or the session's process descending from the tab's pty root), which
+     * ignore this veto entirely.
      */
     fun titleLooksLikeShellTab(titles: Collection<String?>): Boolean {
         val real = titles.filterNotNull().map { it.trim() }.filter { it.isNotEmpty() }
-        if (real.any { it.contains("claude", ignoreCase = true) }) return false
+        if (real.any { looksLikeClaudeTitle(it) }) return false
         return real.any { t ->
             t.lowercase() in SHELL_TAB_NAMES ||
                 t.matches(Regex("(?i)(local|bash|pwsh) \\(\\d+\\)")) ||
                 t.contains('\\') || t.contains(":/") || t.count { c -> c == '/' } >= 2 ||
                 Regex("^\\S+@\\S+").containsMatchIn(t)
         }
+    }
+
+    /**
+     * Adoption-freshness gate: true only when a session's OS-process start time is KNOWN and at
+     * most [maxAgeMs] before [nowMs]. Unknown start (null — process gone, or the platform can't
+     * report it) fails CLOSED: correlation-based adoption must never pair a session of unknown
+     * age with a tab (field-observed: a 12-hour-old orphan session was 1:1-adopted onto a fresh
+     * empty tab and stole its identity). A start time slightly in the future (clock skew) counts
+     * as fresh — it is by definition not an old process.
+     */
+    fun isAdoptablyFresh(startEpochMs: Long?, nowMs: Long, maxAgeMs: Long): Boolean =
+        startEpochMs != null && nowMs - startEpochMs <= maxAgeMs
+
+    // ══════════════════════════════════════════════════════════════
+    // WSL SESSION ROOTS — pure translation/parsing halves
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Translate a WSL-side cwd to its Windows-comparable form: `/mnt/d/Dev/X` → `d:/Dev/X`.
+     * Returns null for anything that isn't a `/mnt/<drive>` path (e.g. `/home/...`, which has
+     * no Windows equivalent, or a path that is already Windows-shaped). Keeping every stored
+     * cwd in Windows form lets ALL existing cwd machinery (project claims, adoption grouping,
+     * spawn working directory) work unchanged — and `wsl.exe` maps the Windows cwd straight
+     * back to the same `/mnt` path on entry.
+     */
+    fun wslCwdToWindows(cwd: String): String? {
+        val m = Regex("""^/mnt/([a-zA-Z])(/.*)?$""").find(cwd.trim()) ?: return null
+        val drive = m.groupValues[1]
+        val rest = m.groupValues[2]
+        return "$drive:" + (rest.ifEmpty { "/" })
+    }
+
+    /**
+     * Normalise a cwd read off a TERMINAL TAB (the reworked bridge) into the same space session
+     * cwds live in. Session cwds are stored Windows-TRANSLATED at scan time (see
+     * [SessionRoot.comparableCwd]), so a tab cwd must be comparably translated or not used at all:
+     *  - Windows-shaped (drive letter or a backslash present) → passed through unchanged;
+     *  - `/`-rooted → through [wslCwdToWindows], which yields NULL for a Linux-native path
+     *    (`/home/dev/project`) that simply has no Windows equivalent.
+     *
+     * Null means "cwd unreadable", NOT "some other cwd": an untranslatable path would otherwise
+     * form a bucket no session can ever match, and the tab would silently lose the last-resort
+     * eligibility it keeps while its cwd is merely unknown.
+     */
+    fun normalizeBridgeCwd(raw: String): String? {
+        val s = raw.trim()
+        if (s.isEmpty()) return null
+        if (s.contains('\\') || Regex("^[a-zA-Z]:").containsMatchIn(s)) return raw
+        if (s.startsWith("/")) return wslCwdToWindows(s)
+        return raw
+    }
+
+    /**
+     * Parse `wsl.exe -l -q` output into distro names. The tool writes UTF-16LE (the classic
+     * gotcha — decoded as UTF-8 every other character is a NUL); a NUL byte anywhere means
+     * UTF-16LE, otherwise plain UTF-8. BOM and blank lines are dropped.
+     */
+    fun parseWslDistroList(raw: ByteArray): List<String> {
+        if (raw.isEmpty()) return emptyList()
+        val text =
+            if (raw.any { it == 0.toByte() }) String(raw, Charsets.UTF_16LE)
+            else String(raw, Charsets.UTF_8)
+        return text.lineSequence()
+            .map { it.trim().trim('\uFEFF', '\u0000') }
+            .filter { it.isNotEmpty() }
+            .toList()
+    }
+
+    /**
+     * True when [s] may be interpolated into the `wsl.exe` command line and into a
+     * `\\wsl.localhost\<distro>\…` path: non-blank and free of `"`, backtick, `$`, `;`, `&`, `|`,
+     * backslash and line breaks. Names carrying any of those are SKIPPED, never escaped — the
+     * command is consumed by an unknown host shell (git-bash, PowerShell, cmd), none of which
+     * quote the same way, and a backslash would also break out of the UNC path.
+     */
+    fun isSafeWslToken(s: String): Boolean =
+        s.isNotBlank() && s.none { it in "\"`$;&|\\\n\r" }
+
+    /**
+     * The command typed into a HOST terminal to resume a WSL-side session: enter the distro
+     * (booting it if stopped) as [user] and run its own — LINUX-NATIVE — claude.
+     *
+     * [user] is the Linux user whose `~/.claude` the session was DISCOVERED under; without `-u`
+     * the distro's DEFAULT user runs the resume, which for a multi-user distro is a different
+     * home, a different claude installation and a different account. Null means unknown (a root
+     * id persisted before roots carried a user) → `-u` is omitted and the default user runs.
+     *
+     * Explicit install locations are tried BEFORE bare `claude`, because WSL's interop PATH
+     * appends the Windows PATH: field-verified, `sh -lc "which claude"` inside a distro resolved
+     * to the WINDOWS npm claude under `/mnt/c/...` — a different installation and account, the
+     * exact wire-crossing this feature exists to prevent. Bare `claude` runs only when no native
+     * candidate exists; if that ever hits the Windows claude, `--resume` of a sid it doesn't own
+     * errors visibly instead of silently opening the wrong account's session.
+     *
+     * Quoting is host-shell-agnostic (the widget's shell may be git-bash, PowerShell, or cmd):
+     * one double-quoted argument, no `$`/backticks (PowerShell and bash would both expand them),
+     * `~` and `;`/`&&` left for the WSL-side `sh` to interpret. [distro]/[user] are expected to
+     * have passed [isSafeWslToken] at discovery time.
+     */
+    fun buildWslResumeCommand(distro: String, sid: String, user: String?): String {
+        val candidates = listOf(
+            "~/.local/bin/claude", "~/.npm-global/bin/claude",
+            "/usr/local/bin/claude", "/usr/bin/claude",
+        )
+        val chain = candidates.joinToString("") { "test -x $it && exec $it --resume $sid; " }
+        val asUser = user?.let { " -u \"$it\"" } ?: ""
+        return "wsl.exe -d \"$distro\"$asUser -- sh -lc \"${chain}claude --resume $sid\""
     }
 
     /**
@@ -339,5 +499,19 @@ internal object ClaudeTabsHelpers {
         for (sid in fresh) pendingRemovals[sid] = now
         for (sid in confirmed) pendingRemovals.remove(sid)
         return computed + fresh
+    }
+
+    /**
+     * Tab lists from three sources merged into ONE display-ordered list without duplicates:
+     * [primary] (the ContentManager's own tabs — its order drives restore ordinals) first, then
+     * every [nested] tab not already listed (split groups), then every [known] tab the terminal
+     * frontend lists that neither source had (the stale-tool-window case — see [TerminalTabs]).
+     * Compared by IDENTITY, the way the platform treats Contents.
+     */
+    fun <T : Any> mergeTabLists(primary: List<T>, nested: List<T>, known: Collection<T>): List<T> {
+        val seen: MutableSet<T> = java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
+        val out = ArrayList<T>(primary.size + nested.size + known.size)
+        for (source in listOf(primary, nested, known)) for (t in source) if (seen.add(t)) out.add(t)
+        return out
     }
 }

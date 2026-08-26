@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>3.0.0</version>
+    <version>3.1.2</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -51,6 +51,66 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>3.1.2 — open tabs can no longer go invisible to the plugin</h3>
+    <ul>
+      <li><b>Fixes sessions silently missing from restore after a long IDE session.</b> The
+        terminal plugin caches its tool-window reference once; when the IDE re-creates the
+        Terminal tool window that cached reference points at an empty, disposed window. The
+        plugin enumerated tabs through it, saw none, and so never recorded any tab as open —
+        after the next restart nothing came back, even though the tabs had been visibly open for
+        days. Tabs are now read from the IDE's tool-window registry (including split groups) and
+        cross-checked against the terminal's own tab list; a stale cache is logged as a warning
+        instead of silently emptying the restore snapshot.</li>
+    </ul>
+    <h3>3.1.1 — hand-opened Claude tabs are adopted again</h3>
+    <ul>
+      <li><b>A tab you typed <code>claude</code> or <code>claude --resume &lt;id&gt;</code> into is
+        picked up again on the reworked terminal.</b> It binds to the session, gets renamed,
+        honors <code>/tab</code>, and comes back after a restart — previously such a tab was
+        never adopted and its session was silently absent from the restore snapshot.</li>
+      <li><b>Tabs are identified by facts, not guesses.</b> A terminal tab now reports the command
+        line it was launched with, the process id at its root, and its launch directory. Two exact
+        rules follow: a tab whose launch command names a session <i>is</i> that session, and a
+        session whose process descends from a tab's root process <i>is running in</i> that tab —
+        which is precisely the hand-typed case. Neither rule needs the tab's title, its working
+        directory, or the order tabs were opened in.</li>
+      <li><b>Plain shell tabs never receive a session by guesswork.</b> A tab that looks like a
+        bash / PowerShell prompt is excluded from the order- and directory-based matching passes —
+        it can neither be given a session nor stand in the way of the real Claude tab getting one.
+        (The two exact rules above are exempt: a tab proven to host a session is bound whatever it
+        is called.) Ambiguity still refuses, in both directions, and a pre-existing tab can no
+        longer absorb a session id minted for a newly launched one.</li>
+    </ul>
+
+    <h3>3.1.0 — WSL session roots</h3>
+    <ul>
+      <li><b>Windows and WSL Claudes are now cleanly separated — and both supported.</b> Each
+        running WSL distro's <code>~/.claude</code> is tracked as its own session root: a
+        separate installation, typically a separate account. Sessions are titled/animated from
+        their own root's status, and restore launches through the owning root
+        (<code>wsl.exe -d &lt;distro&gt; … claude --resume</code> vs plain
+        <code>claude --resume</code>), so a session always comes back under the account it
+        belongs to. A sleeping distro never costs a tab — resuming boots it.</li>
+      <li><b>Stale sessions can no longer steal fresh tabs.</b> Adopting a session onto a
+        hand-opened tab now requires the session's process to be minutes old (the legitimate
+        "just typed <code>claude</code>" case) — a long-running orphan can't grab a new empty
+        tab, wear its name and animation, or leak identity across roots.</li>
+      <li><b>Startup terminals are plugin-authored only.</b> The IDE terminal's own tab
+        persistence reopened tabs and re-ran their commands — an IDE-restored claude tab spawned
+        a brand-new empty session next to the plugin's resumed one (duplicate "Claude" tabs
+        after every restart). The persisted tab list is now cleared at shutdown. A one-time
+        notification explains the takeover with a one-click opt-out (also:
+        <code>rider.claude.tabs.ownStartupTabs</code> registry key). Uninstalling or disabling
+        the plugin automatically returns the IDE's own behavior — the takeover is a
+        per-shutdown action, never a persistent settings change.</li>
+    </ul>
+
+    <h3>3.0.1 — Marketplace compliance</h3>
+    <p>No internal platform API: quit detection now rides the public app-lifecycle listener
+    (same snapshot-freeze semantics). Plugin classloader lookup moved off the deprecated
+    accessor. The remaining deprecated terminal calls are deliberate — their official
+    replacements are still marked experimental on every supported platform build.</p>
+
     <h3>3.0.0 — Own the terminal</h3>
     <p>Ground-up rewrite. The plugin creates every Claude tab itself and assigns its session id
     at launch — tab ↔ session identity is a stored fact, never guessed. Only an <b>×</b> closes
@@ -82,9 +142,14 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <postStartupActivity implementation="com.claudetabs.ClaudeTabWatcherStartup"/>
+        <notificationGroup id="Claude Terminal Tabs" displayType="STICKY_BALLOON"/>
         <registryKey key="rider.claude.tabs.respectAiAgents"
                      defaultValue="true"
                      description="Defer to JetBrains AI Assistant / Anthropic Claude Code plugin when present (informational log only)."
+                     restartRequired="false"/>
+        <registryKey key="rider.claude.tabs.ownStartupTabs"
+                     defaultValue="true"
+                     description="Clear the IDE terminal's own tab persistence at shutdown so every startup terminal tab is plugin-authored. Prevents IDE-restored tabs from re-running claude as brand-new empty sessions next to the plugin's resumed ones. Disable to get the IDE's own shell-tab restore back."
                      restartRequired="false"/>
     </extensions>
 

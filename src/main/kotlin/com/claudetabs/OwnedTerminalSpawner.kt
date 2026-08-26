@@ -20,11 +20,24 @@ internal object OwnedTerminalSpawner {
 
     enum class Mode { NEW, RESUME }
 
+    /**
+     * The executable token that starts every Windows-root launch. Normally the bare `claude` on
+     * the shell's PATH; overridable via `-Dclaudetabs.claudeCommand=<absolute path>` so the E2E
+     * harness can pin its stub CLI without depending on the sandbox shell's PATH. Never set in
+     * production. Quoted when it contains whitespace, the same way the WSL launcher quotes.
+     * Read per call (not cached) so a test can set and restore the property around one assertion.
+     */
+    private fun claudeExecutable(): String {
+        val override = System.getProperty("claudetabs.claudeCommand")?.takeIf { it.isNotBlank() }
+            ?: return "claude"
+        return if (override.any { it.isWhitespace() }) "\"$override\"" else override
+    }
+
     /** The exact command the plugin sends into an owned terminal it just created. Pure so the
      *  contract ("new assigns the id, resume reuses it, nothing else") is unit-pinned. */
     fun launchCommand(sid: String, mode: Mode): String = when (mode) {
-        Mode.NEW -> "claude --session-id $sid"
-        Mode.RESUME -> "claude --resume $sid"
+        Mode.NEW -> "${claudeExecutable()} --session-id $sid"
+        Mode.RESUME -> "${claudeExecutable()} --resume $sid"
     }
 
     private val UUID_V4 =
@@ -105,5 +118,93 @@ internal object OwnedTerminalSpawner {
             if (sids.size == 1 && tabs.size == 1) out[tabs[0]] = sids[0]
         }
         return out
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Pid-ancestry pairing — the EXACT adoption of a hand-typed `claude`
+    // ──────────────────────────────────────────────────────────────────
+
+    /** How far up the OS process tree [pairByPidAncestry] walks. A hand-typed `claude` sits one or
+     *  two hops under its tab's shell (shell → node/npm wrapper → claude); a handful of hops covers
+     *  every wrapper shape while keeping the walk cheap and bounded. */
+    const val ANCESTRY_MAX_HOPS = 6
+
+    /** An alive, unbound session as the ancestry pass sees it. [rootId] is the session's SESSION
+     *  ROOT id (`"windows"`, `"wsl:<distro>:<user>"`, …) — see the cross-namespace hazard in
+     *  [pairByPidAncestry]. A null [rootId] is the pre-3.1 persisted shape and means Windows. */
+    data class AncestrySession(val sid: String, val pid: Long?, val rootId: String?)
+
+    /** An unbound terminal tab as the ancestry pass sees it: an opaque [handle] (the caller's
+     *  Content/widget pair) plus the OS pid of its pty ROOT process, null when unknown (a remote
+     *  or WSL-adapter tab never reports one). */
+    data class AncestryTab<T>(val handle: T, val ptyRootPid: Long?)
+
+    /**
+     * Bind sessions to tabs by OS PROCESS ANCESTRY: a session whose process descends from a tab's
+     * pty root IS running in that tab. That is an operating-system fact, not a correlation, which
+     * is what makes a hand-typed `claude --resume <id>` in an ordinary terminal tab adoptable —
+     * the CLI is a child of that tab's shell.
+     *
+     * Rules:
+     *  - The ancestor set of a session starts at its OWN pid (a tab whose pty root IS the CLI is
+     *    the same fact, one hop shorter) and walks up via [parentOf] for at most [maxHops] hops.
+     *  - Repeating a pid ends the walk, so a cycle or a self-parent from a hostile/odd [parentOf]
+     *    terminates instead of spinning.
+     *  - AMBIGUITY REFUSES, as everywhere else in this codebase: a session matching two or more
+     *    tabs binds nothing, and a tab claimed by two or more sessions binds nothing.
+     *
+     * **CROSS-NAMESPACE HAZARD — why the root gate is not optional.** A pid is only meaningful
+     * inside its own pid namespace. A WSL session's pid is a LINUX pid from the distro's namespace
+     * and can collide numerically with an unrelated Windows pty-root pid; binding on that collision
+     * would attach one Anthropic ACCOUNT's session to another root's tab (identity must never cross
+     * roots — see SessionRoot). So only sessions belonging to the Windows root are ever walked. The
+     * tab side is naturally safe too (a WSL/remote tab reports no pty-root pid), but that is a
+     * second line of defence, never the gate.
+     *
+     * @param parentOf pid → parent pid, or null when unknown/absent (injected so the whole rule is
+     *   testable without touching the real process tree)
+     * @return tab handle → session id, for unambiguous matches only
+     */
+    fun <T> pairByPidAncestry(
+        sessions: List<AncestrySession>,
+        tabs: List<AncestryTab<T>>,
+        parentOf: (Long) -> Long?,
+        maxHops: Int = ANCESTRY_MAX_HOPS,
+    ): Map<T, String> {
+        val tabsByPid = HashMap<Long, MutableList<AncestryTab<T>>>()
+        for (t in tabs) tabsByPid.getOrPut(t.ptyRootPid ?: continue) { mutableListOf() }.add(t)
+        if (tabsByPid.isEmpty()) return emptyMap()
+        // sid → the single tab its ancestry points at (sessions matching 0 or 2+ tabs are dropped).
+        val claimBySid = LinkedHashMap<String, T>()
+        for (s in sessions) {
+            val pid = s.pid ?: continue
+            if (s.rootId != null && s.rootId != WINDOWS_ROOT_ID) continue
+            val matches = ancestorPids(pid, parentOf, maxHops).flatMap { tabsByPid[it].orEmpty() }
+            if (matches.size == 1) claimBySid[s.sid] = matches.single().handle
+        }
+        val claimCount = claimBySid.values.groupingBy { it }.eachCount()
+        val out = HashMap<T, String>()
+        for ((sid, handle) in claimBySid) if (claimCount[handle] == 1) out[handle] = sid
+        return out
+    }
+
+    /** Windows [SessionRoot.Windows.ID], inlined as a `const` so this file stays IDE-free. */
+    private const val WINDOWS_ROOT_ID = SessionRoot.Windows.ID
+
+    /** [start] plus up to [maxHops] of its ancestors. Terminates on an unknown parent, on the hop
+     *  budget, or on a repeated pid (cycle / self-parent), and never throws: a [parentOf] that
+     *  blows up simply ends the walk. */
+    private fun ancestorPids(start: Long, parentOf: (Long) -> Long?, maxHops: Int): Set<Long> {
+        val seen = LinkedHashSet<Long>()
+        seen.add(start)
+        var cur = start
+        var hops = 0
+        while (hops < maxHops) {
+            val parent = try { parentOf(cur) } catch (_: Throwable) { null } ?: break
+            if (!seen.add(parent)) break
+            cur = parent
+            hops++
+        }
+        return seen
     }
 }

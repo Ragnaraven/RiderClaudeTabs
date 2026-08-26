@@ -1,12 +1,15 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
-    id("org.jetbrains.intellij.platform") version "2.10.0"
+    // 2.11: newest line usable with the Gradle 8.13 wrapper (2.12+ requires Gradle 9). Needed
+    // over 2.10 because 2.10's runIde could not boot the unified 2026.1 layout (coroutines
+    // -javaagent class not loadable → JVM abort).
+    id("org.jetbrains.intellij.platform") version "2.11.0"
     kotlin("jvm") version "2.3.0"
 }
 
 group = "com.claudetabs"
-version = "3.0.0"
+version = "3.1.2"
 
 repositories {
     mavenCentral()
@@ -50,7 +53,66 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
+// ── E2E (Layer 3b): sandboxed IDE + Robot Server for UI-driven end-to-end tests ──
+// Launched by e2e/run-e2e.ps1, which prepares build/e2e (stub wrappers, isolated .claude home,
+// throwaway project) and orchestrates the two-phase pre/post-restart scenario. The sandbox IDE
+// reads/writes ONLY the isolated home, and every Claude launch resolves to the stub CLI (pinned
+// by absolute path, see -Dclaudetabs.claudeCommand) — no real sessions, accounts, or IDE state
+// are ever touched.
+val e2eDir: File = layout.buildDirectory.dir("e2e").get().asFile
+
+val runIdeForE2e by intellijPlatformTesting.runIde.registering {
+    type = org.jetbrains.intellij.platform.gradle.IntelliJPlatformType.IntellijIdea
+    version = "2026.1"
+    task {
+        // IPGP injects the IDE's kotlinx-coroutines debug agent; on unified 2026.1 the agent
+        // class fails to load and ABORTS the JVM at boot (ClassNotFoundException: AgentPremain).
+        // The E2E needs no coroutine debug probes — point at a nonexistent jar, which the
+        // exists-guarded argument provider then skips entirely.
+        coroutinesJavaAgentFile.set(layout.buildDirectory.file("e2e/no-coroutines-agent.jar"))
+        jvmArgs(
+            "-Drobot-server.port=8082",
+            "-Drobot-server.host.public=false",
+            "-Dclaudetabs.home=${File(e2eDir, "claude-home/.claude").absolutePath}",
+            "-Dclaudetabs.fakeRoots=distroA=${File(e2eDir, "fake-root/.claude").absolutePath}",
+            "-Dclaudetabs.disableWslDiscovery=true",
+            // Pin the Windows-root launcher to the stub by ABSOLUTE path. The PATH prepend below
+            // is kept as a convenience for anything typed by hand in a sandbox terminal, but it is
+            // not load-bearing: an IDE shell-integration hiccup once swallowed it and the owned
+            // tabs ran the machine's real CLI. This property cannot be swallowed.
+            "-Dclaudetabs.claudeCommand=${File(e2eDir, "bin/claude.cmd").absolutePath}",
+            "-Djb.privacy.policy.text=<!--999.999-->",
+            "-Djb.consents.confirmation.enabled=false",
+            "-Dide.show.tips.on.startup.default.value=false",
+            "-Didea.trust.all.projects=true",
+            "-Deap.require.license=false",
+            // Registry override: keep the Windows Defender advisory toast out of the sandbox.
+            "-Dignore.virus.scanning.warn.message=true",
+        )
+        environment("CLAUDE_STUB_HOME", File(e2eDir, "claude-home/.claude").absolutePath)
+        environment("CLAUDE_STUB_LOG", File(e2eDir, "stub-argv.log").absolutePath)
+        // Any `claude` typed/spawned in a sandbox terminal resolves to the stub, never the real CLI.
+        environment("PATH", File(e2eDir, "bin").absolutePath + ";" + System.getenv("PATH"))
+        args(File(e2eDir, "project").absolutePath)
+    }
+    plugins {
+        robotServerPlugin()
+    }
+}
+
 intellijPlatform {
+    pluginVerification {
+        ides {
+            // Verification IDE targets are supplied per-machine via
+            //   ./gradlew verifyPlugin "-PverifierIdes=<install-dir>[;<install-dir>...]"
+            // so no local installation paths live in the build file. Without the property the
+            // task has no targets and reports so, which is the intended default.
+            providers.gradleProperty("verifierIdes").orNull
+                ?.split(';')
+                ?.filter { it.isNotBlank() }
+                ?.forEach { local(file(it)) }
+        }
+    }
     pluginConfiguration {
         ideaVersion {
             sinceBuild = "261"
@@ -131,6 +193,10 @@ tasks {
         description = "Run Remote Robot UI tests. Requires an IDE sandbox to be running."
         group = "verification"
         useJUnit()
+        // remote-robot's Gson deserializes server error envelopes containing a Throwable; on
+        // JDK 17+ that reflection is sealed and every such response throws JsonIOException in
+        // the CLIENT (masking the real server-side error). Open java.lang for the test JVM.
+        jvmArgs("--add-opens=java.base/java.lang=ALL-UNNAMED")
         include("**/ui/**")
         testClassesDirs = sourceSets["test"].output.classesDirs
         classpath = sourceSets["test"].runtimeClasspath

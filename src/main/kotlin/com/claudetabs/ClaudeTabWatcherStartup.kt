@@ -78,6 +78,49 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private const val INJECT_FIFO_FRESH_MS = 20_000L
         private const val INJECT_FIFO_TTL_MS = 120_000L
 
+        /** Slack for the FIFO first-seen guard. An injected tab's Content necessarily appears
+         *  AFTER its `--session-id` was injected, so a tab first observed BEFORE that instant can
+         *  never be the injection's tab. The stamp itself comes from the ContentManager's own
+         *  `contentAdded` event (no quantisation); this slack only covers the poll-time fallback
+         *  stamp for a tab that already existed when the listener was installed. The guard exists because a
+         *  hand-opened tab can now leave `undetermined` (its cwd became readable) and re-enter the
+         *  FIFO candidate list, where without it a long-standing hand tab would absorb the first
+         *  sid of a later injection burst. */
+        private const val FIFO_FIRST_SEEN_SLACK_MS = 6_000L
+
+        /** Adoption freshness window: the CORRELATION passes (hand-open 1:1 by cwd, last-resort
+         *  single-pairing, minted-sid readback) may only pair a session with a tab while the
+         *  session's OS process is at most this old. The legitimate hand-open case — the user
+         *  types `claude` into a terminal — produces a seconds-old process; a long-running orphan
+         *  (hand-resumed hours ago, a claude running OUTSIDE the IDE in the same cwd, or a stale
+         *  session whose tab is shell-titled and unbindable) must NEVER latch onto a fresh empty
+         *  tab, wear its name, or leak its identity across runtimes/accounts (a tab hosting a
+         *  WSL-side claude is indistinguishable from an unreadable tab — the only safe rule is to
+         *  refuse stale pairings entirely). Exact-identity passes (argv readback, injected-sid
+         *  FIFO) are NOT gated: they carry positive identity, not correlation. */
+        private const val ADOPT_FRESH_WINDOW_MS = 5 * 60_000L
+
+        /** A correlation pairing that is not obviously safe must be observed stable for this long
+         *  before it commits — one extra poll in which a competing signal can land and turn the
+         *  1:1 into a refusal. Exactly one shape needs it: a FOREIGN-root (WSL/fake) sid, which
+         *  would otherwise steal the tab of a just-typed Windows claude whose session file hasn't
+         *  landed yet, and strand it outside the snapshot. (Shell-titled tabs used to defer here
+         *  too; they are now excluded from every pass instead — a confirming poll cannot refute a
+         *  static derivation, so it only delayed the wrong binding by one poll.) */
+        private const val ADOPT_CONFIRM_MS = 8_000L
+
+        /** Circuit breaker for non-Windows roots: a scan that blocks longer than SLOW (a wedged
+         *  \\wsl.localhost share hangs rather than errors) benches that root for BACKOFF, so
+         *  repeated polls don't park thread after thread on the same dead share. */
+        private const val ROOT_SCAN_SLOW_MS = 10_000L
+        private const val ROOT_SCAN_BACKOFF_MS = 5 * 60_000L
+        private val rootScanBackoffUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+        /** Application-level user choice from the one-time startup-tabs takeover notification:
+         *  "on"/"off"; absent = not asked yet. See [suppressIdeTerminalTabRestore]. */
+        private const val OWN_STARTUP_TABS_CHOICE_KEY = "claudetabs.ownStartupTabs.choice"
+        private val ownStartupTabsAskedThisSession = java.util.concurrent.atomic.AtomicBoolean(false)
+
         /** Base delay after a spawn before the next, giving the just-launched Claude a moment to
          *  BEGIN its startup write of `~/.claude.json`; paired with [awaitConfigSettled] which then
          *  waits for that write to FINISH. Together they serialize the writes — the real fix for the
@@ -100,10 +143,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private val appScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
         /** `~/.claude.json` — Claude's own config. Never written; restore reads size+mtime only. */
-        private val CLAUDE_GLOBAL_CONFIG = File(System.getProperty("user.home"), ".claude.json")
+        private val CLAUDE_GLOBAL_CONFIG = ClaudeHome.globalConfig
 
         /** Root of Claude Code's user data. */
-        private val CLAUDE_HOME = File(System.getProperty("user.home"), ".claude")
+        private val CLAUDE_HOME = ClaudeHome.dir
 
         /** Markers wrapping the plugin's legacy section of `~/.claude/CLAUDE.md` (1.x only). */
         private const val CLAUDE_MD_MARKER = "<!-- rider-claude-tabs-plugin -->"
@@ -144,7 +187,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** One-shot guard for [reconcileStaleEntriesOnStartup] across the JVM. */
         private val reconciledThisJvm = java.util.concurrent.atomic.AtomicBoolean(false)
 
-        private const val PLUGIN_VERSION = "3.0.1"
+        private const val PLUGIN_VERSION = "3.1.2"
 
         /** The official Claude Code plugin's "open Claude in the terminal" action (its toolbar
          *  button + Ctrl+Esc). Replaced at startup with [NewClaudeSessionAction] so the button the
@@ -182,23 +225,23 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
         }
 
-        /** True once the IDE begins shutting down (quit OR restart). Freezes the snapshot so a
-         *  shutdown's tab-removal burst can't be mistaken for user ×-closes. */
+        /**
+         * True once the IDE begins shutting down (quit OR restart). Freezes the snapshot so a
+         * shutdown's tab-removal burst can't be mistaken for user ×-closes.
+         *
+         * Set on [com.intellij.ide.AppLifecycleListener.appClosing] — the earliest PUBLIC quit
+         * signal, published app-wide once exit is committed and BEFORE any project starts closing
+         * (pty kills happen inside project/tool-window teardown, strictly after it). The
+         * platform-internal `ApplicationEx.isExitInProgress` flips marginally earlier (at the exit
+         * REQUEST), but the gap between the two contains no teardown, and internal API is barred
+         * from Marketplace plugins — so this flag plus the per-project `projectClosing` flag and
+         * the bulk-vanish removal deferral (the net for any poll landing mid-burst) carry the
+         * quit-race protection. The teardown races observed in the field predate this listener:
+         * they were losses against the LATE signals (`projectClosing` of a second project,
+         * `appWillBeClosed`), not against `appClosing`.
+         */
         @Volatile private var appShuttingDown = false
         private val appClosingSubscribed = java.util.concurrent.atomic.AtomicBoolean(false)
-
-        /**
-         * The EARLIEST platform quit signal: `ApplicationEx.isExitInProgress` is set synchronously
-         * the moment exit is REQUESTED — before any lifecycle listener fires and before tool
-         * windows dispose. Listener flags alone lose the teardown race: field evidence showed the
-         * terminal killing pty processes (agent tabs self-close on process death, exactly like ×
-         * clicks) several seconds before `projectClosing`/`appWillBeClosed` fired, so a poll in
-         * that window recorded the closures as user closes and shrank the final snapshot.
-         */
-        private fun appExitInProgress(): Boolean = try {
-            (ApplicationManager.getApplication() as? com.intellij.openapi.application.ex.ApplicationEx)
-                ?.isExitInProgress == true
-        } catch (_: Throwable) { false }
 
         internal fun ctxOf(project: Project): ProjectCtx =
             projectCtx.getOrPut(project.locationHash) { ProjectCtx() }
@@ -292,6 +335,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             cwd: String,
             displayName: String,
             mode: OwnedTerminalSpawner.Mode,
+            /** Launch command override — non-null when the session's root needs a different
+             *  launcher than the plain Windows `claude` (a WSL session resumes through
+             *  `wsl.exe -d <distro> …` so it comes back under ITS installation/account). */
+            command: String? = null,
         ): TerminalWidget? {
             return try {
                 val initialTitle = TitleModel.compose(displayName, busy = false, frameIndex = 0)
@@ -315,7 +362,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         findContentForWidget(project, widget)?.let { c.contentToSid[it] = sid }
                     } catch (_: Exception) { /* best effort */ }
                 }
-                val cmd = OwnedTerminalSpawner.launchCommand(sid, mode)
+                val cmd = command ?: OwnedTerminalSpawner.launchCommand(sid, mode)
                 ApplicationManager.getApplication().invokeLater {
                     try {
                         widget.sendCommandToExecute(cmd)
@@ -333,8 +380,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
         /** Walk the terminal tool window's ContentManager for the Content backing [widget]. */
         private fun findContentForWidget(project: Project, widget: TerminalWidget): Content? {
-            val tw = TerminalToolWindowManager.getInstance(project).toolWindow ?: return null
-            for (content in tw.contentManager.contents) {
+            val tw = TerminalTabs.toolWindow(project) ?: return null
+            for (content in TerminalTabs.contents(project, tw)) {
                 try {
                     if (TerminalToolWindowManager.findWidgetByContent(content) === widget) return content
                 } catch (_: Exception) { /* try next */ }
@@ -428,6 +475,25 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Set by [com.intellij.openapi.project.ProjectManagerListener.projectClosing]. */
         @Volatile var projectClosing: Boolean = false
 
+        /** Ambiguity grace (EDT-only): sid → epoch-ms until which the sid stays adoption-eligible
+         *  after being refused ONLY because of a same-cwd contest — the refusal must be a delay,
+         *  not a permanent loss of the tab from the snapshot. See bindSessions (B2). */
+        val adoptGraceUntil = HashMap<String, Long>()
+
+        /** Correlation pairing awaiting its one-poll confirmation (EDT-only): sid → (tab
+         *  Content, first-observed epoch-ms). See ADOPT_CONFIRM_MS. */
+        val pendingAdoptConfirm = HashMap<String, Pair<Content, Long>>()
+
+        /** Content → epoch-ms this project first observed the tab UNBOUND (EDT-only, pruned each
+         *  poll to the contents that are still present and still unbound). Stamped by the terminal
+         *  ContentManager's `contentAdded` listener the instant a tab appears, with the poll's own
+         *  stamp as the fallback for tabs that predate the listener. The FIFO pass's first-seen
+         *  guard reads it — see FIFO_FIRST_SEEN_SLACK_MS. */
+        val firstSeenUnbound = HashMap<Content, Long>()
+
+        /** One-shot log dedup for [suppressIdeTerminalTabRestore] (the clear itself repeats). */
+        @Volatile var ideTabRestoreSuppressLogged = false
+
         /** sid → first time (ms) it was observed absent while OTHER sids vanished in the same
          *  poll. Bulk removals defer one poll before committing — the teardown-race safety net
          *  ([ClaudeTabsHelpers.applyRemovalDeferral]). */
@@ -469,8 +535,19 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Last adopt-scan summary logged — dedup so the poll loop doesn't spam idea.log. */
         @Volatile var lastAdoptSummary: String? = null
 
+        /** Last shell-titled-tabs verdict logged — same dedup (the undeduped line was emitted 132
+         *  identical times in a 9-minute run). Cleared when no tab is shell-titled, so the verdict
+         *  logs again if it returns. */
+        @Volatile var lastShellTitledLine: String? = null
+
+        /** Last per-tab title diagnostic block logged — same dedup, one block per change. */
+        @Volatile var lastTitleDiag: String? = null
+
         /** Last bindSessions failure message logged — same dedup. */
         @Volatile var lastBindError: String? = null
+
+        /** Last logged poll-loop error (dedup — a recurring poll failure logs once, not per 5s). */
+        @Volatile var lastPollError: String? = null
 
         /** Wakes the poll loop early (conflated — bursts coalesce). Poked by the terminal
          *  ContentManager listener on tab add/remove so an × is snapshotted IMMEDIATELY: the 5s
@@ -478,8 +555,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          *  tab "necroed" on restart because the frozen snapshot predated the close). */
         val poke = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
 
-        /** One-shot guard for installing the terminal ContentManager listener. */
-        val contentListenerInstalled = java.util.concurrent.atomic.AtomicBoolean(false)
+        /** The terminal ContentManager the poke listener is installed on — re-installed whenever
+         *  the registered tool window (and so its manager) changes; see [TerminalTabs]. */
+        @Volatile var listenedContentManager: com.intellij.ui.content.ContentManager? = null
 
         val startupAt: Long = System.currentTimeMillis()
     }
@@ -586,11 +664,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         updateProjectIndex(project)
         reconcileStaleEntriesOnStartup()
         takeOverOfficialClaudeButton()
+        maybeAskOwnStartupTabs(project)
 
-        // App-shutdown subscription (once per JVM). BOTH lifecycle hooks set the flag — appClosing
-        // fires earlier in the exit sequence than appWillBeClosed — but neither is sufficient by
-        // itself: pty teardown can precede both (field-verified), which is why pollOnce ALSO checks
-        // [appExitInProgress] directly every poll. The listeners exist for the logs and as backup.
+        // App-shutdown subscription (once per JVM). BOTH lifecycle hooks set the flag: appClosing
+        // is published at the START of the committed exit sequence — before any project begins
+        // closing, and therefore before the terminal starts killing ptys — and appWillBeClosed is
+        // the late backstop. This is the earliest public quit signal; the bulk-vanish removal
+        // deferral covers any poll that lands inside a teardown burst regardless.
         if (appClosingSubscribed.compareAndSet(false, true)) {
             try {
                 val app = ApplicationManager.getApplication()
@@ -612,7 +692,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
         }
 
-        val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        // Dispatchers.IO, not Default: the poll loop and title ticks do blocking file IO —
+        // including UNC reads against \\wsl.localhost, which HANG rather than error when the 9p
+        // server is unwell. Blocking IO is not cancellable, so a wedged call parks its thread;
+        // on the small shared Default pool that starves the whole IDE's coroutines, on IO's
+        // large pool it costs one expendable thread (plus the per-root scan breaker in pollOnce).
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
         try {
             val pmListener = object : com.intellij.openapi.project.ProjectManagerListener {
@@ -620,6 +705,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     if (p == project) {
                         ctx(project).projectClosing = true
                         LOG.info("[ClaudeTabs] Project closing — freezing open-tabs snapshot")
+                        suppressIdeTerminalTabRestore(project, ctx(project))
                     }
                 }
             }
@@ -652,7 +738,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 } catch (e: ProcessCanceledException) {
                     throw e
                 } catch (e: Exception) {
-                    LOG.debug("[ClaudeTabs] Poll error: ${e.message}")
+                    // WARN, deduped — a poll that dies every cycle is the plugin silently blind
+                    // (entries freeze, closes go undetected) and must be visible in idea.log.
+                    val msg = "${e.javaClass.simpleName}: ${e.message}"
+                    if (msg != ctx(project).lastPollError) {
+                        ctx(project).lastPollError = msg
+                        LOG.warn("[ClaudeTabs] Poll error (recurring polls suppressed): $msg", e)
+                    }
                 }
                 withTimeoutOrNull(POLL_INTERVAL_MS) { c.poke.receive() }
                 // Brief settle so a burst of Content events (multi-tab close, teardown start)
@@ -680,7 +772,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             var reset = 0
             for (entry in storage.activeSessions.listAll()) {
                 val pid = entry.pid ?: continue
-                if (verifyAlive(pid, entry.sid)) continue
+                if (verifyAlive(pid, entry.sid, entry.root)) continue
                 storage.activeSessions.writeOrUpdate(
                     sid = entry.sid, cwd = entry.cwd, pid = null, lastSeen = now, name = null,
                 )
@@ -723,39 +815,100 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 LOG.warn("[ClaudeTabs] ConfigGuard: ~/.claude.json was corrupt — auto-repaired ($status)")
         }
 
-        // Step 1: every alive Claude process → per-sid file. No attachment/ancestry gating — that
-        // was falsified (dead chains on live tabs). Openness is a present tab, computed in step 1c.
-        data class Scan(val pid: Long, val sid: String, val cwd: String, val name: String?, val argvSid: String?)
+        // Step 1: every alive Claude process IN EVERY SESSION ROOT → per-sid file. Roots = the
+        // Windows ~/.claude plus each RUNNING WSL distro's (each a separate installation and
+        // typically a separate ACCOUNT — see SessionRoot; identity never crosses roots). WSL cwds
+        // are stored Windows-translated so all downstream cwd logic works unchanged. No
+        // attachment/ancestry gating — falsified (dead chains on live tabs). Openness is a
+        // present tab, computed in step 1c.
+        data class Scan(
+            val root: SessionRoot, val pid: Long, val sid: String,
+            val cwd: String, val name: String?, val argvSid: String?, val startedAt: Long?,
+        )
         val scans = mutableListOf<Scan>()
-        storage.sessionsDir.listFiles { f -> f.isFile && f.name.endsWith(".json") }?.forEach { sf ->
-            val pid = sf.nameWithoutExtension.toLongOrNull() ?: return@forEach
-            val text = try { sf.readText() } catch (_: Exception) { return@forEach }
-            val sid = ClaudeTabsHelpers.extractJsonString(text, "sessionId") ?: return@forEach
-            val cwd = ClaudeTabsHelpers.extractJsonString(text, "cwd") ?: return@forEach
-            val ph = ProcessHandle.of(pid).orElse(null) ?: return@forEach
-            if (!ph.isAlive) return@forEach
-            val info = ph.info()
-            val procInfo = SessionsDirScanner.ProcessInfo(info.command().orElse(""), info.commandLine().orElse(""))
-            if (!SessionsDirScanner.looksLikeClaude(procInfo)) return@forEach
-            // nameSource:"derived" marks a CLI placeholder (cwd basename + suffix), not a real
-            // conversation topic — caching it as the entry's name produced useless tab titles.
-            val claudeName =
-                if (ClaudeTabsHelpers.extractJsonString(text, "nameSource") == "derived") null
-                else ClaudeTabsHelpers.prettifySessionName(ClaudeTabsHelpers.extractJsonString(text, "name"))
-            // The sid this process was LAUNCHED with — its argv never changes, so it still names
-            // the tab the plugin bound at birth even after an in-app conversation switch.
-            val argvSid = OwnedTerminalSpawner.sessionIdFromCommandLine(procInfo.commandLine)
-            scans.add(Scan(pid, sid, cwd, claudeName, argvSid))
+        val roots: List<SessionRoot> =
+            listOf(SessionRoot.Windows) + WslDiscovery.runningRoots() + FakeRoots.all
+        for (root in roots) {
+            // Bench a root whose previous scan wedged or threw: \\wsl.localhost hangs rather
+            // than errors when the 9p server is unwell (blocking File IO is not cancellable —
+            // repeated polls would park thread after thread on the same dead share), and the
+            // IDE platform hooks java.io access to wsl.localhost paths and throws UNCHECKED
+            // (FileSystemNotFoundException — field-observed for a container-runtime utility
+            // distro that lists as running but has no browsable filesystem).
+            if ((rootScanBackoffUntil[root.id] ?: 0L) > now) continue
+            val scanStart = System.currentTimeMillis()
+            try {
+                root.sessionsDir.listFiles { f -> f.isFile && f.name.endsWith(".json") }?.forEach { sf ->
+                    val pid = sf.nameWithoutExtension.toLongOrNull() ?: return@forEach
+                    val text = try { sf.readText() } catch (_: Exception) { return@forEach }
+                    val sid = ClaudeTabsHelpers.extractJsonString(text, "sessionId") ?: return@forEach
+                    val rawCwd = ClaudeTabsHelpers.extractJsonString(text, "cwd") ?: return@forEach
+                    if (!root.processAlive(pid)) return@forEach
+                    // Recycling guard. A root that can't inspect argv (WSL /proc virtual files over
+                    // the share) returns null — accepted: the session file sits in THAT root's own
+                    // ~/.claude, written by its claude, and the sessionId guard applies downstream.
+                    // BLANK info (Windows can report a live process with empty command AND command
+                    // line, e.g. across access-token boundaries) is the same "unknown" case — a
+                    // node-wrapped claude would otherwise be filtered and its session never tracked.
+                    val info = root.processInfo(pid)
+                        ?.takeIf { it.command.isNotBlank() || it.commandLine.isNotBlank() }
+                    if (info != null && !SessionsDirScanner.looksLikeClaude(info)) return@forEach
+                    // nameSource:"derived" marks a CLI placeholder (cwd basename + suffix), not a real
+                    // conversation topic — caching it as the entry's name produced useless tab titles.
+                    val claudeName =
+                        if (ClaudeTabsHelpers.extractJsonString(text, "nameSource") == "derived") null
+                        else ClaudeTabsHelpers.prettifySessionName(ClaudeTabsHelpers.extractJsonString(text, "name"))
+                    // The sid this process was LAUNCHED with — its argv never changes, so it still names
+                    // the tab the plugin bound at birth even after an in-app conversation switch.
+                    val argvSid = OwnedTerminalSpawner.sessionIdFromCommandLine(info?.commandLine)
+                    // The CLI stamps its own start time into the file — the freshness anchor that
+                    // works identically for every root (no process API needed).
+                    val startedAt = ClaudeTabsHelpers.extractJsonLong(text, "startedAt")
+                    scans.add(Scan(root, pid, sid, root.comparableCwd(rawCwd), claudeName, argvSid, startedAt))
+                }
+            } catch (t: Throwable) {
+                // One bad root must NEVER abort the poll: before this catch existed, the utility
+                // distro's throw killed every poll mid-scan — entries froze (pids never updated,
+                // new sessions never tracked) while the loop looked alive. Bench it and move on.
+                rootScanBackoffUntil[root.id] = System.currentTimeMillis() + ROOT_SCAN_BACKOFF_MS
+                LOG.warn(
+                    "[ClaudeTabs][wsl] root ${root.id} scan failed " +
+                        "(${t.javaClass.simpleName}: ${t.message}) — benched for ${ROOT_SCAN_BACKOFF_MS / 1000}s",
+                )
+                continue
+            }
+            val scanTook = System.currentTimeMillis() - scanStart
+            if (root !is SessionRoot.Windows && scanTook > ROOT_SCAN_SLOW_MS) {
+                rootScanBackoffUntil[root.id] = System.currentTimeMillis() + ROOT_SCAN_BACKOFF_MS
+                LOG.warn(
+                    "[ClaudeTabs][wsl] root ${root.id} scan took ${scanTook}ms — " +
+                        "benched for ${ROOT_SCAN_BACKOFF_MS / 1000}s",
+                )
+            }
         }
+        val adoptableFreshSids = mutableSetOf<String>()
+        val sidRootIds = mutableMapOf<String, String>()
         for ((sid, group) in scans.groupBy { it.sid }) {
             val s = group.first()
             try {
-                storage.activeSessions.writeOrUpdate(sid, s.cwd, s.pid, now, s.name)
+                storage.activeSessions.writeOrUpdate(sid, s.cwd, s.pid, now, s.name, root = s.root.id)
                 seenSids.add(sid)
                 sidToPid[sid] = s.pid
                 sidToCwd[sid] = s.cwd
+                sidRootIds[sid] = s.root.id
                 c.everSeenAlive.add(sid)
                 evictionTracker.recordAlive(sid)
+                // Adoption-freshness (see ADOPT_FRESH_WINDOW_MS): correlation passes may only pair
+                // this sid with a tab while the session is minutes old. Primary anchor: the CLI's
+                // own `startedAt` stamp (field-verified present on every root's session files in
+                // practice); then the root's process start time. If BOTH are unknown the age is
+                // unknown, and unknown age must fail CLOSED — [isAdoptablyFresh] already does, and
+                // anchoring the clock at "when this JVM first saw it" defeated exactly that: a
+                // stale orphan looked seconds old and was adopted onto a fresh tab.
+                val startMs = s.startedAt ?: s.root.processStartEpochMs(s.pid)
+                if (ClaudeTabsHelpers.isAdoptablyFresh(startMs, now, ADOPT_FRESH_WINDOW_MS)) {
+                    adoptableFreshSids.add(sid)
+                }
             } catch (e: Exception) {
                 LOG.debug("[ClaudeTabs] writeOrUpdate failed for sid=$sid: ${e.message}")
             }
@@ -790,7 +943,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // Step 1b: bind sessions to owned widgets. Submitted before 1c so newly-bound Contents
         // are reflected in this same poll's presentSids.
         val aliveByCwd = sidToCwd.filter { (_, cwd) -> claimsCwd(cwd, project) }.toMap()
-        ApplicationManager.getApplication().invokeLater { bindSessions(project, aliveByCwd, argvFlips.toMap()) }
+        val freshSids = adoptableFreshSids.toSet()
+        val sidRoots = sidRootIds.toMap()
+        // Snapshot: the poll thread keeps mutating sidToPid in step 2, after this hand-off.
+        val sidPids = sidToPid.toMap()
+        ApplicationManager.getApplication().invokeLater {
+            bindSessions(project, aliveByCwd, argvFlips.toMap(), freshSids, sidRoots, sidPids)
+        }
 
         // Step 1c: record left-to-right order + recompute openness.
         ApplicationManager.getApplication().invokeLater { recordTabOrder(project) }
@@ -802,7 +961,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             if (entry.sid in seenSids) continue
             val recordedPid = entry.pid
             if (recordedPid == null) { unconfirmed.add(entry); continue }
-            if (verifyAlive(recordedPid, entry.sid)) {
+            if (verifyAlive(recordedPid, entry.sid, entry.root)) {
                 evictionTracker.recordAlive(entry.sid)
                 c.everSeenAlive.add(entry.sid)
                 sidToPid[entry.sid] = recordedPid
@@ -815,19 +974,21 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
 
         // Step 2b: persist the open-tabs snapshot for THIS project (frozen during teardown).
-        // `isExitInProgress` is checked EVERY poll because it is the only signal guaranteed to be
-        // set before the terminal starts killing ptys at quit (which self-closes agent tabs,
-        // indistinguishable from × clicks) — the listener-set flags arrive seconds too late.
-        val exitInProgress = appExitInProgress()
-        val teardown = c.projectClosing || appShuttingDown || exitInProgress ||
+        // appShuttingDown (set on appClosing, which precedes all project teardown at quit) and
+        // projectClosing cover quit and window-close; the terminal's pty kills self-close agent
+        // tabs exactly like × clicks, so any poll that lands inside a removal burst before either
+        // flag flips is caught by the bulk-vanish deferral instead.
+        val teardown = c.projectClosing || appShuttingDown ||
             try { project.isDisposed } catch (_: Throwable) { false }
         if (teardown) {
-            val why = "projectClosing=${c.projectClosing} appShuttingDown=$appShuttingDown " +
-                "exitInProgress=$exitInProgress"
+            val why = "projectClosing=${c.projectClosing} appShuttingDown=$appShuttingDown"
             if (c.lastTeardownWhy != why) {
                 c.lastTeardownWhy = why
                 LOG.info("[ClaudeTabs][snapshot] teardown detected ($why) — snapshot FROZEN, keeping last durable write")
             }
+            // Repeated on every teardown poll: the terminal may rewrite its persisted tab list
+            // during its own shutdown bookkeeping, and the LAST write must be the empty one.
+            suppressIdeTerminalTabRestore(project, c)
         } else if (!project.basePath.isNullOrBlank()) {
             val hash = projectHash(project)
             val present = c.presentSids.filter { sid ->
@@ -891,16 +1052,23 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     )
                 ) continue
                 if (!claimsCwd(entry.cwd, project)) continue
-                if (!ClaudeTabsHelpers.hasTranscriptAnywhere(storage.projectsDir, entry.sid, entry.cwd)) continue
+                if (!transcriptExistsForEntry(entry)) continue
                 val attempts = c.restoreSpawnAttempts[entry.sid] ?: 0
                 if (attempts >= MAX_SPAWN_ATTEMPTS) continue
                 val last = c.restoreSpawnLastAttempt[entry.sid]
                 if (last != null && (now - last) < RESPAWN_COOLDOWN_MS) continue
                 c.restoreSpawnAttempts[entry.sid] = attempts + 1
                 val displayName = TitleModel.resolveDisplayName(entry.userName, null, entry.name)
+                // Resolved OFF the EDT — see performRestore.
+                val resumeCommand = SessionRoot.resumeCommandFor(entry.root, entry.sid)
                 resumeSpawnMutex.withLock {
                     withContext(Dispatchers.Main) {
-                        if (!project.isDisposed) spawnOwnedTab(project, entry.sid, entry.cwd, displayName, OwnedTerminalSpawner.Mode.RESUME)
+                        if (!project.isDisposed) {
+                            spawnOwnedTab(
+                                project, entry.sid, entry.cwd, displayName, OwnedTerminalSpawner.Mode.RESUME,
+                                command = resumeCommand,
+                            )
+                        }
                     }
                     delay(RESTORE_STAGGER_MS)
                     awaitConfigSettled()
@@ -928,22 +1096,55 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      *      a different id — adopt the single new unbound session in that tab's cwd (serialized spawns
      *      keep it unambiguous) via [rebindOwnedTab]. Give up after [SPAWN_WARMUP_MS].
      *
+     *  (A2) **Exact adoption from birth-time / OS facts.** Before any heuristic runs: a tab whose
+     *      LAUNCH ARGV names the session, and a session whose PROCESS DESCENDS from a tab's pty
+     *      root. Both ignore the shell-title veto and the freshness gate — see the block comment at
+     *      the passes themselves for why that is not a loosening.
+     *
      *  (B) **Adopt hand-opened tabs.** A tab the user opened by hand (bypassing the action) has no
      *      birth binding. Correlate unowned present tabs to unowned alive sessions strictly 1:1 by
      *      cwd ([OwnedTerminalSpawner.pairUniqueByKey]) — ambiguity binds nothing, so a session can
-     *      never attach to the wrong tab (and an × can never kill the wrong Claude).
+     *      never attach to the wrong tab (and an × can never kill the wrong Claude). A tab's cwd
+     *      comes from its classic widget, or — for a reworked tab, which has no widget at all —
+     *      from [ReworkedTerminalBridge.viewInfoByContent] (live shell-integration cwd, else the
+     *      tab's LAUNCH directory); without that second source a hand-opened reworked tab was
+     *      invisible to this whole pass.
+     *
+     *      Shell-titledness is a hard VETO over the HEURISTIC passes: a tab that still affirmatively
+     *      looks like a plain shell is removed from their candidate pools, so it can neither receive
+     *      a session nor block another tab from receiving one. A title carrying claude's own glyph
+     *      (`✳ <topic>`, braille busy frames) or leading with "claude" rescues a tab from the
+     *      generic "Local" defaultTitle ([ClaudeTabsHelpers.looksLikeClaudeTitle]) — but note that
+     *      on a REWORKED tab that rescue effectively never fires: the CLI's own terminal title is
+     *      written to `applicationTitle` only when the advanced setting
+     *      `terminal.show.application.title` is enabled, and it is OFF by default with no per-tab
+     *      opt-in (verified at runtime: a tab hosting the CLI reported `application=null` for its
+     *      whole life). So the rescue is a classic-tab affordance, and a hand-opened reworked tab
+     *      running the CLI reaches the snapshot through the exact passes (A2) — not through titles.
      *
      * @param aliveByCwd sid → cwd for sessions seen alive this poll that belong to this project
+     * @param freshSids sids whose process started within [ADOPT_FRESH_WINDOW_MS] — the ONLY sids
+     *   the correlation passes ((A) minted-sid readback candidates, (B2) hand-open 1:1 and
+     *   last-resort) may pair with a tab. A stale orphan (hand-resumed hours ago, running
+     *   outside the IDE, or wearing an unbindable shell-titled tab) must never latch onto a
+     *   fresh tab — field-observed stealing a new tab's identity, name, and animation. Exact
+     *   passes (argv re-point, injected-sid FIFO) carry positive identity and are not gated.
      */
     private fun bindSessions(
         project: Project,
         aliveByCwd: Map<String, String>,
         argvFlips: Map<String, String> = emptyMap(),
+        freshSids: Set<String> = emptySet(),
+        sidRoots: Map<String, String> = emptyMap(),
+        /** sid → the OS pid of its claude process, for the sessions seen alive this poll. Read ONLY
+         *  by the pid-ancestry pass, and there only for Windows-root sessions (a WSL pid belongs to
+         *  a different pid namespace — see [OwnedTerminalSpawner.pairByPidAncestry]). */
+        sidPids: Map<String, Long> = emptyMap(),
     ) {
         if (project.isDisposed) return
         val c = ctx(project)
         try {
-            val tw = TerminalToolWindowManager.getInstance(project).toolWindow ?: return
+            val tw = TerminalTabs.toolWindow(project) ?: return
             val now = System.currentTimeMillis()
 
             // (A0) Argv-anchored re-point — follow in-app conversation switches. Runs FIRST so a
@@ -978,8 +1179,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 }
                 val boundSids = c.contentToSid.values.toHashSet().apply { addAll(c.spawnedWidgets.keys) }
                 val pendCwd = ClaudeTabsHelpers.normalizeCwd(pending.cwd)
+                // freshSids gate: the readback target is a JUST-SPAWNED claude — a stale unowned
+                // session in the same cwd must neither be mistaken for it nor block the count.
+                // Root gate: the plugin's own spawner launches the WINDOWS claude, so the real
+                // sid can only ever appear in the windows root — a foreign-root session must
+                // never masquerade as a mint's readback.
                 val candidates = aliveByCwd.filter { (sid, cwd) ->
-                    sid !in boundSids && sid !in c.pendingNew.keys &&
+                    sid !in boundSids && sid !in c.pendingNew.keys && sid in freshSids &&
+                        (sidRoots[sid] ?: SessionRoot.Windows.ID) == SessionRoot.Windows.ID &&
                         ClaudeTabsHelpers.normalizeCwd(cwd) == pendCwd
                 }.keys
                 val pendingForCwd = c.pendingNew.values.count { ClaudeTabsHelpers.normalizeCwd(it.cwd) == pendCwd }
@@ -1042,32 +1249,126 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 LOG.info("[ClaudeTabs] Exact adopt (sid from tab's own launch command) → sid=$sid")
             }
 
-            // Enumerate every UNBOUND tab ONCE, split into cwd-readable (a shell — has shell
-            // integration) and undetermined (unreadable cwd = a full-screen pty = a Claude tab; also
-            // any widgetless reworked tab). Built before the 1:1 pass so the FIFO pass below can run
+            // Everything the reworked frontend can tell us about its tabs in ONE walk: the live
+            // TerminalTitle, the view's cwd, and the tab's birth-time launch facts (argv, pty-root
+            // pid, launch cwd). A reworked tab has NO classic widget, so this is its only source
+            // for any of them — read here, before the enumeration, because the cwd decides which
+            // bucket each tab lands in and the launch facts drive the exact passes below.
+            // NOTE on the title: `applicationTitle` does NOT follow the program's own terminal
+            // title here — the reworked path writes it only when the advanced setting
+            // `terminal.show.application.title` is enabled, default OFF, no per-tab opt-in. The
+            // title is still read (shell-tab veto) and written (rename), but it identifies nothing.
+            val bridgeInfo = ReworkedTerminalBridge.viewInfoByContent(project)
+
+            // Enumerate every UNBOUND tab ONCE, in ContentManager (= creation) order, split into
+            // cwd-readable and undetermined (unreadable cwd = a full-screen pty whose shell
+            // integration has gone quiet). Built before the 1:1 pass so the FIFO pass below can run
             // even when no session is "alive" yet (a freshly injected tab whose Claude hasn't
             // registered its session file).
             val tabsByCwd = HashMap<String, MutableList<Pair<Content, TerminalWidget?>>>()
             val undetermined = mutableListOf<Pair<Content, TerminalWidget?>>()
-            for (content in tw.contentManager.contents) {
+            val unboundInOrder = mutableListOf<Pair<Content, TerminalWidget?>>()
+            var bridgeCwdTabs = 0
+            for (content in TerminalTabs.contents(project, tw, bridgeInfo.keys)) {
                 if (c.contentToSid.containsKey(content)) continue
                 val w = widgetOfContent[content]
                     ?: try { TerminalToolWindowManager.findWidgetByContent(content) } catch (_: Exception) { null }
                 if (w != null && c.spawnedWidgets.containsValue(w)) continue
+                unboundInOrder.add(content to w)
+                // First-seen stamp for the FIFO guard — a tab can only be an injection's tab if it
+                // appeared after that injection.
+                c.firstSeenUnbound.getOrPut(content) { now }
+                // The bridge reports the tab's cwd in the RUNTIME's own form (a WSL tab reports
+                // `/mnt/...`, or a Linux-native path with no Windows equivalent at all), while
+                // session cwds are stored Windows-translated at scan time — so translate, and
+                // treat an untranslatable path as unreadable rather than as a bucket of its own.
                 val cwd = currentDirectoryOf(w)
+                    ?: bridgeInfo[content]?.cwd
+                        ?.let { ClaudeTabsHelpers.normalizeBridgeCwd(it) }
+                        ?.also { bridgeCwdTabs++ }
                 if (cwd == null) { undetermined.add(content to w); continue }
                 tabsByCwd.getOrPut(ClaudeTabsHelpers.normalizeCwd(cwd)) { mutableListOf() }.add(content to w)
             }
+            // Contents that vanished or got bound stop carrying a stamp.
+            val unboundContents = unboundInOrder.mapTo(HashSet()) { it.first }
+            c.firstSeenUnbound.keys.retainAll(unboundContents)
 
-            // Title gate for the order/count-based passes below: on the reworked terminal an
-            // unbound PLAIN SHELL tab is just as cwd-unreadable as an unbound Claude tab, so FIFO
-            // and last-resort adoption could bind a session to a bash/pwsh tab the user opened
-            // alongside (field-observed: a shell tab wearing a session's glyph and name). A tab
-            // whose readable titles say "shell" is excluded from those passes; anything claude-ish
-            // in a title, or no readable title at all, keeps the tab eligible.
-            val bridgeTitles = ReworkedTerminalBridge.titlesByContent(project)
+            // ── EXACT PASSES (A) and (B) — run BEFORE every heuristic pass ────────────────────
+            // Both bind on a STORED or OPERATING-SYSTEM fact, so both deliberately ignore the two
+            // gates below, which exist only to constrain GUESSING:
+            //  - the SHELL-TITLE VETO. On a reworked tab the program's title is not observable at
+            //    all: `applicationTitle` is written only when the advanced setting
+            //    `terminal.show.application.title` is enabled, and it is OFF by default with no
+            //    per-tab opt-in (runtime-verified — a tab hosting the CLI reported
+            //    `application=null` its whole life). Such a tab wears "Local" forever, so the veto
+            //    would refuse precisely the tabs these passes exist to rescue.
+            //  - the ADOPTION-FRESHNESS gate. Age bounds the damage of a wrong CORRELATION. An argv
+            //    naming the sid, or a process tree putting the session inside the tab, is equally
+            //    true for a session started a second ago and one started last week — and "chats
+            //    left open for weeks" is the core case of the restore contract.
+            // Nothing is loosened: ambiguity still refuses, and an already-bound sid is never stolen.
+            val boundNow = HashSet(c.contentToSid.values).apply { addAll(c.spawnedWidgets.keys) }
+
+            // (A) ARGV SESSION ID. A reworked tab whose launch argv carries `--session-id <sid>`
+            // IS that session — the id ClaudeAgentLaunchCustomizer injected at spawn, read back
+            // through the bridge's startup options. Parsed by the SAME helper the classic-widget
+            // path and the process scan use, so there is exactly one argv parser in the plugin.
+            var argvBound = 0
+            for ((content, w) in unboundInOrder) {
+                if (c.contentToSid.containsKey(content)) continue
+                val sid = OwnedTerminalSpawner.sessionIdFromCommand(bridgeInfo[content]?.shellCommand) ?: continue
+                if (sid !in aliveByCwd || sid in boundNow) continue // alive, this project's, unbound
+                c.contentToSid[content] = sid
+                c.everHadWidget.add(sid)
+                boundNow.add(sid)
+                w?.let { c.spawnedWidgets[sid] = it }
+                argvBound++
+                LOG.info("[ClaudeTabs][adopt] Argv adopt (the tab's own launch argv names the session) → sid=$sid")
+            }
+
+            // (B) PID ANCESTRY. A session whose process descends from a tab's pty root runs IN that
+            // tab — which is what makes a hand-typed `claude --resume <id>` in an ordinary terminal
+            // adoptable, with no cwd, title or timing signal needed. The rule (hop budget, cycle
+            // safety, ambiguity refusal) and the CROSS-PID-NAMESPACE hazard behind the Windows-root
+            // gate live in [OwnedTerminalSpawner.pairByPidAncestry].
+            val ancestryTabs = unboundInOrder
+                .filter { !c.contentToSid.containsKey(it.first) }
+                .map { OwnedTerminalSpawner.AncestryTab(it, bridgeInfo[it.first]?.ptyRootPid) }
+            val ancestrySessions = aliveByCwd.keys
+                .filter { it !in boundNow }
+                .map { OwnedTerminalSpawner.AncestrySession(it, sidPids[it], sidRoots[it] ?: SessionRoot.Windows.ID) }
+            var ancestryBound = 0
+            for ((tab, sid) in OwnedTerminalSpawner.pairByPidAncestry(ancestrySessions, ancestryTabs, ::parentPidOf)) {
+                val (content, widget) = tab
+                c.contentToSid[content] = sid
+                c.everHadWidget.add(sid)
+                boundNow.add(sid)
+                widget?.let { c.spawnedWidgets[sid] = it }
+                ancestryBound++
+                LOG.info(
+                    "[ClaudeTabs][adopt] Ancestry adopt (the session's process descends from this " +
+                        "tab's pty root) → sid=$sid",
+                )
+            }
+
+            // Title gate — a hard VETO over every CORRELATION pass (the exact passes above already
+            // ran and are exempt by construction). On the reworked terminal an unbound PLAIN SHELL
+            // tab looks exactly like an unbound Claude tab to the order/count based passes, so
+            // adoption could bind a session to a bash/pwsh tab the user opened alongside
+            // (field-observed: a shell tab wearing a session's glyph and name — the original bug).
+            // Anything claude-ish in ANY title — a leading glyph/braille busy frame or a title
+            // starting with "claude" — keeps the tab eligible, as does having no readable title.
+            // SCOPE OF THAT RESCUE (verified, do not re-derive): on a REWORKED tab the CLI's own
+            // terminal title never reaches us, because `applicationTitle` is written only when the
+            // advanced setting `terminal.show.application.title` is enabled and it is OFF by
+            // default with no per-tab opt-in. A hand-opened reworked tab therefore wears "Local"
+            // for life and the gate calls it a shell whatever runs inside — so the claude-ish
+            // rescue effectively only fires on CLASSIC tabs. That is why the exact argv/ancestry
+            // passes above run first and ignore this veto: they are the ONLY way such a tab is
+            // ever adopted. The plugin-owned launch paths (the action, the taken-over button,
+            // injected agent launches) never depended on titles either — they bind at birth.
             fun observableTitles(content: Content, w: TerminalWidget?): List<String?> {
-                val t = bridgeTitles[content] ?: try { w?.terminalTitle } catch (_: Throwable) { null }
+                val t = bridgeInfo[content]?.title ?: try { w?.terminalTitle } catch (_: Throwable) { null }
                 return listOf(
                     try { t?.userDefinedTitle } catch (_: Throwable) { null },
                     try { t?.applicationTitle } catch (_: Throwable) { null },
@@ -1075,45 +1376,129 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     try { content.displayName } catch (_: Throwable) { null },
                 )
             }
-            val (shellTabs, claudeCandidates) = undetermined.partition {
-                ClaudeTabsHelpers.titleLooksLikeShellTab(observableTitles(it.first, it.second))
+            val shellTitled = unboundInOrder
+                .filter { ClaudeTabsHelpers.titleLooksLikeShellTab(observableTitles(it.first, it.second)) }
+                .mapTo(HashSet()) { it.first }
+            // How far the veto reaches depends on WHERE the title came from. A classic widget's tab
+            // name never follows the program's OSC title, so a classic tab hosting the CLI wears a
+            // shell-looking name forever — that name is NOT evidence the CLI is absent. Only the
+            // reworked view's title (which the CLI rewrites within about a second of launch) carries
+            // that evidence, so only bridge-read titles justify the hard veto. Classic-titled tabs
+            // stay eligible for the strict one-session/one-tab by-directory match — which is exact
+            // enough not to need the title signal — while remaining out of the weaker
+            // order/count-based passes below.
+            val authoritativeShellTitled = shellTitled.filterTo(mutableSetOf()) { bridgeInfo[it]?.title != null }
+            val claudeCandidates = undetermined.filterNot { it.first in shellTitled }
+            // Per-tab title forensics for every UNBOUND tab, deduped like the scan summary below.
+            // The title gate is a hard veto, so when a tab the user expects to be adopted is
+            // classified as a plain shell this is the only record of what the four observable title
+            // slots actually held, and which source (reworked view vs classic widget) they came
+            // from. Non-ASCII is escaped so a CLI glyph survives the log file's encoding — its
+            // presence or absence is exactly what distinguishes "no OSC title arrived" from "the
+            // title arrived and the gate still said shell".
+            val titleDiag = unboundInOrder.mapIndexed { idx, (content, w) ->
+                val bridgeTitle = bridgeInfo[content]?.title
+                val widgetTitle = try { w?.terminalTitle } catch (_: Throwable) { null }
+                val src = when {
+                    bridgeTitle != null -> "bridge"
+                    widgetTitle != null -> "widget"
+                    else -> "none"
+                }
+                val slots = observableTitles(content, w)
+                "[ClaudeTabs][title-diag] tab#$idx src=$src " +
+                    "userDefined=${quoteForLog(slots[0])} application=${quoteForLog(slots[1])} " +
+                    "default=${quoteForLog(slots[2])} displayName=${quoteForLog(slots[3])} " +
+                    "shell=${content in shellTitled}"
             }
-            if (shellTabs.isNotEmpty()) {
-                LOG.info(
-                    "[ClaudeTabs][adopt] ${shellTabs.size} unbound tab(s) titled like plain shells — " +
-                        "excluded from FIFO/last-resort session binding",
-                )
+            val titleDiagJoined = titleDiag.joinToString("\n")
+            if (titleDiagJoined != c.lastTitleDiag) {
+                c.lastTitleDiag = titleDiagJoined
+                titleDiag.forEach { LOG.info(it) }
+            }
+            // Deduped like the adopt-scan summary: the ~5s poll re-derives the same verdict every
+            // pass, and an undeduped line emitted 132 identical times in a 9-minute run drowns the
+            // log it exists to explain. Only a CHANGE in the verdict is worth a line.
+            if (shellTitled.isNotEmpty()) {
+                val line = "[ClaudeTabs][adopt] ${shellTitled.size} unbound tab(s) titled like plain shells — " +
+                    "excluded from the order/count adoption passes; the " +
+                    "${authoritativeShellTitled.size} bridge-titled of them also from the strict " +
+                    "by-cwd pass"
+                if (line != c.lastShellTitledLine) { c.lastShellTitledLine = line; LOG.info(line) }
+            } else {
+                c.lastShellTitledLine = null
             }
 
             // (B1) FIFO injection-order binding — the BURST case. Several agent-button tabs opened
-            // together in one project all land in `undetermined` (Claude owns the pty → cwd
-            // unreadable), so the strict 1:1 rule refuses them. But each got a known --session-id
-            // injected IN ORDER, and new Contents append to the ContentManager in that same order, so
-            // pair still-unbound undetermined tabs to still-unclaimed injected sids in FIFO order.
-            val fifoBound = fifoBindInjected(c, claudeCandidates, widgetOfContent, aliveByCwd, now)
+            // together in one project all got a known --session-id injected IN ORDER, and their new
+            // Contents append to the ContentManager in that same order, so pair still-unbound tabs
+            // to still-unclaimed injected sids in FIFO order. Candidates are ALL unbound non-shell
+            // tabs, not just the undetermined ones: an agent tab whose cwd turned out readable is
+            // now drained into `tabsByCwd` above, and must not thereby fall out of the burst fix.
+            // The first-seen guard inside keeps a pre-existing hand tab from stealing an injected
+            // sid it cannot possibly own.
+            val fifoCandidates = unboundInOrder.filter { it.first !in shellTitled }
+            val fifoBound = fifoBindInjected(c, fifoCandidates, widgetOfContent, aliveByCwd, now)
 
             // (B2) Hand-open 1:1 adoption for anything the exact + FIFO passes didn't bind.
+            // Three gates protect it:
+            //  - FRESHNESS (see the freshSids param doc): the legitimate case is "user typed
+            //    `claude` into a tab moments ago"; an orphan must stay unbound rather than risk
+            //    pairing with the wrong tab. A sid refused only because of AMBIGUITY keeps ONE
+            //    extra window of grace (below) — the refusal is a delay, not a life sentence.
+            //  - PAIRING CONFIRMATION (below, at commit): a foreign-root session must not steal a
+            //    tab from a Windows claude whose session file hasn't landed yet.
+            //  - THE TITLE GATE: shell-titled tabs are already out of every candidate list here.
             val boundSids = c.contentToSid.values.toHashSet().apply { addAll(c.spawnedWidgets.keys) }
-            val unownedSessions = aliveByCwd.filterKeys { it !in boundSids }
+            val eligible = { sid: String -> sid in freshSids || (c.adoptGraceUntil[sid] ?: 0L) > now }
+            val staleUnowned = aliveByCwd.keys.count { it !in boundSids && !eligible(it) }
+            val unownedSessions = aliveByCwd.filterKeys { it !in boundSids && eligible(it) }
+            // Ambiguity grace, BOUNDED. A poll that refuses a sid — because another session
+            // contests its cwd, or because the tab side is momentarily ambiguous — must not cost it
+            // its tab forever, so every still-unowned sid facing at least one plausible (unbound,
+            // non-shell) tab gets one more window. The bound is that grace may only ever be
+            // GRANTED to a sid that is still in freshSids: a sid eligible only VIA grace can never
+            // refresh its own grace. Without that rule two long-dead sessions sharing a cwd kept
+            // each other adoptable forever — re-opening exactly the stale-orphan theft the
+            // freshness gate exists to prevent. Net eligibility bound: freshness + ONE window.
+            val hasAdoptableTab = unboundInOrder.any {
+                it.first !in shellTitled && !c.contentToSid.containsKey(it.first)
+            }
+            if (hasAdoptableTab) {
+                for (sid in aliveByCwd.keys) {
+                    if (sid in freshSids && sid !in boundSids) c.adoptGraceUntil[sid] = now + ADOPT_FRESH_WINDOW_MS
+                }
+            }
+            c.adoptGraceUntil.keys.retainAll(aliveByCwd.keys) // dead/gone sids drop their grace
             val stillUndetermined = claudeCandidates.filter { !c.contentToSid.containsKey(it.first) }
             val pairs = HashMap<Pair<Content, TerminalWidget?>, String>()
+            var adoptedCount = 0
             if (unownedSessions.isNotEmpty()) {
                 val sessionsByCwd = unownedSessions.entries
                     .groupBy({ ClaudeTabsHelpers.normalizeCwd(it.value) }, { it.key })
+                // Candidate tabs per cwd: still unbound AND not AUTHORITATIVELY shell-titled (see
+                // the veto note above — a classic tab's name is not evidence). Pre-filtering the
+                // pool is what makes the everyday shape resolve by the plain strict rule — the
+                // project directory holding the Claude tab plus the plain shells the user keeps
+                // open there is now one session and ONE candidate tab. It also stops a shell tab
+                // from BLOCKING the last-resort pass below (a readable bash tab sharing the cwd
+                // used to make the real, cwd-unreadable Claude tab unadoptable).
                 val readableTabsByCwd = HashMap<String, MutableList<Pair<Content, TerminalWidget?>>>()
                 for ((cwd, list) in tabsByCwd) {
-                    val fresh = list.filter { !c.contentToSid.containsKey(it.first) }
+                    val fresh = list.filter {
+                        !c.contentToSid.containsKey(it.first) && it.first !in authoritativeShellTitled
+                    }
                     if (fresh.isNotEmpty()) readableTabsByCwd[cwd] = fresh.toMutableList()
                 }
                 // Pair among cwd-readable tabs (strict 1:1 per cwd — ambiguity binds nothing).
+                val readableByCwd = readableTabsByCwd.mapValues { it.value.toList() }
                 pairs.putAll(
                     OwnedTerminalSpawner.pairUniqueByKey(
                         sessionsByKey = sessionsByCwd,
-                        tabsByKey = readableTabsByCwd.mapValues { it.value.toList() },
+                        tabsByKey = readableByCwd,
                     ),
                 )
                 // Last resort: exactly ONE unowned session left, exactly ONE undetermined tab, and no
-                // readable tab in the session's cwd competing for it — the only possible pairing.
+                // candidate readable tab in the session's cwd competing for it — the only possible pairing.
                 val leftoverSessions = unownedSessions.keys - pairs.values.toSet()
                 if (leftoverSessions.size == 1 && stillUndetermined.size == 1) {
                     val sid = leftoverSessions.first()
@@ -1123,21 +1508,54 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         LOG.info("[ClaudeTabs] Last-resort adopt: single unowned session + single undetermined tab → sid=$sid")
                     }
                 }
+                // COMMIT — with a one-poll confirmation for the one pairing that could be wrong.
+                // FOREIGN ROOT: a WSL/fake session (typically a DIFFERENT ACCOUNT) can correlate
+                // onto a tab that in truth hosts a just-typed Windows claude whose session file
+                // hasn't been written yet; committing steals the tab, strands the real session
+                // outside the snapshot (silent loss on restart — contract violation), and resumes
+                // the other account's conversation in its place. The SAME sid↔tab pairing must
+                // therefore survive one extra poll (ADOPT_CONFIRM_MS) — time enough for the
+                // competing Windows session to appear and turn the pairing into a refusal.
+                // Everything else commits at once: same-root mispairing cannot cross accounts, and
+                // the exact passes have already had theirs.
                 for ((tab, sid) in pairs) {
+                    val root = sidRoots[sid] ?: SessionRoot.Windows.ID
+                    if (root != SessionRoot.Windows.ID) {
+                        val pending = c.pendingAdoptConfirm[sid]
+                        if (pending == null || pending.first !== tab.first) {
+                            c.pendingAdoptConfirm[sid] = tab.first to now
+                            LOG.info(
+                                "[ClaudeTabs][adopt] sid=$sid pairing observed but not obviously safe " +
+                                    "(foreign-root ($root)) — deferred one poll for confirmation",
+                            )
+                            continue
+                        }
+                        if (now - pending.second < ADOPT_CONFIRM_MS) continue
+                    }
                     val (content, widget) = tab
                     c.contentToSid[content] = sid
                     c.everHadWidget.add(sid)
+                    c.pendingAdoptConfirm.remove(sid)
+                    adoptedCount++
                     // Widget may be null for a bridged-but-widgetless tab: durability works off
                     // contentToSid alone; only title/animation needs the widget.
                     widget?.let { c.spawnedWidgets[sid] = it }
-                    LOG.info("[ClaudeTabs] Hand-open 1:1 adopted tab (cwd match) → sid=$sid")
+                    LOG.info("[ClaudeTabs] Hand-open 1:1 adopted tab (cwd match, root=$root) → sid=$sid")
                 }
             }
+            // A pairing that dissolved (ambiguity appeared, tab vanished, session died) forgets its
+            // stamp. OUTSIDE the block above on purpose: a poll with no eligible unowned session at
+            // all must still clear stamps, otherwise they linger holding disposed Content refs.
+            c.pendingAdoptConfirm.keys.retainAll(pairs.values.toSet())
             // Always-on scan diagnostic (deduped): if adoption isn't happening, idea.log must say why.
             val summary = "[ClaudeTabs][adopt-scan] unownedSessions=${unownedSessions.size} " +
+                "staleUnowned=$staleUnowned " +
                 "bridgedWidgets=${widgetOfContent.size} readableTabs=${tabsByCwd.values.sumOf { it.size }} " +
-                "undetermined=${undetermined.size} shellTitled=${shellTabs.size} fifoBound=$fifoBound " +
-                "adopted=${pairs.size} fifoQueue=${c.pendingInjectedSids.size}"
+                "bridgeCwd=$bridgeCwdTabs undetermined=${undetermined.size} " +
+                "shellTitled=${shellTitled.size}/${authoritativeShellTitled.size} " +
+                "argvBound=$argvBound ancestryBound=$ancestryBound fifoBound=$fifoBound " +
+                "adopted=$adoptedCount pendingConfirm=${c.pendingAdoptConfirm.size} " +
+                "fifoQueue=${c.pendingInjectedSids.size}"
             if (summary != c.lastAdoptSummary) { c.lastAdoptSummary = summary; LOG.info(summary) }
         } catch (e: Exception) {
             val msg = "${e.javaClass.simpleName}: ${e.message}"
@@ -1149,15 +1567,43 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     /**
-     * (B1) FIFO injection-order binding. Pairs still-unbound [undetermined] tabs (unreadable cwd =
-     * Claude tabs) to still-unclaimed injected sids in FIFO order — the deterministic answer to the
-     * burst case the strict 1:1 rule can't touch. Order holds because ContentManager order = tab
-     * creation order = injection order. Binds Content-only when the tab is widgetless (reworked).
-     * Returns the number bound this pass. Heavily logged so the queue can be tracked in idea.log.
+     * Render a title slot for a log line: a missing slot stays the bare token `null`, anything else
+     * is quoted so an EMPTY string (`""`) is unmistakable. Every char outside printable ASCII —
+     * notably the CLI's leading status glyph and braille spinner frames — becomes `\uXXXX`, because
+     * idea.log's encoding cannot be relied on to round-trip them and their presence is the whole
+     * point of the diagnostic.
+     */
+    private fun quoteForLog(s: String?): String {
+        if (s == null) return "null"
+        val sb = StringBuilder(s.length + 2).append('"')
+        for (ch in s) {
+            when {
+                ch == '"' || ch == '\\' -> sb.append('\\').append(ch)
+                ch.code in 0x20..0x7E -> sb.append(ch)
+                else -> sb.append("\\u").append(String.format("%04x", ch.code))
+            }
+        }
+        return sb.append('"').toString()
+    }
+
+    /**
+     * (B1) FIFO injection-order binding. Pairs still-unbound, non-shell-titled [candidates] (in
+     * ContentManager order) to still-unclaimed injected sids in FIFO order — the deterministic
+     * answer to the burst case the strict 1:1 rule can't touch. Order holds because ContentManager
+     * order = tab creation order = injection order. Binds Content-only when the tab is widgetless
+     * (reworked). Returns the number bound this pass. Heavily logged so the queue can be tracked
+     * in idea.log.
+     *
+     * FIRST-SEEN GUARD: a tab is only paired with an injected sid when this project first observed
+     * the tab unbound at or after the injection (minus [FIFO_FIRST_SEEN_SLACK_MS] of poll-cadence
+     * slack). An injected tab's Content necessarily appears AFTER its injection, so an older tab
+     * — a shell or claude the user opened by hand long before — can never be it. Without the
+     * guard, now that a readable-cwd tab also enters this candidate list, such a tab would absorb
+     * the first sid of a later burst and the real tab would be left unbound.
      */
     private fun fifoBindInjected(
         c: ProjectCtx,
-        undetermined: List<Pair<Content, TerminalWidget?>>,
+        candidates: List<Pair<Content, TerminalWidget?>>,
         widgetOfContent: Map<Content, TerminalWidget>,
         aliveByCwd: Map<String, String>,
         now: Long,
@@ -1181,24 +1627,43 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             it.sid in aliveByCwd || (now - it.injectedAt) < INJECT_FIFO_FRESH_MS
         }
         if (bindable.isEmpty()) return 0
-        val tabs = undetermined.map { it.first }.filter { !c.contentToSid.containsKey(it) }
+        val tabs = candidates.map { it.first }.filter { !c.contentToSid.containsKey(it) }
         if (tabs.isEmpty()) {
-            LOG.info("[ClaudeTabs][fifo] ${bindable.size} injected sid(s) bindable but no unbound undetermined tab yet (queue=${c.pendingInjectedSids.size})")
+            LOG.info("[ClaudeTabs][fifo] ${bindable.size} injected sid(s) bindable but no unbound candidate tab yet (queue=${c.pendingInjectedSids.size})")
             return 0
         }
-        val n = minOf(tabs.size, bindable.size)
-        LOG.info("[ClaudeTabs][fifo] binding $n by injection order (unboundUndeterminedTabs=${tabs.size} bindableInjected=${bindable.size} queue=${c.pendingInjectedSids.size})")
+        LOG.info("[ClaudeTabs][fifo] pairing up to ${minOf(tabs.size, bindable.size)} by injection order (unboundCandidateTabs=${tabs.size} bindableInjected=${bindable.size} queue=${c.pendingInjectedSids.size})")
         var bound2 = 0
-        for (i in 0 until n) {
-            val content = tabs[i]
-            val inj = bindable[i]
+        var skippedTooOld = 0
+        var ti = 0
+        var bi = 0
+        while (ti < tabs.size && bi < bindable.size) {
+            val content = tabs[ti]
+            val inj = bindable[bi]
+            // First-seen guard: a tab this project already knew before the sid was injected cannot
+            // be that injection's tab. Skip the TAB (not the sid) — the sid's own tab may still be
+            // further down the ContentManager order.
+            val firstSeen = c.firstSeenUnbound[content] ?: now
+            if (firstSeen < inj.injectedAt - FIFO_FIRST_SEEN_SLACK_MS) {
+                ti++
+                skippedTooOld++
+                continue
+            }
             c.contentToSid[content] = inj.sid
             c.everHadWidget.add(inj.sid)
             val w = widgetOfContent[content]
             if (w != null) c.spawnedWidgets[inj.sid] = w
             c.pendingInjectedSids.remove(inj)
             bound2++
-            LOG.info("[ClaudeTabs][fifo] bound tab#$i → sid=${inj.sid} widget=${w != null} (was injected ${now - inj.injectedAt}ms ago)")
+            LOG.info("[ClaudeTabs][fifo] bound tab#$ti → sid=${inj.sid} widget=${w != null} (was injected ${now - inj.injectedAt}ms ago)")
+            ti++
+            bi++
+        }
+        if (skippedTooOld > 0) {
+            LOG.info(
+                "[ClaudeTabs][fifo] $skippedTooOld candidate tab(s) skipped by the first-seen guard " +
+                    "(known before the injection — cannot be an injected tab)",
+            )
         }
         return bound2
     }
@@ -1234,6 +1699,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         try { storage.activeSessions.delete(oldSid) } catch (_: Exception) { }
     }
 
+    /**
+     * Parent of a WINDOWS pid, or null when the OS won't say (process gone, permission, no parent).
+     * The injected lookup behind the pid-ancestry pass — kept here, at the platform edge, so the
+     * pairing rule itself stays a pure function ([OwnedTerminalSpawner.pairByPidAncestry]).
+     * `ProcessHandle` is JDK API and reports the WINDOWS process tree only, which is exactly the
+     * namespace that pass is gated to.
+     */
+    private fun parentPidOf(pid: Long): Long? = try {
+        ProcessHandle.of(pid).flatMap { it.parent() }.map<Long> { it.pid() }.orElse(null)
+    } catch (_: Throwable) { null }
+
     /** The tab's cwd, or null. Cascade of PUBLIC accessors (no private-field reflection):
      *  1. `getCurrentDirectory()` on the widget — present on the reworked TerminalWidgetImpl, but
      *     sourced from shell integration, which can go quiet while a full-screen app owns the pty.
@@ -1264,7 +1740,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // Contents leave the manager exactly like × clicks. Recomputing presence / pruning
             // bindings from that dissolving state would poison presentSids (and via it any late
             // snapshot write) — freeze the model too, not just the write.
-            if (c.projectClosing || appShuttingDown || appExitInProgress()) {
+            if (c.projectClosing || appShuttingDown) {
                 if (!c.tabOrderFrozenLogged) {
                     c.tabOrderFrozenLogged = true
                     LOG.info(
@@ -1274,19 +1750,30 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 }
                 return
             }
-            val tw = TerminalToolWindowManager.getInstance(project).toolWindow ?: return
+            val tw = TerminalTabs.toolWindow(project) ?: return
 
-            // One-shot: poke the poll loop on tab add/remove. This is NOT close detection (the
+            // Poke the poll loop on tab add/remove. This is NOT close detection (the
             // falsified 1.x/2.x territory was CLASSIFYING removals); it only wakes the presence
             // recompute so an × is snapshotted before a same-instant IDE close freezes the
             // snapshot. During teardown the write guard in pollOnce still freezes everything.
-            if (c.contentListenerInstalled.compareAndSet(false, true)) {
-                tw.contentManager.addContentManagerListener(object : com.intellij.ui.content.ContentManagerListener {
-                    override fun contentAdded(event: com.intellij.ui.content.ContentManagerEvent) { c.poke.trySend(Unit) }
+            // Installed per ContentManager INSTANCE, not once per project: a re-created tool
+            // window brings a new manager, and a listener left on the old one hears nothing.
+            val cm = try { tw.contentManagerIfCreated } catch (_: Throwable) { null }
+            if (cm != null && cm !== c.listenedContentManager) {
+                c.listenedContentManager = cm
+                cm.addContentManagerListener(object : com.intellij.ui.content.ContentManagerListener {
+                    override fun contentAdded(event: com.intellij.ui.content.ContentManagerEvent) {
+                        // Stamp the tab's first-unbound instant at the exact moment it appears, not
+                        // at the next poll: the FIFO first-seen guard compares that stamp against
+                        // the injection time, and poll-cadence quantisation left it a whole poll
+                        // interval of slack in which a pre-existing tab could still look "new".
+                        c.firstSeenUnbound.getOrPut(event.content) { System.currentTimeMillis() }
+                        c.poke.trySend(Unit)
+                    }
                     override fun contentRemoved(event: com.intellij.ui.content.ContentManagerEvent) { c.poke.trySend(Unit) }
                 })
             }
-            val contents = tw.contentManager.contents
+            val contents = TerminalTabs.contents(project, tw)
 
             val present = LinkedHashSet<String>()
             contents.forEachIndexed { index, content ->
@@ -1310,12 +1797,117 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     /** PID + sid cross-check (handles PID reuse): `<pid>.json` exists AND its sessionId matches. */
-    private fun verifyAlive(pid: Long, expectedSid: String): Boolean {
-        val pidFile = File(storage.sessionsDir, "$pid.json")
+    /**
+     * Transcript-existence gate for restore, per root. Windows: strict — a missing transcript
+     * means nothing to resume. WSL: checked only while the distro is running and its projects
+     * dir is readable; otherwise FAIL-OPEN — a sleeping distro must never cost the user a tab
+     * (the resume command itself boots it), per the restore contract. The Windows-translated
+     * entry cwd misses the WSL munged-dirname fast path, but [ClaudeTabsHelpers.transcriptFile]
+     * falls back to scanning every project subdir, which finds it.
+     */
+    private fun transcriptExistsForEntry(entry: ActiveSessionsStore.Entry): Boolean {
+        if (entry.root == SessionRoot.Windows.ID) {
+            return ClaudeTabsHelpers.hasTranscriptAnywhere(storage.projectsDir, entry.sid, entry.cwd)
+        }
+        val root = SessionRoot.byId(entry.root) ?: return true
+        val readable = try { root.projectsDir.isDirectory } catch (_: Throwable) { false }
+        if (!readable) return true
+        return ClaudeTabsHelpers.hasTranscriptAnywhere(root.projectsDir, entry.sid, entry.cwd)
+    }
+
+    /**
+     * One-time (per application) notification for the startup-tabs takeover: the behavior is ON
+     * by default — it is the correct behavior for what this plugin exists to do — but disabling
+     * an IDE feature deserves an explicit heads-up and a one-click opt-out. The choice persists
+     * app-wide; until the user answers, the notification reappears once per IDE session.
+     */
+    private fun maybeAskOwnStartupTabs(project: Project) {
+        try {
+            val props = com.intellij.ide.util.PropertiesComponent.getInstance()
+            if (props.getValue(OWN_STARTUP_TABS_CHOICE_KEY) != null) return
+            if (!ownStartupTabsAskedThisSession.compareAndSet(false, true)) return
+            val group = com.intellij.notification.NotificationGroupManager.getInstance()
+                .getNotificationGroup("Claude Terminal Tabs") ?: return
+            val n = group.createNotification(
+                "Claude tabs now own terminal restore",
+                "The IDE terminal reopens its tabs on startup and re-runs their commands, which " +
+                    "spawns duplicate empty Claude sessions next to the plugin's restored ones. " +
+                    "The plugin now clears the IDE's terminal-tab persistence at shutdown, so " +
+                    "startup terminals are plugin-authored only. Note: plain shell tabs are no " +
+                    "longer auto-reopened either.",
+                com.intellij.notification.NotificationType.INFORMATION,
+            )
+            n.addAction(
+                com.intellij.notification.NotificationAction.createSimpleExpiring("Keep (recommended)") {
+                    props.setValue(OWN_STARTUP_TABS_CHOICE_KEY, "on")
+                },
+            )
+            n.addAction(
+                com.intellij.notification.NotificationAction.createSimpleExpiring("Turn off — keep IDE tab restore") {
+                    props.setValue(OWN_STARTUP_TABS_CHOICE_KEY, "off")
+                    LOG.info("[ClaudeTabs] user kept the IDE's own terminal tab restore (startup-tabs takeover off)")
+                },
+            )
+            n.notify(project)
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] startup-tabs notification failed: ${e.message}")
+        }
+    }
+
+    /**
+     * "Don't open any terminals the plugin didn't author": the reworked terminal unconditionally
+     * reopens its own persisted tabs on project open and RE-RUNS their commands — an IDE-restored
+     * claude tab spawns a brand-new EMPTY session next to the plugin's proper `--resume` restore
+     * (field-observed: duplicate "✳ Claude" tabs after every restart, each a fresh conversation).
+     * No platform setting gates that restore, so the persisted tab list is cleared at teardown
+     * (and again after the plugin's own restore, as a belt) — startup terminals are then
+     * plugin-authored only. Reflective and best-effort: the storage class is platform-internal;
+     * worst case on a platform change is the old duplicate-tab behavior. The
+     * `rider.claude.tabs.ownStartupTabs` registry key turns it off for users who want the IDE's
+     * own shell-tab restore back.
+     *
+     * SELF-RESTORING BY DESIGN: this is a per-shutdown ACTION, never a persistent settings
+     * mutation — uninstalling or disabling the plugin stops the action and the IDE's own tab
+     * persistence resumes untouched on the next session (cost: the one transitional session
+     * whose tabs the final plugin-run shutdown already cleared).
+     */
+    private fun suppressIdeTerminalTabRestore(project: Project, c: ProjectCtx) {
+        try {
+            if (!com.intellij.openapi.util.registry.Registry.`is`("rider.claude.tabs.ownStartupTabs", true)) return
+        } catch (_: Throwable) { /* registry unavailable → default ON */ }
+        // The user-facing choice from the one-time takeover notification outranks the default
+        // (the registry key above remains the hard override for power users / support).
+        try {
+            if (com.intellij.ide.util.PropertiesComponent.getInstance()
+                    .getValue(OWN_STARTUP_TABS_CHOICE_KEY) == "off"
+            ) return
+        } catch (_: Throwable) { }
+        try {
+            val loader = org.jetbrains.plugins.terminal.TerminalToolWindowManager::class.java.classLoader
+            val cls = Class.forName("org.jetbrains.plugins.terminal.settings.impl.TerminalTabsStorage", true, loader)
+            val inst = cls.getMethod("getInstance", Project::class.java).invoke(null, project)
+            cls.getMethod("updateStoredTabs", java.util.List::class.java).invoke(inst, emptyList<Any>())
+            if (!c.ideTabRestoreSuppressLogged) {
+                c.ideTabRestoreSuppressLogged = true
+                LOG.info("[ClaudeTabs] IDE terminal tab persistence cleared — startup tabs are plugin-authored only")
+            }
+        } catch (t: Throwable) {
+            if (!c.ideTabRestoreSuppressLogged) {
+                c.ideTabRestoreSuppressLogged = true
+                LOG.info("[ClaudeTabs] could not clear IDE terminal tab persistence (${t.javaClass.simpleName}) — IDE-restored tabs may reappear")
+            }
+        }
+    }
+
+    private fun verifyAlive(pid: Long, expectedSid: String, rootId: String): Boolean {
+        // Stopped WSL distro → root unresolvable → nothing in it is alive (correct: its
+        // processes died with it; the entry demotes to restore-pending and resumes later).
+        val root = SessionRoot.byId(rootId) ?: return false
+        val pidFile = File(root.sessionsDir, "$pid.json")
         if (!pidFile.exists()) return false
         val text = try { pidFile.readText() } catch (_: Exception) { return false }
         if (ClaudeTabsHelpers.extractJsonString(text, "sessionId") != expectedSid) return false
-        return try { ProcessHandle.of(pid).map { it.isAlive }.orElse(false) } catch (_: Exception) { false }
+        return root.processAlive(pid)
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -1338,7 +1930,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val toRestore = entries.filter { e ->
             claimsCwd(e.cwd, project) &&
                 e.sid in openSnapshot &&
-                ClaudeTabsHelpers.hasTranscriptAnywhere(storage.projectsDir, e.sid, e.cwd)
+                transcriptExistsForEntry(e)
         }.sortedWith(compareBy({ it.ordinal ?: Int.MAX_VALUE }, { it.sid }))
         if (toRestore.isEmpty()) {
             LOG.info("[ClaudeTabs] Restore: nothing to spawn (snapshot=${openSnapshot.size}, entries=${entries.size})")
@@ -1349,11 +1941,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         for (e in toRestore) {
             storage.activeSessions.bumpRestoreAttempts(e.sid)
             val displayName = TitleModel.resolveDisplayName(e.userName, null, e.name)
+            // Resolved OFF the EDT: resumeCommandFor may consult WSL discovery (wsl.exe, 5s cap)
+            // to recover the owning user for a legacy root id.
+            val resumeCommand = SessionRoot.resumeCommandFor(e.root, e.sid)
             resumeSpawnMutex.withLock {
                 withContext(Dispatchers.Main) {
                     if (project.isDisposed) return@withContext
                     c.restoreSpawnAttempts[e.sid] = (c.restoreSpawnAttempts[e.sid] ?: 0) + 1
-                    spawnOwnedTab(project, e.sid, e.cwd, displayName, OwnedTerminalSpawner.Mode.RESUME)
+                    spawnOwnedTab(
+                        project, e.sid, e.cwd, displayName, OwnedTerminalSpawner.Mode.RESUME,
+                        command = resumeCommand,
+                    )
                     spawned.add(e)
                 }
                 if (project.isDisposed) return
@@ -1362,6 +1960,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
         }
         writeLastRestoreSnapshot(project, spawned)
+        // Belt for a missed teardown clear (crash, kill): whatever the IDE just re-persisted is
+        // superseded by the plugin-authored restore above — clear it again for the NEXT startup.
+        suppressIdeTerminalTabRestore(project, c)
     }
 
     /** Drop a snapshot to `last-restore.json` so `/tabs-status` can show what was restored. */

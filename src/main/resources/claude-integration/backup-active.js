@@ -109,7 +109,10 @@ for (const s of alive.values()) {
   const existing = readJsonSafe(file, null);
   const name = s.name !== null ? s.name : cachedName(existing);
   const userName = existing && existing.userName !== undefined ? existing.userName : null;
-  const entry = { sid: s.sid, cwd: s.cwd, pid: s.pid, lastSeen: now, name, userName };
+  // Spread the existing entry FIRST: fields this script doesn't know about (root, ordinal,
+  // restoreAttempts, anything newer) must survive a backup — dropping `root` would resume a
+  // session through the wrong installation/account on the next restore.
+  const entry = { ...(existing || {}), sid: s.sid, cwd: s.cwd, pid: s.pid, lastSeen: now, name, userName };
   atomicWrite(file, JSON.stringify(entry));
   if (!existing) added++; else refreshed++;
 }

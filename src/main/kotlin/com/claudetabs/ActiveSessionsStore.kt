@@ -40,6 +40,11 @@ internal class ActiveSessionsStore(val dir: File) {
          *  by [writeOrUpdate] whenever a live pid is recorded. Entries that hit the restore
          *  loop's generation cap are retired to the backlog instead of resurrected forever. */
         val restoreAttempts: Int = 0,
+        /** Which [SessionRoot] this session lives in ("windows" or "wsl:<distro>") — a separate
+         *  Claude installation and typically a separate ACCOUNT. Liveness checks and the resume
+         *  launcher are derived from it; identity never crosses roots. Files written by pre-3.1
+         *  builds have no field → "windows". */
+        val root: String = SessionRoot.Windows.ID,
     )
 
     /** Serialises read-modify-write cycles within this JVM: the poll loop and the title
@@ -72,6 +77,7 @@ internal class ActiveSessionsStore(val dir: File) {
         name: String? = null,
         userName: String? = null,
         ordinal: Int? = null,
+        root: String? = null,
     ) = synchronized(rmwLock) {
         dir.mkdirs()
         val existing = read(sid)
@@ -80,7 +86,10 @@ internal class ActiveSessionsStore(val dir: File) {
         val resolvedOrdinal = ordinal ?: existing?.ordinal
         // A live pid means the session came alive — its restore-generation counter starts over.
         val resolvedAttempts = if (pid != null) 0 else existing?.restoreAttempts ?: 0
-        val entry = Entry(sid, cwd, pid, lastSeen, resolvedName, resolvedUserName, resolvedOrdinal, resolvedAttempts)
+        // Null preserves the recorded root (an update without root knowledge must never flip a
+        // WSL session back to windows — that would resume it under the wrong account).
+        val resolvedRoot = root ?: existing?.root ?: SessionRoot.Windows.ID
+        val entry = Entry(sid, cwd, pid, lastSeen, resolvedName, resolvedUserName, resolvedOrdinal, resolvedAttempts, resolvedRoot)
         atomicWrite(fileFor(sid), serialise(entry))
     }
 
@@ -129,6 +138,7 @@ internal class ActiveSessionsStore(val dir: File) {
         else append("\"").append(ClaudeTabsHelpers.esc(e.userName)).append("\"")
         append(",\"ordinal\":").append(e.ordinal?.toString() ?: "null")
         append(",\"restoreAttempts\":").append(e.restoreAttempts)
+        append(",\"root\":\"").append(ClaudeTabsHelpers.esc(e.root)).append("\"")
         append("}")
     }
 
@@ -145,7 +155,9 @@ internal class ActiveSessionsStore(val dir: File) {
         val ordinal = Regex(""""ordinal"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull()
         // Missing on files written by older builds → 0 (backward compatible).
         val restoreAttempts = Regex(""""restoreAttempts"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-        return Entry(sid, cwd, pid, lastSeen, name, userName, ordinal, restoreAttempts)
+        // Missing on pre-3.1 files → windows (the only root that existed).
+        val root = ClaudeTabsHelpers.extractJsonString(text, "root") ?: SessionRoot.Windows.ID
+        return Entry(sid, cwd, pid, lastSeen, name, userName, ordinal, restoreAttempts, root)
     }
 
     private fun atomicWrite(target: File, content: String) = DurableIo.writeAtomic(target, content)

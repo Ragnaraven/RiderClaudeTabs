@@ -93,14 +93,14 @@ internal class TitleController(
         // EDT below via the tab's own TerminalTitle — the SAME path as classic widgets.
         val reworkedSnaps = widgetlessBound.mapNotNull { (content, sid) ->
             val entry = storage.activeSessions.read(sid) ?: return@mapNotNull null
-            val live = readLiveStatus(sid, entry.pid)
+            val live = readLiveStatus(sid, entry.pid, entry.root)
             ReworkedSnap(content, sid, displayableUserName(sid, entry.userName), live.topic, displayableCachedTopic(entry.name, live), live.busy)
         }
 
         // Off-EDT: all file reads. Capped to sids that actually have widgets.
         val snaps = widgets.mapNotNull { (sid, widget) ->
             val entry = storage.activeSessions.read(sid) ?: return@mapNotNull null
-            val live = readLiveStatus(sid, entry.pid)
+            val live = readLiveStatus(sid, entry.pid, entry.root)
             Snapshot(sid, widget, displayableUserName(sid, entry.userName), live.topic, displayableCachedTopic(entry.name, live), live.busy)
         }
         if (snaps.isEmpty() && reworkedSnaps.isEmpty()) return
@@ -249,9 +249,13 @@ internal class TitleController(
      * (permission prompt / input needed) and "shell" (background shell while idle) are distinct
      * CLI statuses and intentionally do NOT animate.
      */
-    private fun readLiveStatus(sid: String, pid: Long?): LiveStatus {
+    private fun readLiveStatus(sid: String, pid: Long?, rootId: String): LiveStatus {
         if (pid == null) return LiveStatus(busy = false, topic = null)
-        val pidFile = File(storage.sessionsDir, "$pid.json")
+        // Root-aware: a WSL session's status file lives in ITS ~/.claude, and its pid means
+        // nothing to Windows. A stopped distro resolves to no root → quiet (no topic, no
+        // animation) until it runs again.
+        val root = SessionRoot.byId(rootId) ?: return LiveStatus(busy = false, topic = null)
+        val pidFile = File(root.sessionsDir, "$pid.json")
         if (!pidFile.exists()) return LiveStatus(busy = false, topic = null)
         val text = try { pidFile.readText() } catch (_: Exception) { null }
             ?: return LiveStatus(busy = false, topic = null)
@@ -268,7 +272,7 @@ internal class TitleController(
         val derived = ClaudeTabsHelpers.extractJsonString(text, "nameSource") == "derived"
         val topic = if (derived) null else pretty
         var busy = ClaudeTabsHelpers.extractJsonString(text, "status") == "busy"
-        if (busy && !processAlive(pid)) {
+        if (busy && !root.processAlive(pid)) {
             busy = false
             if (staleBusyLogged.add(sid)) {
                 LOG.info("[ClaudeTabs][title] Ignoring stale busy for sid=$sid — process $pid is dead (killed mid-turn); animation stopped")
@@ -277,12 +281,6 @@ internal class TitleController(
             staleBusyLogged.remove(sid)
         }
         return LiveStatus(busy, topic, derivedTopic = if (derived) pretty else null)
-    }
-
-    private fun processAlive(pid: Long): Boolean = try {
-        java.lang.ProcessHandle.of(pid).map { it.isAlive }.orElse(false)
-    } catch (_: Throwable) {
-        false
     }
 
     /** Last topic OBSERVED per sid, not yet persisted — the capture debounce state. */
