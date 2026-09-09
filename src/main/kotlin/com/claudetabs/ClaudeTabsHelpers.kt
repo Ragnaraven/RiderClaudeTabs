@@ -163,6 +163,22 @@ internal object ClaudeTabsHelpers {
     }
 
     /**
+     * The inverse of [wslCwdToWindows]: `C:\Users\dev\.claude` → `/mnt/c/Users/dev/.claude`.
+     * Returns null for a path with no drive letter (a UNC share has no `/mnt` equivalent).
+     *
+     * Used to tell a WSL-side helper script where the plugin's state dir is. The plugin only
+     * ever runs on the Windows side, so its state lives in the Windows `~/.claude`; a helper
+     * invoked from a Claude session INSIDE a distro sees that same directory through `/mnt`
+     * and cannot derive the path on its own.
+     */
+    fun windowsPathToWslMount(path: String): String? {
+        val m = Regex("""^([a-zA-Z]):[\\/](.*)$""").find(path.trim()) ?: return null
+        val drive = m.groupValues[1].lowercase()
+        val rest = m.groupValues[2].replace('\\', '/').trimEnd('/')
+        return "/mnt/$drive" + if (rest.isEmpty()) "" else "/$rest"
+    }
+
+    /**
      * Normalise a cwd read off a TERMINAL TAB (the reworked bridge) into the same space session
      * cwds live in. Session cwds are stored Windows-TRANSLATED at scan time (see
      * [SessionRoot.comparableCwd]), so a tab cwd must be comparably translated or not used at all:

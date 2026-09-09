@@ -169,6 +169,24 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private val PERMISSION_ENTRIES =
             SettingsPermissions.CURRENT_ENTRIES + SettingsPermissions.LEGACY_ENTRIES
 
+        /** Node helpers copied into every `~/.claude/rider-plugin`. SINGLE SOURCE OF TRUTH —
+         *  the deploy path writes these and uninstall removes the directory holding them. */
+        internal val INTEGRATION_HELPERS = listOf(
+            "current-project.js", "backup-active.js", "tab-name.js", "recover-tabs.js",
+        )
+
+        /** Slash commands copied into every `~/.claude/commands`. Same single-source rationale:
+         *  a command added here is deployed AND uninstalled, never one without the other. */
+        internal val INTEGRATION_COMMANDS = listOf(
+            "tab.md", "tabs-backup.md", "tabs-restore.md", "tabs-history.md",
+            "tabs-status.md", "tabs-clear.md", "tabs-recover.md",
+        )
+
+        /** Command names written by 1.x builds — deleted on uninstall, never re-deployed. */
+        private val LEGACY_COMMANDS = listOf(
+            "clear-tabs.md", "restore-tabs.md", "tab-history.md", "backup-tabs.md",
+        )
+
         /** Singleton storage helper. */
         private val storage = ClaudeTabsStorage(CLAUDE_HOME)
 
@@ -428,13 +446,15 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 )
                 if (updated != null) settings.writeText(updated)
             }
-            File(CLAUDE_HOME, "rider-plugin").deleteRecursively()
-            listOf(
-                "commands/tab.md", "commands/tabs-clear.md", "commands/tabs-restore.md",
-                "commands/tabs-history.md", "commands/tabs-backup.md", "commands/tabs-status.md",
-                "commands/clear-tabs.md", "commands/restore-tabs.md", "commands/tab-history.md",
-                "commands/backup-tabs.md",
-            ).forEach { File(CLAUDE_HOME, it).delete() }
+            val homes = buildList {
+                add(CLAUDE_HOME)
+                try { WslDiscovery.runningRoots().forEach { add(it.claudeHome) } } catch (_: Exception) { }
+            }
+            for (home in homes) {
+                File(home, "rider-plugin").deleteRecursively()
+                (INTEGRATION_COMMANDS.map { "commands/$it" } + LEGACY_COMMANDS.map { "commands/$it" })
+                    .forEach { File(home, it).delete() }
+            }
         }
     }
 
@@ -1986,12 +2006,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
     private fun deployClaudeIntegration() {
         try {
-            val cl = javaClass.classLoader
-            storage.stateDir.mkdirs()
-            for (name in listOf("current-project.js", "backup-active.js", "tab-name.js")) {
-                val inStream = cl.getResourceAsStream("claude-integration/$name") ?: continue
-                inStream.use { input -> File(storage.stateDir, name).outputStream().use { input.copyTo(it) } }
-            }
+            deployInto(storage, rootId = null)
             stripClaudeMdSection()
             for (legacy in listOf(
                     "tab-now.js", "rename-tab.sh", "tab.sh", "tab-backup.js",
@@ -1999,20 +2014,69 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             )) {
                 try { File(storage.stateDir, legacy).delete() } catch (_: Exception) { }
             }
-            storage.commandsDir.mkdirs()
-            for (name in listOf("tab.md", "tabs-backup.md", "tabs-restore.md", "tabs-history.md", "tabs-status.md", "tabs-clear.md")) {
-                val inStream = cl.getResourceAsStream("claude-integration/$name") ?: continue
-                inStream.use { input -> File(storage.commandsDir, name).outputStream().use { input.copyTo(it) } }
-            }
-            ensureSettingsPermissions()
+            deployIntoWslRoots()
         } catch (e: Exception) {
             LOG.warn("[ClaudeTabs] deployClaudeIntegration failed: ${e.message}")
         }
     }
 
+    /**
+     * Copy the helpers and commands into one `~/.claude`. [rootId] is null for the home the
+     * plugin itself writes state into, and the root's own id for a WSL home — where the state
+     * dir sits on the other side of the `/mnt` boundary and has to be pointed at explicitly.
+     */
+    private fun deployInto(target: ClaudeTabsStorage, rootId: String?) {
+        val cl = javaClass.classLoader
+        target.stateDir.mkdirs()
+        for (name in INTEGRATION_HELPERS) {
+            val inStream = cl.getResourceAsStream("claude-integration/$name") ?: continue
+            inStream.use { input -> File(target.stateDir, name).outputStream().use { input.copyTo(it) } }
+        }
+        target.commandsDir.mkdirs()
+        for (name in INTEGRATION_COMMANDS) {
+            val inStream = cl.getResourceAsStream("claude-integration/$name") ?: continue
+            inStream.use { input -> File(target.commandsDir, name).outputStream().use { input.copyTo(it) } }
+        }
+        ensureSettingsPermissions(target)
+        if (rootId != null) writeStateRootPointer(target, rootId)
+    }
+
+    /**
+     * A helper run from a Claude session inside a distro resolves `~` to the LINUX home, where
+     * there is no plugin state — the plugin only ever runs on the Windows side. This pointer is
+     * the one thing that bridges the two: the state dir in the `/mnt` form that side can open,
+     * plus the root id to stamp on any session record the helper has to rebuild (a record
+     * without it resumes on Windows, where the session's transcript does not exist).
+     */
+    private fun writeStateRootPointer(target: ClaudeTabsStorage, rootId: String) {
+        val mounted = ClaudeTabsHelpers.windowsPathToWslMount(storage.stateDir.absolutePath) ?: return
+        val json = """{"stateDir":"${ClaudeTabsHelpers.esc(mounted)}","host":"windows",""" +
+            """"rootId":"${ClaudeTabsHelpers.esc(rootId)}"}"""
+        DurableIo.writeAtomic(File(target.stateDir, "state-root.json"), json)
+    }
+
+    /**
+     * Deploy into every running WSL distro's `~/.claude` as well. Sessions started inside a
+     * distro are the ones a WSL shutdown kills, so `/tabs-recover` is least useful in the only
+     * home where it was previously never installed. Best-effort per root: an unreachable share
+     * must not fail the deployment for the others.
+     */
+    private fun deployIntoWslRoots() {
+        for (root in WslDiscovery.runningRoots()) {
+            try {
+                deployInto(ClaudeTabsStorage(root.claudeHome), rootId = root.id)
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] integration deploy into ${root.id} failed: ${e.message}")
+            }
+        }
+    }
+
     /** Ensure current permission entries exist in `~/.claude/settings.json`; remove legacy ones. */
-    private fun ensureSettingsPermissions() {
-        val settings = storage.settingsFile
+    /** Keep [target]'s `settings.json` permission lines current. Every home the helpers are
+     *  deployed into needs its own: a session running inside a distro reads THAT distro's
+     *  settings, so permissions written only on the Windows side would prompt on every run. */
+    private fun ensureSettingsPermissions(target: ClaudeTabsStorage = storage) {
+        val settings = target.settingsFile
         try {
             if (!settings.exists()) return
             val original = settings.readText()

@@ -20,6 +20,35 @@ class ClaudeTabsHelpersTest {
 
     @get:Rule val tmp = TemporaryFolder()
 
+    // ── windowsPathToWslMount ────────────────────────────────────────
+
+    @Test fun windowsPathToWslMount_translatesDriveLetter() {
+        assertEquals("/mnt/c/Users/dev/.claude", ClaudeTabsHelpers.windowsPathToWslMount("C:\\Users\\dev\\.claude"))
+    }
+
+    @Test fun windowsPathToWslMount_acceptsForwardSlashes() {
+        assertEquals("/mnt/d/Dev/MyApp", ClaudeTabsHelpers.windowsPathToWslMount("D:/Dev/MyApp"))
+    }
+
+    @Test fun windowsPathToWslMount_driveRoot() {
+        assertEquals("/mnt/c", ClaudeTabsHelpers.windowsPathToWslMount("C:\\"))
+    }
+
+    /** A UNC share has no /mnt equivalent — null keeps the caller from writing a pointer that
+     *  resolves to nothing rather than one that resolves to the wrong directory. */
+    @Test fun windowsPathToWslMount_rejectsUncAndRootedPaths() {
+        assertNull(ClaudeTabsHelpers.windowsPathToWslMount("\\\\wsl.localhost\\Distro\\home\\dev"))
+        assertNull(ClaudeTabsHelpers.windowsPathToWslMount("/home/dev/.claude"))
+    }
+
+    /** The two translations are inverses over the paths both accept — the pointer the plugin
+     *  writes must name the same directory the session records' cwds were translated from. */
+    @Test fun windowsPathToWslMount_roundTripsWithWslCwdToWindows() {
+        val wsl = "/mnt/d/Dev/MyApp"
+        val windows = ClaudeTabsHelpers.wslCwdToWindows(wsl)!!
+        assertEquals(wsl, ClaudeTabsHelpers.windowsPathToWslMount(windows))
+    }
+
     // ── extractJsonString ────────────────────────────────────────────
 
     @Test fun extractJsonString_simpleField() {

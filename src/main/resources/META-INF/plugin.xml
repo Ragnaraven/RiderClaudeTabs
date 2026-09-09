@@ -51,6 +51,35 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>3.2.1 — /tabs-recover reads the right state directory</h3>
+    <ul>
+      <li><b>Fixes <code>/tabs-recover</code> silently operating on the wrong snapshot when run
+        from inside WSL.</b> It preferred a local <code>active-sessions/</code> directory over
+        the pointer the plugin deploys, so a stale one left by an earlier build shadowed the
+        real state: the command reported an empty snapshot, could not tell which root a session
+        belonged to, and would have written its recovery to a file the plugin never reads. The
+        pointer now wins, since it is the plugin's own statement of where its state lives.</li>
+    </ul>
+    <h3>3.2.0 — recover the tabs a crash took, from the IDE or from WSL</h3>
+    <ul>
+      <li><b>New <code>/tabs-recover</code> command.</b> When a hard stop kills the Claude
+        processes without the IDE noticing — a WSL shutdown, an OOM, a machine reset — the
+        alive-tab snapshot can end up holding fewer sessions than were really open, and only
+        that subset comes back. <code>/tabs-recover</code> rebuilds the snapshot from what
+        outlives a crash: the per-session records, the eviction backlog, and the transcripts on
+        disk. It dry-runs first, recovers the last hour by default
+        (<code>--within &lt;minutes&gt;</code> to widen), and leaves the reopening to the
+        plugin's own restore pass — it never launches anything itself.</li>
+      <li><b>Sessions the plugin never recorded are recoverable too.</b> A session with a
+        transcript but no record used to be lost for good; it is now discovered by its
+        transcript, named from it, and given a rebuilt record stamped with the root it actually
+        ran under.</li>
+      <li><b>The commands are installed inside WSL as well.</b> They were only ever written to
+        the Windows <code>~/.claude</code>, so a Claude session running in a distro — exactly
+        the kind a WSL shutdown kills — could not reach them. Each running distro now gets the
+        commands and helpers, plus a pointer to the plugin's state directory on the Windows
+        side.</li>
+    </ul>
     <h3>3.1.2 — open tabs can no longer go invisible to the plugin</h3>
     <ul>
       <li><b>Fixes sessions silently missing from restore after a long IDE session.</b> The

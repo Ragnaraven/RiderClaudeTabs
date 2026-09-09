@@ -23,6 +23,7 @@ Everything else (scripts, commands, CLAUDE.md section, permissions) is set up on
 | `/tabs-backup` | Writes currently-active sessions into history so you can resume them later, without waiting for the tab to close. |
 | `/tabs-history` | Numbered list of past closed/backed-up sessions (newest first). Pick one to resume. |
 | `/tabs-restore` | Shows what's in the auto-restore file (the set of tabs that will come back next Rider start). |
+| `/tabs-recover` | Rebuilds the tab snapshot after a crash, so the plugin reopens the sessions that were really open. Dry-runs first; recovers the last 60 minutes by default (`/tabs-recover --within 180`). |
 | `/tabs-clear` | Clears the rename cache and per-project restore files. Doesn't touch history. |
 
 ## Config
@@ -42,6 +43,7 @@ Restart Rider after editing.
 
 - Rider / IntelliJ 2026.1+
 - Windows primary. macOS / Linux should work but less tested.
+- Sessions started inside WSL are tracked and restored too; the commands are installed into each running distro's `~/.claude` as well as the Windows one.
 - Requires Claude Code CLI (provides the `node` runtime the plugin's scripts use).
 
 ## Files it writes
@@ -53,6 +55,7 @@ active-sessions/<sid>.json      # one file per alive session (name, order, cwd)
 open-tabs-<project>.json        # the open-tab snapshot restored on next launch
 session-backlog.json            # last 50 evicted sessions (for /tabs-history)
 config.json                     # user overrides
+state-root.json                 # WSL homes only: where the Windows-side state dir lives
 ```
 
 ## Running the tests

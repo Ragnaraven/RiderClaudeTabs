@@ -26,6 +26,7 @@ internal object SettingsPermissions {
         "Bash(node ~/.claude/rider-plugin/backup-active.js)",
         "Bash(node ~/.claude/rider-plugin/backup-active.js *)",
         "Bash(node ~/.claude/rider-plugin/tab-name.js *)",
+        "Bash(node ~/.claude/rider-plugin/recover-tabs.js *)",
     )
 
     /** Permission lines written by 1.x builds — removed on update AND on uninstall, never
