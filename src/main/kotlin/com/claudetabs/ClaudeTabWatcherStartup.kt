@@ -171,6 +171,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private const val EXTERNAL_REQUEST_TTL_MS = 2 * 60_000L
         /** Close evidence not consumed by the gate within this long is stale (the tab came back). */
         private const val CLOSE_EVIDENCE_TTL_MS = 60_000L
+        /** A session record idle this long, not running and in no snapshot, is pruned at startup. */
+        private val STALE_RECORD_PRUNE_MS =
+            (System.getProperty("claudetabs.staleRecordPruneDays")?.toLongOrNull() ?: 30L) * 86_400_000L
         /** A removal event with no sid pairs with a departure seen within this long of it. */
         private const val UNATTRIBUTED_REMOVAL_MS = 15_000L
 
@@ -975,6 +978,22 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
             if (reset > 0) {
                 LOG.info("[ClaudeTabs] Startup reconcile: $reset stale entr(ies) reset to restore-pending")
+            }
+            // Prune: a record not running, in no snapshot, and not seen for STALE_RECORD_PRUNE_MS is
+            // bookkeeping for a conversation nothing will reopen from here — its transcript is
+            // still the CLI's to resume, and the recovery command still finds it by transcript.
+            // Left alone, these piled up into the hundreds (every poll of every project listed
+            // and parsed all of them) and swamped the restore command's listing.
+            val keep = storage.allSnapshotSids()
+            val now = System.currentTimeMillis()
+            var pruned = 0
+            for (entry in storage.activeSessions.listAll()) {
+                if (entry.pid != null || entry.sid in keep) continue
+                if (now - entry.lastSeen < STALE_RECORD_PRUNE_MS) continue
+                if (storage.activeSessions.delete(entry.sid)) pruned++
+            }
+            if (pruned > 0) {
+                LOG.info("[ClaudeTabs] Startup prune: $pruned record(s) idle for over ${STALE_RECORD_PRUNE_MS / 86_400_000L} days removed")
             }
         } catch (e: Exception) {
             LOG.warn("[ClaudeTabs] Startup reconcile failed: ${e.message}")

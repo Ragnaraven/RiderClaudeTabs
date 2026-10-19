@@ -59,17 +59,36 @@ internal class ActiveSessionsStore(val dir: File) {
 
     fun fileFor(sid: String): File = File(dir, "$sid.json")
 
+    /** A record parsed from a file as it was at (mtime, length); re-read only when either moves.
+     *  Every poll of every open project lists ALL records (hundreds, most untouched for weeks);
+     *  before this they were read and parsed in full each time. */
+    private data class Cached(val mtime: Long, val length: Long, val entry: Entry?)
+    private val parsed = java.util.concurrent.ConcurrentHashMap<String, Cached>()
+
     fun listAll(): List<Entry> {
         if (!dir.exists()) return emptyList()
-        return dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }
-            ?.mapNotNull { f -> try { parse(DurableIo.readText(f)) } catch (_: Exception) { null } }
-            ?: emptyList()
+        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".json") } ?: return emptyList()
+        val live = HashSet<String>(files.size * 2)
+        val out = ArrayList<Entry>(files.size)
+        for (f in files) {
+            live.add(f.name)
+            cachedParse(f)?.let { out.add(it) }
+        }
+        parsed.keys.retainAll(live)
+        return out
     }
 
-    fun read(sid: String): Entry? {
-        val f = fileFor(sid)
-        // No exists() pre-check: it is a second racing syscall, and the read below answers it.
-        return try { parse(DurableIo.readText(f)) } catch (_: Exception) { null }
+    fun read(sid: String): Entry? = cachedParse(fileFor(sid))
+
+    private fun cachedParse(f: File): Entry? {
+        // Two stats instead of an open/read/parse when the file is unchanged. A missing file
+        // stats as (0, 0) and reads as null; the next write moves both and invalidates it.
+        val mtime = f.lastModified()
+        val length = f.length()
+        parsed[f.name]?.let { if (it.mtime == mtime && it.length == length) return it.entry }
+        val entry = try { parse(DurableIo.readText(f)) } catch (_: Exception) { null }
+        parsed[f.name] = Cached(mtime, length, entry)
+        return entry
     }
 
     /** Write or update the per-sid file. A non-null optional field ([name], [userName],
@@ -159,16 +178,16 @@ internal class ActiveSessionsStore(val dir: File) {
     fun parse(text: String): Entry? {
         val sid = ClaudeTabsHelpers.extractJsonString(text, "sid") ?: return null
         val cwd = ClaudeTabsHelpers.extractJsonString(text, "cwd") ?: return null
-        val pid = Regex(""""pid"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()
-        val lastSeen = Regex(""""lastSeen"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+        val pid = ClaudeTabsHelpers.extractJsonLong(text, "pid")
+        val lastSeen = ClaudeTabsHelpers.extractJsonLong(text, "lastSeen") ?: 0L
         // `name` is current; `metaName` is the pre-2.0 key — read both so files written by
         // earlier builds (including migration seeds) keep their labels.
         val name = ClaudeTabsHelpers.extractJsonString(text, "name")
             ?: ClaudeTabsHelpers.extractJsonString(text, "metaName")
         val userName = ClaudeTabsHelpers.extractJsonString(text, "userName")
-        val ordinal = Regex(""""ordinal"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull()
+        val ordinal = ClaudeTabsHelpers.extractJsonLong(text, "ordinal")?.toInt()
         // Missing on files written by older builds → 0 (backward compatible).
-        val restoreAttempts = Regex(""""restoreAttempts"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val restoreAttempts = ClaudeTabsHelpers.extractJsonLong(text, "restoreAttempts")?.toInt() ?: 0
         // Missing on pre-3.1 files → windows (the only root that existed).
         val root = ClaudeTabsHelpers.extractJsonString(text, "root") ?: SessionRoot.Windows.ID
         // Missing on pre-3.3 files (and written as JSON null when never observed) → null, which

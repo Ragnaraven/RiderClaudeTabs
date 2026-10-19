@@ -21,8 +21,15 @@ internal object ClaudeTabsHelpers {
      * Intentionally hand-rolled (instead of Gson/Jackson) to keep the plugin zero-deps.
      * Only supports flat objects — entries in the plugin's files never have nested objects.
      */
+    /** One compiled pattern per key: these run per field, per record, per poll, in every
+     *  open project — compiling them anew each call was a measurable share of a busy IDE's
+     *  allocation churn (field-observed in freeze dumps: hundreds of records, nine fields each). */
+    private val stringFieldPatterns = java.util.concurrent.ConcurrentHashMap<String, Regex>()
+    private val longFieldPatterns = java.util.concurrent.ConcurrentHashMap<String, Regex>()
+
     fun extractJsonString(json: String, key: String): String? {
-        val m = Regex(""""$key"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""").find(json) ?: return null
+        val pattern = stringFieldPatterns.getOrPut(key) { Regex(""""$key"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"""") }
+        val m = pattern.find(json) ?: return null
         return m.groupValues[1].replace("\\\\", "\\").replace("\\\"", "\"")
     }
 
@@ -31,7 +38,7 @@ internal object ClaudeTabsHelpers {
 
     /** Extract a non-negative integer-valued field from flat [json], or null. */
     fun extractJsonLong(json: String, key: String): Long? =
-        Regex(""""$key"\s*:\s*(\d+)""").find(json)?.groupValues?.get(1)?.toLongOrNull()
+        longFieldPatterns.getOrPut(key) { Regex(""""$key"\s*:\s*(\d+)""") }.find(json)?.groupValues?.get(1)?.toLongOrNull()
 
     // ══════════════════════════════════════════════════════════════
     // TAB NAME HELPERS

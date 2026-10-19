@@ -127,6 +127,17 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         Regex("\"([^\"]+)\"").findAll(trimmed).map { it.groupValues[1] }.toSet()
     }
 
+    /** Every sid in every project's snapshot — what restore could still want. */
+    fun allSnapshotSids(): Set<String> = synchronized(openTabsLock) {
+        val out = HashSet<String>()
+        stateDir.listFiles { f -> f.isFile && f.name.startsWith("open-tabs-") && f.name.endsWith(".json") }
+            ?.forEach { f ->
+                val text = try { DurableIo.readText(f) } catch (_: Exception) { return@forEach }
+                Regex("\"([^\"]+)\"").findAll(text).forEach { out.add(it.groupValues[1]) }
+            }
+        out
+    }
+
     /** Persist the alive-tab snapshot for [projectHash] via atomic write. */
     fun saveOpenTabs(projectHash: String, sids: Set<String>) = synchronized(openTabsLock) {
         val f = openTabsFile(projectHash)
