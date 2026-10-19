@@ -63,6 +63,25 @@ internal sealed class SessionRoot {
      *  claude" — the caller decides how strictly to treat it per root. */
     abstract fun processInfo(pid: Long): SessionsDirScanner.ProcessInfo?
 
+    /**
+     * This root's `sessions/<pid>.json` files, or NULL when the directory could not be listed:
+     * missing, unreachable (a stopped distro, a wedged share) or denied.
+     *
+     * Null means UNOBSERVABLE, never "empty". A caller that folds null into an empty array reads
+     * one unlistable directory as "every session in this root just died" — and then evicts, or
+     * refuses to restore, every session the root owns.
+     */
+    open fun listSessionFiles(): Array<File>? =
+        sessionsDir.listFiles { f -> f.isFile && f.name.endsWith(".json") }
+
+    /**
+     * Positive proof the root can still report on its PROCESSES, not just list a directory. A
+     * dying distro can go on serving `sessions/` from cache while every `/proc` read fails, and
+     * that reads as "root fine, every session dead" — the one misreading the removal gate must
+     * never act on. False = unhealthy; a throw counts as false.
+     */
+    open fun probe(): Boolean = true
+
     /** The shell command typed into a spawned host terminal to resume [sid] in this root. */
     abstract fun resumeCommand(sid: String): String
 
@@ -110,6 +129,9 @@ internal sealed class SessionRoot {
             procDir(pid).isDirectory
         } catch (_: Throwable) { false }
 
+        /** `/proc/1` exists in every running distro; unreadable means the share is not serving. */
+        override fun probe(): Boolean = try { procDir(1).isDirectory } catch (_: Throwable) { false }
+
         /** `/proc/<pid>`'s mtime is the process start time on Linux. 0/unreadable → null. */
         override fun processStartEpochMs(pid: Long): Long? = try {
             procDir(pid).lastModified().takeIf { it > 0L }
@@ -119,8 +141,12 @@ internal sealed class SessionRoot {
             val bytes = File(procDir(pid), "cmdline").readBytes()
             if (bytes.isEmpty()) null
             else {
+                // cmdline is NUL-SEPARATED and NUL-terminated, so the split leaves an empty tail
+                // token; dropping the empties makes [args] exactly the process's argv. Passing
+                // those tokens on is what lets a whole-token flag test (headless `-p` runs) work
+                // here — the joined form below cannot tell a flag from a path that spells one.
                 val args = String(bytes, Charsets.UTF_8).split('\u0000').filter { it.isNotEmpty() }
-                SessionsDirScanner.ProcessInfo(args.firstOrNull() ?: "", args.joinToString(" "))
+                SessionsDirScanner.ProcessInfo(args.firstOrNull() ?: "", args.joinToString(" "), args)
             }
         } catch (_: Throwable) { null }
 
@@ -146,6 +172,28 @@ internal sealed class SessionRoot {
             marker(pid).lastModified().takeIf { it > 0L }
         } catch (_: Throwable) { null }
         override fun processInfo(pid: Long): SessionsDirScanner.ProcessInfo? = null
+
+        /**
+         * The scan's failure arms, on demand. A real root cannot be made to throw or to stall to
+         * order, so the harness drives them with marker files in [claudeHome]: `scan-throws`
+         * makes the listing throw (the unchecked-throw case that benches a root), `scan-hang-ms`
+         * holds a millisecond count to sleep first (the slow-share case that trips the scan's
+         * time budget). This is the ONLY way an E2E reaches those two arms; with no markers —
+         * the default, and always in production — the listing behaves exactly like the base one.
+         */
+        override fun listSessionFiles(): Array<File>? {
+            if (File(claudeHome, "scan-throws").exists()) throw IllegalStateException("fake root: scan-throws")
+            val hangMs = try {
+                File(claudeHome, "scan-hang-ms").takeIf { it.exists() }?.readText()?.trim()?.toLongOrNull()
+            } catch (_: Throwable) { null }
+            if (hangMs != null && hangMs > 0L) Thread.sleep(hangMs)
+            return super.listSessionFiles()
+        }
+
+        /** `probe-fails` in [claudeHome] makes the root list fine but fail its health probe —
+         *  the dying-distro shape (directory served, processes unreadable). */
+        override fun probe(): Boolean = !File(claudeHome, "probe-fails").exists()
+
         override fun resumeCommand(sid: String): String = try {
             File(claudeHome, "resume-command.txt").readText().trim().replace("{SID}", sid)
         } catch (_: Throwable) { "claude --resume $sid" }

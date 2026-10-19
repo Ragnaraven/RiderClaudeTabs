@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>3.1.2</version>
+    <version>3.0.0</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -37,8 +37,9 @@
       <li><code>/tabs-status</code> — live sessions + recent eviction backlog for the current project</li>
       <li><code>/tabs-backup</code> — explicit sync: write per-sid files for every alive Claude process</li>
       <li><code>/tabs-history</code> — browse the eviction backlog and print a resume command</li>
-      <li><code>/tabs-restore</code> — list current per-sid files and print resume commands</li>
+      <li><code>/tabs-restore</code> — pick recent sessions by name and reopen them as tabs</li>
       <li><code>/tabs-clear</code> — clear <code>active-sessions/</code> for the current project</li>
+      <li><code>/tabs-recover</code> — after a crash, rebuild the restore list from what survived and let the plugin reopen the tabs</li>
     </ul>
 
     <p><b>Requirements:</b> Rider / IntelliJ 2026.1+, <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a>,
@@ -51,108 +52,18 @@
     ]]></description>
 
     <change-notes><![CDATA[
-    <h3>3.2.1 — /tabs-recover reads the right state directory</h3>
+    <h3>3.0</h3>
+    <p>Your Claude Code terminal tabs come back.</p>
     <ul>
-      <li><b>Fixes <code>/tabs-recover</code> silently operating on the wrong snapshot when run
-        from inside WSL.</b> It preferred a local <code>active-sessions/</code> directory over
-        the pointer the plugin deploys, so a stale one left by an earlier build shadowed the
-        real state: the command reported an empty snapshot, could not tell which root a session
-        belonged to, and would have written its recovery to a file the plugin never reads. The
-        pointer now wins, since it is the plugin's own statement of where its state lives.</li>
+      <li><b>Restart, crash, or reboot</b> — every Claude session that was open in the project is
+        reopened, in order, with its name. Close a tab with <b>×</b> and it stays closed.</li>
+      <li><b>Named tabs.</b> Tabs show <code>✳ &lt;topic&gt;</code> and animate while Claude is
+        thinking. <code>/tab &lt;name&gt;</code> renames one for good.</li>
+      <li><b>WSL included.</b> Sessions running inside a distro are tracked and restored like
+        local ones.</li>
+      <li><b>Slash commands</b> — <code>/tabs-status</code>, <code>/tabs-history</code>,
+        <code>/tabs-recover</code> and friends, installed automatically.</li>
     </ul>
-    <h3>3.2.0 — recover the tabs a crash took, from the IDE or from WSL</h3>
-    <ul>
-      <li><b>New <code>/tabs-recover</code> command.</b> When a hard stop kills the Claude
-        processes without the IDE noticing — a WSL shutdown, an OOM, a machine reset — the
-        alive-tab snapshot can end up holding fewer sessions than were really open, and only
-        that subset comes back. <code>/tabs-recover</code> rebuilds the snapshot from what
-        outlives a crash: the per-session records, the eviction backlog, and the transcripts on
-        disk. It dry-runs first, recovers the last hour by default
-        (<code>--within &lt;minutes&gt;</code> to widen), and leaves the reopening to the
-        plugin's own restore pass — it never launches anything itself.</li>
-      <li><b>Sessions the plugin never recorded are recoverable too.</b> A session with a
-        transcript but no record used to be lost for good; it is now discovered by its
-        transcript, named from it, and given a rebuilt record stamped with the root it actually
-        ran under.</li>
-      <li><b>The commands are installed inside WSL as well.</b> They were only ever written to
-        the Windows <code>~/.claude</code>, so a Claude session running in a distro — exactly
-        the kind a WSL shutdown kills — could not reach them. Each running distro now gets the
-        commands and helpers, plus a pointer to the plugin's state directory on the Windows
-        side.</li>
-    </ul>
-    <h3>3.1.2 — open tabs can no longer go invisible to the plugin</h3>
-    <ul>
-      <li><b>Fixes sessions silently missing from restore after a long IDE session.</b> The
-        terminal plugin caches its tool-window reference once; when the IDE re-creates the
-        Terminal tool window that cached reference points at an empty, disposed window. The
-        plugin enumerated tabs through it, saw none, and so never recorded any tab as open —
-        after the next restart nothing came back, even though the tabs had been visibly open for
-        days. Tabs are now read from the IDE's tool-window registry (including split groups) and
-        cross-checked against the terminal's own tab list; a stale cache is logged as a warning
-        instead of silently emptying the restore snapshot.</li>
-    </ul>
-    <h3>3.1.1 — hand-opened Claude tabs are adopted again</h3>
-    <ul>
-      <li><b>A tab you typed <code>claude</code> or <code>claude --resume &lt;id&gt;</code> into is
-        picked up again on the reworked terminal.</b> It binds to the session, gets renamed,
-        honors <code>/tab</code>, and comes back after a restart — previously such a tab was
-        never adopted and its session was silently absent from the restore snapshot.</li>
-      <li><b>Tabs are identified by facts, not guesses.</b> A terminal tab now reports the command
-        line it was launched with, the process id at its root, and its launch directory. Two exact
-        rules follow: a tab whose launch command names a session <i>is</i> that session, and a
-        session whose process descends from a tab's root process <i>is running in</i> that tab —
-        which is precisely the hand-typed case. Neither rule needs the tab's title, its working
-        directory, or the order tabs were opened in.</li>
-      <li><b>Plain shell tabs never receive a session by guesswork.</b> A tab that looks like a
-        bash / PowerShell prompt is excluded from the order- and directory-based matching passes —
-        it can neither be given a session nor stand in the way of the real Claude tab getting one.
-        (The two exact rules above are exempt: a tab proven to host a session is bound whatever it
-        is called.) Ambiguity still refuses, in both directions, and a pre-existing tab can no
-        longer absorb a session id minted for a newly launched one.</li>
-    </ul>
-
-    <h3>3.1.0 — WSL session roots</h3>
-    <ul>
-      <li><b>Windows and WSL Claudes are now cleanly separated — and both supported.</b> Each
-        running WSL distro's <code>~/.claude</code> is tracked as its own session root: a
-        separate installation, typically a separate account. Sessions are titled/animated from
-        their own root's status, and restore launches through the owning root
-        (<code>wsl.exe -d &lt;distro&gt; … claude --resume</code> vs plain
-        <code>claude --resume</code>), so a session always comes back under the account it
-        belongs to. A sleeping distro never costs a tab — resuming boots it.</li>
-      <li><b>Stale sessions can no longer steal fresh tabs.</b> Adopting a session onto a
-        hand-opened tab now requires the session's process to be minutes old (the legitimate
-        "just typed <code>claude</code>" case) — a long-running orphan can't grab a new empty
-        tab, wear its name and animation, or leak identity across roots.</li>
-      <li><b>Startup terminals are plugin-authored only.</b> The IDE terminal's own tab
-        persistence reopened tabs and re-ran their commands — an IDE-restored claude tab spawned
-        a brand-new empty session next to the plugin's resumed one (duplicate "Claude" tabs
-        after every restart). The persisted tab list is now cleared at shutdown. A one-time
-        notification explains the takeover with a one-click opt-out (also:
-        <code>rider.claude.tabs.ownStartupTabs</code> registry key). Uninstalling or disabling
-        the plugin automatically returns the IDE's own behavior — the takeover is a
-        per-shutdown action, never a persistent settings change.</li>
-    </ul>
-
-    <h3>3.0.1 — Marketplace compliance</h3>
-    <p>No internal platform API: quit detection now rides the public app-lifecycle listener
-    (same snapshot-freeze semantics). Plugin classloader lookup moved off the deprecated
-    accessor. The remaining deprecated terminal calls are deliberate — their official
-    replacements are still marked experimental on every supported platform build.</p>
-
-    <h3>3.0.0 — Own the terminal</h3>
-    <p>Ground-up rewrite. The plugin creates every Claude tab itself and assigns its session id
-    at launch — tab ↔ session identity is a stored fact, never guessed. Only an <b>×</b> closes
-    a tab; window-close, quit, crash, and reboot restore every open tab, named and animated, in
-    order. Real topic names win over placeholders and launcher defaults, transient tool titles
-    are never captured, shell tabs are never mis-bound, and the plugin never kills a process.</p>
-
-    <h3>2.0.0</h3>
-    <p>Per-session files with crash-atomic writes, eviction backlog, title ownership + thinking
-    animation. Superseded by 3.0.</p>
-
-    <h3>1.0.18</h3>
-    <p>Heuristic identity matching (ancestry walks, window-state serialization). Superseded.</p>
     ]]></change-notes>
 
     <!-- IntelliJ Platform 2026.1 (build 261) and newer. No untilBuild — forward compatible. -->
@@ -160,6 +71,10 @@
 
     <depends>com.intellij.modules.platform</depends>
     <depends>org.jetbrains.plugins.terminal</depends>
+
+    <applicationListeners>
+        <listener class="com.claudetabs.IdeStartupMarker" topic="com.intellij.ide.AppLifecycleListener"/>
+    </applicationListeners>
 
     <extensions defaultExtensionNs="org.jetbrains.plugins.terminal">
         <!-- Owns the session id of every Claude CLI launched directly as a terminal's pty process

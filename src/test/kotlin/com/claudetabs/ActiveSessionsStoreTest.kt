@@ -186,6 +186,48 @@ class ActiveSessionsStoreTest {
         assertNull("missing ordinal parses as null", r!!.ordinal)
     }
 
+    // ── startedAt: the session's own start stamp ──────────────────────
+
+    @Test fun startedAt_roundTrips() {
+        val s = newStore()
+        s.writeOrUpdate(sid = "sid-a", cwd = "/path/to/project", pid = 1L, lastSeen = 1L, startedAt = 1_700_000_000_000L)
+        assertEquals(1_700_000_000_000L, s.read("sid-a")!!.startedAt)
+    }
+
+    @Test fun startedAt_neverStampedSerialisesAsNull() {
+        val s = newStore()
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 1L, lastSeen = 1L)
+        assertNull("an unobserved stamp must round-trip as unknown", s.read("sid-a")!!.startedAt)
+    }
+
+    @Test fun startedAt_missingInPre33FileParsesAsNull() {
+        val s = newStore()
+        // A file written before the field existed has no "startedAt" key at all.
+        val legacy = """{"sid":"sid-old","cwd":"/x","pid":7,"lastSeen":5,"name":null,"userName":null,"ordinal":null,"restoreAttempts":0,"root":"windows"}"""
+        val e = s.parse(legacy)
+        assertNotNull(e)
+        assertNull("missing startedAt is UNKNOWN, not epoch 0 (which would sort oldest)", e!!.startedAt)
+    }
+
+    @Test fun startedAt_nullOnUpdatePreservesExisting() {
+        val s = newStore()
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 1L, lastSeen = 1L, startedAt = 1_700_000_000_000L)
+        // A pid/lastSeen refresh doesn't read the stamp; wiping it would cost the entry its
+        // restore-ordering key on the very next poll.
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 2L, lastSeen = 2L, name = "Topic")
+        val r = s.read("sid-a")!!
+        assertEquals(1_700_000_000_000L, r.startedAt)
+        assertEquals(2L, r.pid)
+    }
+
+    @Test fun startedAt_nonNullOnUpdateStoresTheNewValue() {
+        val s = newStore()
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 1L, lastSeen = 1L, startedAt = 1_700_000_000_000L)
+        // A resumed session is a NEW process with its own stamp — the record follows it.
+        s.writeOrUpdate(sid = "sid-a", cwd = "/x", pid = 2L, lastSeen = 2L, startedAt = 1_700_000_600_000L)
+        assertEquals(1_700_000_600_000L, s.read("sid-a")!!.startedAt)
+    }
+
     @Test fun delete_removesFile_idempotent() {
         val s = newStore()
         s.writeOrUpdate(sid = "sid-x", cwd = "/x", pid = 1L, lastSeen = 1L)

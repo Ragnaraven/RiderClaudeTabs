@@ -22,6 +22,15 @@ internal object E2eUtil {
     val stateDir = File(claudeHome, "rider-plugin")
     val stubLog = File(e2eDir, "stub-argv.log")
 
+    /** The FAKE session root's `~/.claude` (`-Dclaudetabs.fakeRoots=distroA=<this>`) — its own
+     *  sessions dir, liveness markers and scan control files. */
+    val fakeHome = File(e2eDir, "fake-root/.claude")
+
+    /** Where the sandbox IDE writes its log. The plugin's own diagnostics (the snapshot's two
+     *  arms, the adopt scan, a benched root) exist ONLY there, so a phase asserting on them has
+     *  to read the sandbox's idea.log — see [ideaLogLines]. */
+    val sandboxDir: File = File("build/idea-sandbox").absoluteFile
+
     /** The session id `bin/claude-hand.cmd` resumes — see [armHandLauncher]. */
     val handSidFile = File(e2eDir, "hand-sid.txt")
 
@@ -107,6 +116,29 @@ internal object E2eUtil {
         )
         return if (joined.isEmpty()) emptyList() else joined.split("|::|")
     }
+
+    /**
+     * The index of the single terminal tab whose title contains [titlePart].
+     *
+     * [terminalTabTitles] and [closeTerminalTab] are index-based, and an index is only meaningful
+     * while nothing is added or removed — so a phase that wants to × a NAMED tab resolves it here
+     * first. Requiring exactly one match is the point: two matching tabs (or none) mean the phase
+     * no longer knows which tab it is about to close, which is worse than failing.
+     */
+    fun terminalTabIndexTitled(robot: RemoteRobot, titlePart: String): Int {
+        val titles = terminalTabTitles(robot)
+        val hits = titles.indices.filter { titles[it].contains(titlePart) }
+        check(hits.size == 1) { "expected exactly one terminal tab titled like '$titlePart', got titles=$titles" }
+        return hits.single()
+    }
+
+    /** A system property AS THE SANDBOX IDE SEES IT. The phases that depend on non-default plugin
+     *  tuning assert it here: without this a mis-wired driver invocation would run them against the
+     *  shipped defaults and they would fail (or pass) for a reason that has nothing to do with the
+     *  behaviour under test. */
+    fun ideSystemProperty(robot: RemoteRobot, key: String): String? =
+        robot.callJs<String>("'' + java.lang.System.getProperty('$key')", true)
+            .takeIf { it.isNotEmpty() && it != "null" }
 
     /** × the terminal tab at [index] — same ContentManager removal the close button performs. */
     fun closeTerminalTab(robot: RemoteRobot, index: Int) {
@@ -342,6 +374,29 @@ internal object E2eUtil {
         return activeSessions().first { it.sid == sid }.pid!!
     }
 
+    /** The ancestors of [pid] up to (excluding) the sandbox IDE's own JVM, topmost first — the
+     *  shell chain a terminal tab sits on. */
+    fun ancestorsBelowIde(pid: Long): List<Long> {
+        val out = ArrayList<Long>()
+        var h = ProcessHandle.of(pid).orElse(null)?.parent()?.orElse(null)
+        while (h != null) {
+            val cmd = h.info().command().orElse("").lowercase()
+            if (cmd.contains("java") || cmd.contains("idea") || cmd.contains("gradle")) break
+            out.add(0, h.pid())
+            h = h.parent().orElse(null)
+        }
+        return out
+    }
+
+    /** Kill a stub AND the shell chain under its tab, top first — the shape of a pty dying under
+     *  a live tab (the terminal then closes the tab itself). The fake root's liveness marker is
+     *  removed too, since a killed stub never runs its own cleanup. */
+    fun killTabChain(root: String, stubPid: Long) {
+        val chain = ancestorsBelowIde(stubPid) + stubPid
+        chain.forEach { p -> ProcessHandle.of(p).ifPresent { it.destroyForcibly() } }
+        if (root.startsWith("fake:")) File(fakeHome, "proc/$stubPid").delete()
+    }
+
     fun killStub(root: String, pid: Long) {
         val home = if (root.startsWith("fake:")) File(e2eDir, "fake-root/.claude") else claudeHome
         val dir = File(home, "kill").apply { mkdirs() }
@@ -378,12 +433,114 @@ internal object E2eUtil {
         )
     }
 
+    /** The `userName` currently on [sid]'s active-sessions entry, or null if it has none (or the
+     *  entry is missing / mid-rewrite). The read-back half of [setUserName]: a caller that needs
+     *  the name to have STUCK has to see it survive one of the plugin's own rewrites, not just its
+     *  own write. */
+    fun userNameOf(sid: String): String? {
+        val text = try { File(activeSessionsDir, "$sid.json").readText() } catch (_: Exception) { return null }
+        return Regex(""""userName"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+    }
+
     fun snapshotSids(): Set<String> {
         val snap = stateDir.listFiles { f -> f.name.startsWith("open-tabs-") && f.name.endsWith(".json") }
             ?.maxByOrNull { it.lastModified() } ?: return emptySet()
         val text = try { snap.readText() } catch (_: Exception) { return emptySet() }
         return Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
             .findAll(text).map { it.value }.toSet()
+    }
+
+    /** One `sessions/<pid>.json` as the STUB wrote it — the same file a real CLI registers and the
+     *  plugin's scan reads. Read directly (not through `active-sessions`) when a phase needs a fact
+     *  the plugin has no reason to have recorded yet: the pid to send a kill file to, or the
+     *  `startedAt` that decides restore order. */
+    data class StubSession(val pid: Long, val sid: String, val startedAt: Long?, val topic: String?)
+
+    fun stubSessions(home: File): List<StubSession> =
+        File(home, "sessions").listFiles { f -> f.isFile && f.name.endsWith(".json") }?.mapNotNull { f ->
+            val text = try { f.readText() } catch (_: Exception) { return@mapNotNull null }
+            val pid = f.nameWithoutExtension.toLongOrNull() ?: return@mapNotNull null
+            val sid = Regex(""""sessionId"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+                ?: return@mapNotNull null
+            val startedAt = Regex(""""startedAt"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()
+            // The launching wrapper's CLAUDE_STUB_TOPIC — the only thing that says which TAB a
+            // session is running in when several identical-looking tabs share one directory.
+            val topic = Regex(""""stubTopic"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+            StubSession(pid, sid, startedAt, topic)
+        } ?: emptyList()
+
+    /**
+     * Move [from] to [to], retrying until it takes.
+     *
+     * A phase makes a session root unobservable by moving its `sessions/` directory aside — and the
+     * stubs living in it rewrite their session files every 1.5s, so a single attempt races an open
+     * handle and fails on Windows. Retrying is the whole trick; the move itself is instantaneous.
+     */
+    fun awaitMove(from: File, to: File) {
+        await("move ${from.name} → ${to.name}", 30_000) {
+            if (!from.exists()) return@await !from.exists() && to.exists()
+            try {
+                java.nio.file.Files.move(from.toPath(), to.toPath())
+                true
+            } catch (_: Exception) { false }
+        }
+    }
+
+    // ── The sandbox IDE's own log ──
+    //
+    // Some of the plugin's contract is only OBSERVABLE as a log line: which sessions the snapshot's
+    // unbound arm is counting, which one an × evicted, that a root's scan threw and got benched.
+    // The phases read them from the sandbox idea.log. Every read takes a MARK (see [ideaLogMark])
+    // so a phase only ever sees lines its own IDE launch produced.
+
+    /** The sandbox's `idea.log`, under a `log…` directory inside the sandbox's IDE dir (the exact
+     *  name carries the run task, e.g. `log_runIdeForE2e`). Newest wins. */
+    fun ideaLog(): File? {
+        // Resolved ONCE per phase (each phase is its own test JVM): a mark taken from one file and
+        // read back from another would silently compare offsets across two logs.
+        resolvedIdeaLog?.takeIf { it.isFile }?.let { return it }
+        val logDirs = sandboxDir.listFiles { f -> f.isDirectory }.orEmpty().flatMap { ide ->
+            ide.listFiles { f -> f.isDirectory && f.name.startsWith("log") }.orEmpty().toList()
+        } + sandboxDir.listFiles { f -> f.isDirectory && f.name.startsWith("log") }.orEmpty()
+        return logDirs.map { File(it, "idea.log") }.filter { it.isFile }
+            .maxByOrNull { it.lastModified() }
+            ?.also { resolvedIdeaLog = it }
+    }
+
+    private var resolvedIdeaLog: File? = null
+
+    fun requireIdeaLog(): File = ideaLog() ?: throw AssertionError(
+        "no sandbox idea.log under ${sandboxDir.absolutePath} — the plugin's diagnostics are unreadable",
+    )
+
+    /** The log's current length. Hand it to [ideaLogLines] / [awaitLogLine] so a phase's assertions
+     *  can never be satisfied by a line an EARLIER launch wrote. */
+    fun ideaLogMark(): Long = ideaLog()?.length() ?: 0L
+
+    /** Log lines written since [mark] (a rotated/truncated file reads from the start). */
+    fun ideaLogLines(mark: Long): List<String> {
+        val f = ideaLog() ?: return emptyList()
+        val text = try {
+            java.io.RandomAccessFile(f, "r").use { raf ->
+                val len = raf.length()
+                val from = if (mark in 0..len) mark else 0L
+                raf.seek(from)
+                val buf = ByteArray((len - from).toInt())
+                raf.readFully(buf)
+                String(buf, Charsets.UTF_8)
+            }
+        } catch (_: Exception) { return emptyList() }
+        return text.lines()
+    }
+
+    /** Wait for a log line since [mark] matching [pred], and return it. */
+    fun awaitLogLine(what: String, mark: Long, timeoutMs: Long = 60_000, pred: (String) -> Boolean): String {
+        var hit: String? = null
+        await(what, timeoutMs) {
+            hit = ideaLogLines(mark).lastOrNull(pred)
+            hit != null
+        }
+        return hit!!
     }
 
     data class StubLaunch(val ts: Long, val flavor: String?, val argv: List<String>)
@@ -408,6 +565,27 @@ internal object E2eUtil {
     /** File the phases share: phase 1 records what phase 2 must assert against. */
     val expectationsFile = File(e2eDir, "phase1-expectations.json")
 
+    /** The same handoff for the unbound-ledger pair. Its OWN file on purpose: a single shared file
+     *  would mean whichever pair ran last decided what the other pair's post-restart phase reads,
+     *  and a stale one would be asserted against silently. */
+    val phase3ExpectationsFile = File(e2eDir, "phase3-expectations.json")
+
+    /** Phase 4 -> phase 5 handoff: the three sessions an outage left held in the snapshot. */
+    val phase4ExpectationsFile = File(e2eDir, "phase4-expectations.json")
+
+    /** The multi-generation scenario's handoff (`E2eCycleTest`). One file carried across ALL the
+     *  cycles of one run — each generation reads what the previous one left and rewrites it — so it
+     *  carries the run's seed and the generation that wrote it, and a reader that finds either out
+     *  of step refuses it rather than asserting against another run's expectations. */
+    val cycleStateFile = File(e2eDir, "cycle-state.json")
+
+    /** Generic handoff writer: every value is written as a JSON string, so [readExpectations] (one
+     *  regex over quoted values) reads back exactly what was handed in — numbers included. */
+    fun writeExpectations(file: File, values: Map<String, String>) {
+        file.parentFile.mkdirs()
+        file.writeText(values.entries.joinToString(",", "{", "}") { (k, v) -> """"$k":"$v"""" })
+    }
+
     fun writeExpectations(
         keptWin: String,
         keptFake: String,
@@ -425,8 +603,8 @@ internal object E2eUtil {
         )
     }
 
-    fun readExpectations(): Map<String, String> {
-        val text = expectationsFile.readText()
+    fun readExpectations(file: File = expectationsFile): Map<String, String> {
+        val text = file.readText()
         return Regex(""""(\w+)"\s*:\s*"([^"]+)"""").findAll(text)
             .associate { it.groupValues[1] to it.groupValues[2] }
     }

@@ -114,10 +114,14 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
     /** The alive-tab snapshot for [projectHash]. Returns null when NO snapshot has ever been
      *  written (missing file) so the caller can fall back to legacy restore-all exactly once;
      *  returns a possibly-empty set when a snapshot exists (empty = nothing was open). */
+    /** Does a snapshot file exist for [projectHash]? Distinguishes "never written / cleared"
+     *  (start from empty) from "exists but unreadable right now" (keep the in-memory copy). */
+    fun openTabsFileExists(projectHash: String): Boolean = openTabsFile(projectHash).exists()
+
     fun loadOpenTabs(projectHash: String): Set<String>? = synchronized(openTabsLock) {
         val f = openTabsFile(projectHash)
         if (!f.exists()) return@synchronized null
-        val text = try { f.readText() } catch (_: Exception) { return@synchronized null }
+        val text = try { DurableIo.readText(f) } catch (_: Exception) { return@synchronized null }
         val trimmed = text.trim()
         if (trimmed.isEmpty() || trimmed == "[]") return@synchronized emptySet()
         Regex("\"([^\"]+)\"").findAll(trimmed).map { it.groupValues[1] }.toSet()

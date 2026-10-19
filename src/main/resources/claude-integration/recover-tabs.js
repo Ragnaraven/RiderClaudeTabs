@@ -13,6 +13,8 @@
 //   node recover-tabs.js [--within <minutes>] [--all] [--include-closed] [--apply] [--json]
 //
 //   --within N        only sessions active in the last N minutes (default 60)
+//   --sids a,b,c      only these sessions (full ids or unambiguous prefixes); the time window
+//                     is then ignored — a session picked by name is wanted whatever its age
 //   --all             every project, not just the one containing cwd (report-wide, but it
 //                     cannot find sessions the plugin never recorded — that scan needs a
 //                     project root to look under, so run without --all to catch those)
@@ -34,11 +36,12 @@ const has = (f) => argv.includes(f);
 const val = (f, d) => { const i = argv.indexOf(f); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
 
 const WITHIN_MIN = Math.max(1, parseInt(val('--within', '60'), 10) || 60);
+const SIDS = (val('--sids', '') || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const ALL = has('--all');
 const INCLUDE_CLOSED = has('--include-closed');
 const APPLY = has('--apply');
 const JSON_OUT = has('--json');
-const CUTOFF = Date.now() - WITHIN_MIN * 60 * 1000;
+const CUTOFF = SIDS.length ? 0 : (Date.now() - WITHIN_MIN * 60 * 1000);
 
 // ── state dir ─────────────────────────────────────────────────────────────────
 // The plugin runs on the Windows side, so its state lives in the WINDOWS ~/.claude even
@@ -325,6 +328,14 @@ if (project) {
   }
 }
 
+// An explicit pick: keep only the requested sessions, and say which requests matched nothing.
+const unknownSids = [];
+if (SIDS.length) {
+  const kept = candidates.filter((c) => SIDS.some((p) => c.sid.toLowerCase().startsWith(p)));
+  for (const p of SIDS) if (!candidates.some((c) => c.sid.toLowerCase().startsWith(p))) unknownSids.push(p);
+  candidates.splice(0, candidates.length, ...kept);
+}
+
 const snapshots = existingSnapshots(stateDir);
 
 // The project's own snapshot may not exist yet (a project whose tabs the plugin has never
@@ -401,7 +412,9 @@ const result = {
   ok: true,
   applied: APPLY && toAdd.length > 0,
   project: project ? { name: project.name, root: project.root } : null,
-  withinMinutes: WITHIN_MIN,
+  withinMinutes: SIDS.length ? null : WITHIN_MIN,
+  requestedSids: SIDS,
+  unknownSids,
   stateDir,
   snapshotFiles: [...groups.keys()],
   alreadyOpen,

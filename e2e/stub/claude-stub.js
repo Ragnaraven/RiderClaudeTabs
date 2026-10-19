@@ -12,11 +12,21 @@
 //  CLAUDE_STUB_FLAVOR   (optional) tag recorded in the log ("windows" / "fake") — proves which
 //                       wrapper (i.e. which session root's launcher) executed a resume
 //  CLAUDE_STUB_PROC_DIR (optional) dir where a `<pid>` liveness marker file is maintained
-//  CLAUDE_STUB_TOPIC    (optional) topic emitted as a terminal-title escape after 1s
+//  CLAUDE_STUB_TOPIC    (optional) topic emitted as a terminal-title escape after 1s, and
+//                       recorded as `stubTopic` in the session file so a harness that opens
+//                       several look-alike tabs can say WHICH tab a session belongs to (the
+//                       plugin reads named fields and ignores this one)
 //  CLAUDE_STUB_TITLE    (optional, "1") emit the FULL claude-shaped title sequence: a bare
 //                       `claude` while the CLI starts up, then `<glyph> <topic>` once the
 //                       conversation has a topic. Opt-in so the phases that only need the
 //                       plain topic escape keep their existing (title-free startup) shape.
+//  CLAUDE_STUB_REGISTER_DELAY_MS (optional) hold back the FIRST `sessions/<pid>.json` write by
+//                       this many ms. Lets a phase open several tabs and have every one of their
+//                       sessions appear inside a SINGLE plugin poll window: without it the first
+//                       tab's session can be seen while the later tabs' terminal Contents do not
+//                       exist yet, and the 1:1 adoption pass binds it instead of refusing the
+//                       ambiguity the phase is there to reproduce. Everything else (transcript,
+//                       liveness marker, argv log) still happens immediately.
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -51,9 +61,20 @@ function writeSession() {
     version: '0.0.0-stub', kind: 'interactive', entrypoint: 'cli',
     name: base + '-' + sid.slice(0, 2), nameSource: 'derived',
     status: 'idle', updatedAt: Date.now(), statusUpdatedAt: Date.now(),
+    stubTopic: process.env.CLAUDE_STUB_TOPIC || null,
   }));
 }
-writeSession();
+
+// `startedAt` stays the real process start even when registration is held back: it is what the
+// plugin clocks a session's age from, and lying about it would make a held-back session look
+// younger than it is to every freshness/admission rule.
+const registerDelayMs = Math.max(0, parseInt(process.env.CLAUDE_STUB_REGISTER_DELAY_MS || '0', 10) || 0);
+let registered = false;
+function register() {
+  registered = true;
+  try { writeSession(); } catch (_) { /* see the interval below */ }
+}
+if (registerDelayMs > 0) setTimeout(register, registerDelayMs); else register();
 
 // Transcript, so the plugin's restore gate finds something to resume.
 const tdir = path.join(home, 'projects', 'stub');
@@ -91,8 +112,13 @@ console.log('[claude-stub] pid=' + process.pid + ' sid=' + sid + (resumed ? ' (r
 // `<home>/kill/<pid>` — closing a tab whose process already ended shows no
 // terminate-confirmation modal (which would block the robot's EDT calls).
 const killFile = path.join(home, 'kill', String(process.pid));
+// Both halves are guarded, and SEPARATELY. A phase can make this root unobservable by moving
+// `sessions/` away, and an unhandled ENOENT out of writeSession would kill the stub without
+// running cleanup() -- leaving a stale `proc/<pid>` marker behind, i.e. a dead session that still
+// reads as ALIVE. Their own try each, so a failing write never starves the kill channel: a stub
+// the harness cannot ask to exit has to be x'd while alive, which raises the terminate modal.
 setInterval(() => {
-  writeSession();
+  try { if (registered) writeSession(); } catch (_) { /* sessions dir may be gone for now */ }
   try { if (fs.existsSync(killFile)) { fs.unlinkSync(killFile); cleanup(); } } catch (_) { }
 }, 1500);
 process.stdin.resume();          // stay alive until the pty closes or a signal arrives

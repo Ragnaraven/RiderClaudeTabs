@@ -215,7 +215,7 @@ internal object ReworkedTerminalBridge {
                         "startupOpts=${if (startup.readable) "readable" else "dark"} " +
                         "argv=${startup.shellCommand?.let { "${it.size}tok" } ?: "absent"} " +
                         "argvSid=${OwnedTerminalSpawner.sessionIdFromCommand(startup.shellCommand) != null} " +
-                        "ptyPid=${if (startup.pid == null) "absent" else "present"} " +
+                        "ptyPid=${startup.pid ?: "absent"} " +
                         "startupCwd=${if (startup.workingDirectory == null) "absent" else "present"}",
                 )
             }

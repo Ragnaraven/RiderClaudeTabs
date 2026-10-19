@@ -265,70 +265,23 @@ class ClaudeTabsHelpersTest {
         assertEquals(emptySet<String>(), snap)
     }
 
-    // ── applyRemovalDeferral (teardown-race safety net) ─────────────
-
-    @Test fun removalDeferral_singleAbsentSidCommitsImmediately() {
-        // One tab ×'d → removed this very poll. An ×'d tab must never resurrect, even if the
-        // user quits right after closing it.
-        val pending = mutableMapOf<String, Long>()
-        val out = ClaudeTabsHelpers.applyRemovalDeferral(
-            prev = setOf("a", "b", "c"), computed = setOf("a", "b"), pendingRemovals = pending, now = 1_000L,
-        )
-        assertEquals(setOf("a", "b"), out)
-        assertTrue(pending.isEmpty())
-    }
-
-    @Test fun removalDeferral_bulkVanishIsDeferredOnePollThenCommitted() {
-        // Several tabs vanish in ONE poll — the teardown signature. The first poll keeps them
-        // (nothing lost if the app dies right now); a second consecutive absent poll — which only
-        // runs when the teardown flags are clear — confirms and commits.
-        val pending = mutableMapOf<String, Long>()
-        val first = ClaudeTabsHelpers.applyRemovalDeferral(
-            prev = setOf("a", "b", "c"), computed = setOf("a"), pendingRemovals = pending, now = 1_000L,
-        )
-        assertEquals(setOf("a", "b", "c"), first)
-        assertEquals(setOf("b", "c"), pending.keys)
-        val second = ClaudeTabsHelpers.applyRemovalDeferral(
-            prev = first, computed = setOf("a"), pendingRemovals = pending, now = 6_000L,
-        )
-        assertEquals(setOf("a"), second)
-        assertTrue(pending.isEmpty())
-    }
-
-    @Test fun removalDeferral_reappearingSidCancelsItsPendingRemoval() {
-        val pending = mutableMapOf<String, Long>()
-        ClaudeTabsHelpers.applyRemovalDeferral(
-            prev = setOf("a", "b", "c"), computed = setOf("a"), pendingRemovals = pending, now = 1_000L,
-        )
-        // "b" is present again next poll (transient vanish); only "c" remains absent — and as a
-        // SINGLE absent sid it commits.
-        val out = ClaudeTabsHelpers.applyRemovalDeferral(
-            prev = setOf("a", "b", "c"), computed = setOf("a", "b"), pendingRemovals = pending, now = 6_000L,
-        )
-        assertEquals(setOf("a", "b"), out)
-        assertTrue(pending.isEmpty())
-    }
-
-    @Test fun removalDeferral_mixedFreshAndConfirmedCommitsOnlyConfirmed() {
-        val pending = mutableMapOf("b" to 1_000L, "c" to 1_000L)
-        // "b"/"c" were deferred by an earlier poll; "d" vanishes fresh in this bulk poll.
-        val out = ClaudeTabsHelpers.applyRemovalDeferral(
-            prev = setOf("a", "b", "c", "d"), computed = setOf("a"), pendingRemovals = pending, now = 6_000L,
-        )
-        assertEquals(setOf("a", "d"), out) // b+c committed (confirmed), d held one more poll
-        assertEquals(setOf("d"), pending.keys)
-    }
-
-    @Test fun removalDeferral_noAbsenceIsANoOpAndClearsStalePending() {
-        val pending = mutableMapOf("stale" to 1_000L)
-        val out = ClaudeTabsHelpers.applyRemovalDeferral(
-            prev = setOf("a"), computed = setOf("a", "new"), pendingRemovals = pending, now = 2_000L,
-        )
-        assertEquals(setOf("a", "new"), out)
-        assertTrue(pending.isEmpty())
-    }
-
     // ── Generic tab names: launcher defaults must never become a persisted user rename ──
+    // ── markerIsStale (recycled-pid guard) ───────────────────────────
+    @Test fun markerIsStale_markerOlderThanItsProcessIsStale() {
+        val processStart = 2_000_000L
+        assertTrue(ClaudeTabsHelpers.markerIsStale(processStart - 3_600_000L, processStart))
+    }
+
+    @Test fun markerIsStale_markerAtOrAfterProcessStartIsNot() {
+        val processStart = 2_000_000L
+        assertFalse(ClaudeTabsHelpers.markerIsStale(processStart + 800L, processStart))
+        assertFalse(ClaudeTabsHelpers.markerIsStale(processStart - 30_000L, processStart)) // inside the slack
+    }
+
+    @Test fun markerIsStale_unknownStampsCannotDiscriminate() {
+        assertFalse(ClaudeTabsHelpers.markerIsStale(null, 2_000_000L))
+        assertFalse(ClaudeTabsHelpers.markerIsStale(1_000L, null))
+    }
 
     @Test fun genericTabName_includesAgentLauncherDefaults() {
         assertTrue(ClaudeTabsHelpers.isGenericTabName("Claude Code"))
@@ -568,5 +521,195 @@ class ClaudeTabsHelpersTest {
 
     @Test fun mergeTabLists_allEmpty() {
         assertTrue(ClaudeTabsHelpers.mergeTabLists<Any>(emptyList(), emptyList(), emptyList()).isEmpty())
+    }
+
+    // ── isHeadlessArgs — whole-token argv classification ─────────────
+
+    @Test fun headlessArgs_unknownArgvStaysUnknown() {
+        // A root that cannot tokenize argv gets no verdict — never a guess off the joined form.
+        assertNull(ClaudeTabsHelpers.isHeadlessArgs(null))
+    }
+
+    @Test fun headlessArgs_wholeTokenFlagsAreHeadless() {
+        assertEquals(true, ClaudeTabsHelpers.isHeadlessArgs(listOf("claude", "-p", "summarise the diff")))
+        assertEquals(true, ClaudeTabsHelpers.isHeadlessArgs(listOf("claude", "--print")))
+    }
+
+    @Test fun headlessArgs_tokensThatMerelyContainTheFlagAreNotHeadless() {
+        // Every one of these reads as headless under a substring scan of the command line.
+        assertEquals(false, ClaudeTabsHelpers.isHeadlessArgs(listOf("claude", "--permission-mode", "plan")))
+        assertEquals(false, ClaudeTabsHelpers.isHeadlessArgs(listOf("claude", "--add-dir", "/path/to/project-parts")))
+        assertEquals(false, ClaudeTabsHelpers.isHeadlessArgs(listOf("claude", "explain what --print does")))
+    }
+
+    @Test fun headlessArgs_interactiveAndEmptyArgvAreNotHeadless() {
+        assertEquals(false, ClaudeTabsHelpers.isHeadlessArgs(listOf("claude", "--resume", "sid-a")))
+        assertEquals(false, ClaudeTabsHelpers.isHeadlessArgs(emptyList()))
+    }
+
+    // ── claimsExclusively — the most specific OPEN project wins ──────
+
+    @Test fun claims_nestedOpenProjects_onlyTheDeeperOneClaims() {
+        val open = listOf("/repo", "/repo/sub")
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("/repo/sub/x", "/repo/sub", open))
+        assertFalse(
+            "the outer window must not restore a session the inner window owns",
+            ClaudeTabsHelpers.claimsExclusively("/repo/sub/x", "/repo", open),
+        )
+        // A cwd the deeper project does not claim still belongs to the outer one.
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("/repo/y", "/repo", open))
+        assertFalse(ClaudeTabsHelpers.claimsExclusively("/repo/y", "/repo/sub", open))
+    }
+
+    @Test fun claims_siblingWorktreeGoesToTheParentUntilItsOwnProjectIsOpen() {
+        // Unchanged from the plain cwd rule while the worktree has no window of its own.
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("/repo-feature", "/repo", listOf("/repo")))
+        val bothOpen = listOf("/repo", "/repo-feature")
+        assertFalse(ClaudeTabsHelpers.claimsExclusively("/repo-feature", "/repo", bothOpen))
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("/repo-feature", "/repo-feature", bothOpen))
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("/repo-feature/src", "/repo-feature", bothOpen))
+    }
+
+    @Test fun claims_aMoreSpecificBaseThatIsNotOpenNeverSuppresses() {
+        // A closed sub-project cannot spawn the tab, so letting it veto leaves the session
+        // claimed by nobody — which is why only OPEN bases arbitrate.
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("/repo/sub/x", "/repo", listOf("/repo")))
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("/repo-feature", "/repo", listOf("/repo", "/unrelated")))
+    }
+
+    @Test fun claims_cwdOutsideTheProjectIsNotClaimedAtAll() {
+        assertFalse(ClaudeTabsHelpers.claimsExclusively("/other", "/repo", listOf("/repo")))
+    }
+
+    @Test fun claims_normalisesSeparatorsCaseAndTrailingSlash() {
+        val open = listOf("D:\\Dev\\MyApp", "d:/dev/myapp/sub/")
+        assertFalse(ClaudeTabsHelpers.claimsExclusively("D:/Dev/MyApp/Sub/x", "D:\\Dev\\MyApp\\", open))
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("D:/Dev/MyApp/Sub/x", "D:\\Dev\\MyApp\\Sub", open))
+        // The project's own base spelled differently must never veto itself.
+        assertTrue(ClaudeTabsHelpers.claimsExclusively("D:/Dev/MyApp/other", "d:\\dev\\myapp", open))
+    }
+
+    // ── restoreOrder — position, then start time, then sid ───────────
+
+    private fun orderEntry(sid: String, ordinal: Int? = null, startedAt: Long? = null) =
+        ActiveSessionsStore.Entry(
+            sid = sid, cwd = "/path/to/project", pid = null, lastSeen = 0L, name = null,
+            ordinal = ordinal, startedAt = startedAt,
+        )
+
+    private fun ordered(vararg entries: ActiveSessionsStore.Entry) =
+        entries.sortedWith(ClaudeTabsHelpers.restoreOrder()).map { it.sid }
+
+    @Test fun restoreOrder_savedPositionOutranksStartTime() {
+        assertEquals(
+            listOf("sid-a", "sid-b"),
+            ordered(orderEntry("sid-b", ordinal = 1, startedAt = 900L), orderEntry("sid-a", ordinal = 0, startedAt = 5_000L)),
+        )
+    }
+
+    @Test fun restoreOrder_positionlessEntriesComeLastOldestFirst() {
+        // Entries admitted to the snapshot with no tab bound have no ordinal: reopen them in
+        // creation order rather than the sid shuffle the user re-arranges by hand.
+        assertEquals(
+            listOf("sid-b", "sid-a", "sid-c"),
+            ordered(
+                orderEntry("sid-c", startedAt = 3_000L),
+                orderEntry("sid-a", startedAt = 1_000L),
+                orderEntry("sid-b", ordinal = 4),
+            ),
+        )
+    }
+
+    @Test fun restoreOrder_unknownStartTimeSortsAfterKnownOnesAtTheSamePosition() {
+        assertEquals(
+            listOf("sid-b", "sid-a"),
+            ordered(orderEntry("sid-a", ordinal = 2), orderEntry("sid-b", ordinal = 2, startedAt = 10L)),
+        )
+    }
+
+    @Test fun restoreOrder_bothKeysUnknownFallsBackToSidSoTheOrderIsTotal() {
+        assertEquals(
+            listOf("sid-a", "sid-b", "sid-c"),
+            ordered(orderEntry("sid-c"), orderEntry("sid-b"), orderEntry("sid-a")),
+        )
+    }
+
+    // ── sessionStillRunning — pid-reuse-safe restore-time liveness ───
+
+    /** A [SessionRoot.Fake] set up like a real root: the `proc/<pid>` marker IS liveness and its
+     *  mtime IS the process start time; `sessions/<pid>.json` is the root's own pid file. */
+    private fun rootWith(pid: Long, startedAt: Long?, pidFileSid: String?): SessionRoot.Fake {
+        val home = tmp.newFolder()
+        if (startedAt != null) {
+            val marker = File(File(home, "proc").apply { mkdirs() }, pid.toString())
+            marker.writeText("")
+            assertTrue("test setup: marker mtime must be settable", marker.setLastModified(startedAt))
+        }
+        if (pidFileSid != null) {
+            val sessions = File(home, "sessions").apply { mkdirs() }
+            File(sessions, "$pid.json").writeText("{\"sessionId\":\"$pidFileSid\",\"cwd\":\"/path/to/project\"}")
+        }
+        return SessionRoot.Fake("root-a", home)
+    }
+
+    private fun liveEntry(sid: String, pid: Long?, lastSeen: Long) =
+        ActiveSessionsStore.Entry(sid = sid, cwd = "/path/to/project", pid = pid, lastSeen = lastSeen, name = null)
+
+    @Test fun stillRunning_alivePidWithConsistentStartAndMatchingPidFile() {
+        val seen = 1_700_000_000_000L
+        assertTrue(ClaudeTabsHelpers.sessionStillRunning(
+            rootWith(pid = 4242L, startedAt = seen - 60_000L, pidFileSid = "sid-a"),
+            liveEntry("sid-a", 4242L, seen),
+        ))
+        // Within the clock slack a start stamped just after the last sighting is still this
+        // session — the two stamps come from different clocks.
+        assertTrue(ClaudeTabsHelpers.sessionStillRunning(
+            rootWith(pid = 77L, startedAt = seen + 1_000L, pidFileSid = "sid-a"),
+            liveEntry("sid-a", 77L, seen),
+        ))
+    }
+
+    @Test fun stillRunning_processStartedAfterTheLastSightingIsARecycledPid() {
+        // The hard reject: calling this "running" would suppress the restore and lose the tab.
+        val seen = 1_700_000_000_000L
+        assertFalse(ClaudeTabsHelpers.sessionStillRunning(
+            rootWith(pid = 4242L, startedAt = seen + 60_000L, pidFileSid = "sid-a"),
+            liveEntry("sid-a", 4242L, seen),
+        ))
+    }
+
+    @Test fun stillRunning_pidFileNamingAnotherSessionRejects() {
+        val seen = 1_700_000_000_000L
+        assertFalse(ClaudeTabsHelpers.sessionStillRunning(
+            rootWith(pid = 4242L, startedAt = seen - 60_000L, pidFileSid = "sid-b"),
+            liveEntry("sid-a", 4242L, seen),
+        ))
+    }
+
+    @Test fun stillRunning_missingPidFileIsUnknownAndStaysRunning() {
+        // Unknown here must not manufacture a double resume — it is not the pid-reuse guard.
+        val seen = 1_700_000_000_000L
+        assertTrue(ClaudeTabsHelpers.sessionStillRunning(
+            rootWith(pid = 4242L, startedAt = seen - 60_000L, pidFileSid = null),
+            liveEntry("sid-a", 4242L, seen),
+        ))
+    }
+
+    @Test fun stillRunning_deadProcessOrUnknownPidIsNotRunning() {
+        val seen = 1_700_000_000_000L
+        assertFalse(
+            "no liveness marker — the process is gone",
+            ClaudeTabsHelpers.sessionStillRunning(
+                rootWith(pid = 4242L, startedAt = null, pidFileSid = "sid-a"),
+                liveEntry("sid-a", 4242L, seen),
+            ),
+        )
+        assertFalse(
+            "an entry with no pid was never observed alive",
+            ClaudeTabsHelpers.sessionStillRunning(
+                rootWith(pid = 4242L, startedAt = seen - 60_000L, pidFileSid = "sid-a"),
+                liveEntry("sid-a", null, seen),
+            ),
+        )
     }
 }

@@ -4,7 +4,9 @@ package com.claudetabs
  * Pure helper functions extracted from [ClaudeTabWatcherStartup] so they can be unit-tested
  * without needing an IntelliJ [com.intellij.openapi.project.Project] instance or a running IDE.
  *
- * Nothing in here touches the filesystem, threads, reflection, or the IntelliJ platform.
+ * Nothing in here touches threads, reflection, or the IntelliJ platform. The one function that
+ * reads the world is [sessionStillRunning], and it reads it only through the [SessionRoot] it is
+ * handed — so a test drives it with `SessionRoot.Fake` and no IDE, exactly like the rest.
  */
 internal object ClaudeTabsHelpers {
 
@@ -369,6 +371,39 @@ internal object ClaudeTabsHelpers {
         return false
     }
 
+    /**
+     * Does the project at [base] claim [cwd] EXCLUSIVELY — i.e. it claims by [isCwdUnderProject]
+     * and no more specific OPEN project claims it too? The most specific open project wins.
+     *
+     * "More specific" is a strictly longer normalised base in [openBases] that also claims [cwd].
+     * Length ties leave both claiming (they are different projects with equal standing), and the
+     * longest claiming base is never suppressed by anything — so a cwd that any open project
+     * claims always keeps at least one owner.
+     *
+     * [openBases] must be the OPEN projects' base paths and nothing else; this function reads no
+     * index and decides no openness itself. That is the point: arbitrating against projects that
+     * are merely KNOWN lets a closed sub-project veto the open parent's claim, and the session is
+     * then restored by nobody — a closed window cannot spawn the tab it just vetoed.
+     *
+     * Two failures this prevents, both with every window otherwise claiming honestly: `<repo>`
+     * and `<repo>/sub` open side by side, each restoring the same session into its own window
+     * (one conversation, two tabs); and `<repo>` swallowing the sessions of sibling worktree
+     * `<repo>-feature` while `<repo>-feature` is itself open in its own window.
+     *
+     * Stricter than the descendant fast path it grew out of: a DESCENDANT cwd arbitrates here
+     * too, not just a dash-suffix sibling, because two nested open projects are exactly the
+     * double-claim case above.
+     */
+    fun claimsExclusively(cwd: String, base: String, openBases: Collection<String>): Boolean {
+        if (!isCwdUnderProject(cwd, base)) return false
+        val nCwd = normalizeCwd(cwd)
+        val nBase = normalizeCwd(base)
+        return openBases.none { other ->
+            val nOther = normalizeCwd(other)
+            nOther != nBase && nOther.length > nBase.length && isCwdUnderProject(nCwd, nOther)
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════
     // TRANSCRIPT LOOKUP
     // ══════════════════════════════════════════════════════════════
@@ -437,6 +472,20 @@ internal object ClaudeTabsHelpers {
         return null
     }
 
+    /**
+     * Is this argv a HEADLESS run (`claude -p <prompt>` / `claude --print`) rather than an
+     * interactive session? Null when [args] is null: the root could not tokenize argv, and
+     * unknown must stay unknown rather than be guessed.
+     *
+     * WHOLE TOKENS only, which is why this takes argv and not the joined command line. In the
+     * joined form `--permission-mode` contains `-p`, a directory can be named with a `-p`
+     * segment, and a prompt can quote `--print` — each one reads as headless under a substring
+     * scan. A headless run mistaken for a session gets tracked, titled and then RESTORED as a tab
+     * the user never opened, and it reappears at every startup because nothing ever closes it.
+     */
+    fun isHeadlessArgs(args: List<String>?): Boolean? =
+        args?.any { it == "-p" || it == "--print" }
+
     // ══════════════════════════════════════════════════════════════
     // OPEN-TABS SNAPSHOT
     // ══════════════════════════════════════════════════════════════
@@ -473,51 +522,6 @@ internal object ClaudeTabsHelpers {
     }
 
     /**
-     * Defer BULK removals from the snapshot by one poll — the teardown safety net.
-     *
-     * Field evidence: during IDE quit the terminal kills pty processes *before* any close listener
-     * fires, and agent tabs self-close when their process dies — so a poll that lands in that
-     * window sees several tabs vanish at once, exactly like a burst of × clicks, and rewrites the
-     * snapshot without them. Those tabs are then gone on the next launch.
-     *
-     * The two cases are distinguishable by shape and by time:
-     *  - a real × removes ONE tab → a single absent sid commits immediately (an ×'d tab must never
-     *    resurrect, even when the user quits right after closing it);
-     *  - teardown (or a mass close) removes SEVERAL at once → the shrink is deferred one poll. If
-     *    the vanish was teardown, the next poll never runs (or runs frozen behind the teardown
-     *    flags) and the tabs survive; if the user genuinely ×'d several tabs within one poll
-     *    window, the next poll (~seconds later) confirms and commits the removal.
-     *
-     * @param prev the on-disk snapshot from the previous poll
-     * @param computed this poll's freshly computed snapshot ([computeOpenSnapshot] output)
-     * @param pendingRemovals sid → first-observed-absent time (ms); MUTATED to carry deferral
-     *   state across polls. A sid present again is dropped from it; a committed sid is removed.
-     * @return the snapshot to actually persist this poll
-     */
-    fun applyRemovalDeferral(
-        prev: Set<String>,
-        computed: Set<String>,
-        pendingRemovals: MutableMap<String, Long>,
-        now: Long,
-    ): Set<String> {
-        val absent = prev - computed
-        // Anything present again is no longer a removal candidate.
-        pendingRemovals.keys.retainAll(absent)
-        if (absent.isEmpty()) return computed
-        if (absent.size == 1) {
-            // Single × — commit immediately. The × contract outranks the teardown net here.
-            pendingRemovals.clear()
-            return computed
-        }
-        // Bulk vanish — commit only sids already deferred by an earlier poll; hold fresh ones.
-        val confirmed = absent.filter { it in pendingRemovals }.toSet()
-        val fresh = absent - confirmed
-        for (sid in fresh) pendingRemovals[sid] = now
-        for (sid in confirmed) pendingRemovals.remove(sid)
-        return computed + fresh
-    }
-
-    /**
      * Tab lists from three sources merged into ONE display-ordered list without duplicates:
      * [primary] (the ContentManager's own tabs — its order drives restore ordinals) first, then
      * every [nested] tab not already listed (split groups), then every [known] tab the terminal
@@ -529,5 +533,122 @@ internal object ClaudeTabsHelpers {
         val out = ArrayList<T>(primary.size + nested.size + known.size)
         for (source in listOf(primary, nested, known)) for (t in source) if (seen.add(t)) out.add(t)
         return out
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // RESTORE ORDER AND RESTORE-TIME LIVENESS
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * The order the restore loop spawns entries in: saved tab position first, then the session's
+     * own start time, then the sid. Nulls sort LAST in both leading keys.
+     *
+     * The start-time key carries the entries that never had a tab bound and so have no ordinal:
+     * ordering those by [ActiveSessionsStore.Entry.startedAt] reopens them oldest-first, the
+     * order the user created them in, instead of by sid — which is a random shuffle the user has
+     * to re-arrange by hand after every restart. The sid tiebreak keeps the order TOTAL, so the
+     * same set of entries always spawns the same left-to-right layout.
+     */
+    fun restoreOrder(): Comparator<ActiveSessionsStore.Entry> =
+        compareBy<ActiveSessionsStore.Entry, Int?>(nullsLast<Int>()) { it.ordinal }
+            .thenBy(nullsLast<Long>()) { it.startedAt }
+            .thenBy { it.sid }
+
+    /** Clock slack for the start-time check in [sessionStillRunning]: the poll's `lastSeen` stamp
+     *  and a process's start time come from different clocks at different granularities, so a
+     *  start a few seconds "after" the last sighting is still the same process. */
+    const val START_SLACK_MS = 5_000L
+
+    /** How much older than its process a session marker's own start stamp may be before the
+     *  marker is read as a leftover of an EARLIER process that had the same pid. */
+    const val MARKER_STALE_SLACK_MS = 60_000L
+
+    /**
+     * Is a `sessions/<pid>.json` marker a leftover from a previous process that had this pid?
+     *
+     * The CLI writes the marker at start, stamping its own `startedAt`, and does not always
+     * remove it when it dies (killed at an IDE shutdown, say). After a restart the OS hands the
+     * low pids out again, so a NEW claude can carry a dead conversation's marker for the moment
+     * before it writes its own. Read naively, that marker says "pid N is alive and is
+     * conversation X" while N's argv says `--resume Y` — which the in-app switch detector takes
+     * for a Y→X switch, re-points the tab to a dead conversation, and leaves Y bound to nothing.
+     * Field-observed on four tabs within a minute of one restore; all four dead conversations
+     * were restored at the next start. A marker that predates its process by more than
+     * [slackMs] cannot be that process's. Unknown stamps cannot discriminate → not stale.
+     */
+    fun markerIsStale(markerStartedAt: Long?, processStartedAt: Long?, slackMs: Long = MARKER_STALE_SLACK_MS): Boolean {
+        if (markerStartedAt == null || processStartedAt == null) return false
+        return markerStartedAt + slackMs < processStartedAt
+    }
+
+    /**
+     * Is [entry]'s recorded pid still THIS session's live process in [root]? The restore-time
+     * guard: a session that outlived the IDE must not be resumed into a second tab, because both
+     * tabs then append to the one conversation.
+     *
+     * All four probes must pass:
+     *  a. the entry has a pid and [SessionRoot.processAlive] says it is alive;
+     *  b. the start time is CONSISTENT: [SessionRoot.processStartEpochMs] is at most
+     *     [ActiveSessionsStore.Entry.lastSeen] + [START_SLACK_MS];
+     *  c. the root's own `sessions/<pid>.json` names [ActiveSessionsStore.Entry.sid];
+     *  d. the process's command line mentions "claude".
+     *
+     * (b) is the pid-reuse discriminator and the one HARD reject. A process that started after
+     * the poll last saw this session cannot be it — the pid was recycled by something unrelated —
+     * and calling that "still running" suppresses the restore and loses the user's conversation,
+     * which is the worse of the two failures. A root that cannot report a start time cannot
+     * discriminate at all, so an unknown one does not reject.
+     *
+     * (c) and (d) fail toward RUNNING whenever they cannot be read: a pid file caught mid-rewrite
+     * or briefly unreadable, a root that cannot serve argv (a UNC-mounted `/proc` does not always
+     * serve virtual-file contents), a live process reported with a blank command line (Windows
+     * does this across an access-token boundary). They exist only to catch a stale pid that (b)
+     * could not, so an unreadable moment there must not manufacture a double resume.
+     *
+     * Never throws and never logs — any probe failure means "not running", and the CALLER owns
+     * the log line, so this stays a decision function tests can drive with `SessionRoot.Fake`.
+     * [now] is accepted so callers can pin the clock; the rule above compares against the entry's
+     * own `lastSeen` and does not consult it.
+     */
+    fun sessionStillRunning(
+        root: SessionRoot,
+        entry: ActiveSessionsStore.Entry,
+        now: Long = System.currentTimeMillis(),
+    ): Boolean {
+        val pid = entry.pid ?: return false
+        return try {
+            root.processAlive(pid) &&
+                startTimeConsistent(root, pid, entry.lastSeen) &&
+                pidFileNamesSession(root, pid, entry.sid) &&
+                commandLineMentionsClaude(root, pid)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** (b) — the pid-reuse discriminator. Unknown start time cannot discriminate → no reject. */
+    private fun startTimeConsistent(root: SessionRoot, pid: Long, lastSeen: Long): Boolean {
+        val started = root.processStartEpochMs(pid) ?: return true
+        return started <= lastSeen + START_SLACK_MS
+    }
+
+    /** (c) — the root's own pid file. Absent, unreadable or without the field → unknown → no
+     *  reject; a pid file that names a DIFFERENT session is a real one. */
+    private fun pidFileNamesSession(root: SessionRoot, pid: Long, sid: String): Boolean {
+        val text = try {
+            val f = java.io.File(root.sessionsDir, "$pid.json")
+            if (!f.isFile) return true
+            f.readText()
+        } catch (_: Throwable) { return true }
+        val recorded = extractJsonString(text, "sessionId") ?: return true
+        return recorded == sid
+    }
+
+    /** (d) — command-line sanity. A root that cannot inspect the process, or reports it blank,
+     *  is the same "unknown" the scan already treats as not-a-verdict → no reject. */
+    private fun commandLineMentionsClaude(root: SessionRoot, pid: Long): Boolean {
+        val cmd = try { root.processInfo(pid)?.commandLine } catch (_: Throwable) { null }
+        if (cmd.isNullOrBlank()) return true
+        return cmd.contains("claude", ignoreCase = true)
     }
 }

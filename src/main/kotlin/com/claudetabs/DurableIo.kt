@@ -41,13 +41,43 @@ internal object DurableIo {
                 fos.fd.sync()
             } catch (_: java.io.SyncFailedException) { /* FS without fsync — rename still atomic */ }
         }
-        if (!tmp.renameTo(target)) {
-            // Windows can't rename onto an existing file — delete then retry.
-            target.delete()
-            if (!tmp.renameTo(target)) {
-                tmp.delete()
-                throw IOException("atomic rename failed for ${target.absolutePath}")
+        // ATOMIC_MOVE replaces an existing target in one step (MoveFileEx with
+        // MOVEFILE_REPLACE_EXISTING on Windows). The old delete-then-rename left a window with NO
+        // file at all, and a reader landing in it saw the record as missing — a bound tab then
+        // dropped out of the snapshot for a poll. A reader holding the file open can still make
+        // the move fail with AccessDenied for an instant, so retry briefly before giving up.
+        var lastError: Throwable? = null
+        repeat(ATOMIC_MOVE_ATTEMPTS) { attempt ->
+            try {
+                java.nio.file.Files.move(
+                    tmp.toPath(), target.toPath(),
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
+                return
+            } catch (e: java.nio.file.AtomicMoveNotSupportedException) {
+                // Different volume or a filesystem without atomic replace: the legacy path.
+                if (!tmp.renameTo(target)) {
+                    target.delete()
+                    if (!tmp.renameTo(target)) {
+                        tmp.delete()
+                        throw IOException("atomic rename failed for ${target.absolutePath}", e)
+                    }
+                }
+                return
+            } catch (e: IOException) {
+                lastError = e
+                if (attempt < ATOMIC_MOVE_ATTEMPTS - 1) Thread.sleep(ATOMIC_MOVE_RETRY_MS)
             }
         }
+        tmp.delete()
+        throw IOException("atomic replace failed for ${target.absolutePath}", lastError)
     }
+
+    private const val ATOMIC_MOVE_ATTEMPTS = 5
+    private const val ATOMIC_MOVE_RETRY_MS = 10L
+
+    /** Read a whole file through NIO, which opens with FILE_SHARE_DELETE on Windows — so a
+     *  concurrent [writeAtomic] replacing the file neither fails nor blocks on this reader. */
+    fun readText(file: File): String = java.nio.file.Files.readString(file.toPath())
 }

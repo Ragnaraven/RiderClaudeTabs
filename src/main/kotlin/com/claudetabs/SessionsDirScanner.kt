@@ -10,8 +10,17 @@ package com.claudetabs
  */
 internal object SessionsDirScanner {
 
-    /** Subset of `ProcessHandle.Info` we care about. */
-    data class ProcessInfo(val command: String, val commandLine: String)
+    /**
+     * Subset of `ProcessHandle.Info` we care about.
+     *
+     * [args] is the process's TOKENIZED argv when the root can produce it (a Linux root splits
+     * `/proc/<pid>/cmdline` on NUL); null when it cannot — `ProcessHandle.Info` hands back an
+     * already-joined command line, and the original token boundaries are unrecoverable from it.
+     * Null therefore means UNKNOWN, never "no arguments": a whole-token question such as
+     * [ClaudeTabsHelpers.isHeadlessArgs] must answer "unknown" rather than fall back to scanning
+     * [commandLine] for a substring, where a path or a prompt can spell a flag it never passed.
+     */
+    data class ProcessInfo(val command: String, val commandLine: String, val args: List<String>? = null)
 
     /**
      * Recycling guard: given a [ProcessInfo], does this look like a Claude process?

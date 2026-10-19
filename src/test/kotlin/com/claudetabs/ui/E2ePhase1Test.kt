@@ -116,6 +116,7 @@ class E2ePhase1Test {
         //    tab starts out wearing a shell title; only the running program later announces itself.
         //    Field bug: such a tab was never adopted (no snapshot entry → silently not restored).
         val handSid = java.util.UUID.randomUUID().toString()
+        val handMark = E2eUtil.ideaLogMark()
         E2eUtil.armHandLauncher(handSid)
         val variant = E2eUtil.openHandTab(
             robot,
@@ -132,6 +133,9 @@ class E2ePhase1Test {
         // THE fix assertion — adoption needs the tab's title to flip away from the shell shape and
         // may take a confirmation poll, so allow generously more than a normal bind.
         await("hand tab adopted into snapshot", 120_000) { handSid in snapshotSids() }
+        // Membership alone no longer proves adoption: since 3.3.0 a live session enters the
+        // snapshot on its own once the admit window passes. The bind commit line does.
+        E2eUtil.awaitLogLine("hand tab bound (adopt commit line)", handMark, 120_000) { it.contains("→ sid=$handSid") }
 
         // The `/tab` rename on an adopted hand tab must reach the tab title — and specifically the
         // HAND tab's: it is the newest terminal tab, so the LAST title must be the one that

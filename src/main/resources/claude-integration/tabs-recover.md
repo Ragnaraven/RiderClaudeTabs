@@ -69,5 +69,6 @@ Parse `$ARGUMENTS`:
 - Names come from the plugin's own record first, then the transcript's summary, then the first prompt typed in that session — a `—` means the transcript had nothing usable, not that the session is empty.
 - This never launches Claude itself. It only rewrites the snapshot the plugin already restores from, so it is safe to dry-run at any time.
 - Sessions already open are never touched, and re-running after an apply is a no-op.
+- A session added while the IDE is running is picked up by the plugin's next poll and reopened, one or many. The plugin's own snapshot write can, rarely, land on top of this one within the same few milliseconds — the dry run in step 6 catches that; apply again if a sid is missing.
 - `skippedNoSnapshot` (with `--all`) means the plugin has no snapshot for that session's project at all — run `/tabs-recover` from inside that project instead.
 - Widening `--within` past a few hours starts pulling in sessions that were finished, not crashed — prefer the smallest window that covers the outage.

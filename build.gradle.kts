@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.claudetabs"
-version = "3.2.1"
+version = "3.0.0"
 
 repositories {
     mavenCentral()
@@ -89,6 +89,20 @@ val runIdeForE2e by intellijPlatformTesting.runIde.registering {
             // Registry override: keep the Windows Defender advisory toast out of the sandbox.
             "-Dignore.virus.scanning.warn.message=true",
         )
+        // Unbound-ledger tuning, for the phases that exercise it ONLY. The shipped defaults make a
+        // session wait 10s before it counts as open with no tab binding and pair a death with a tab
+        // close inside 30s; a phase that has to observe an admission, an eviction, an unobservable
+        // root and a benched root in sequence would spend minutes just waiting out the admit clock.
+        // Gated on a project property so phases 1/2 keep running against the shipped numbers: they
+        // assert timing-sensitive behaviour of their own, and silently re-tuning their sandbox
+        // would make them prove something the shipped plugin does not do.
+        //   e2e/run-e2e.ps1 passes -PclaudetabsE2eUnbound=true for phases 3/4 and nothing else.
+        if (providers.gradleProperty("claudetabsE2eUnbound").orNull == "true") {
+            jvmArgs(
+                "-Dclaudetabs.unboundAdmitMs=2000",
+                "-Dclaudetabs.unboundAttributionMs=30000",
+            )
+        }
         environment("CLAUDE_STUB_HOME", File(e2eDir, "claude-home/.claude").absolutePath)
         environment("CLAUDE_STUB_LOG", File(e2eDir, "stub-argv.log").absolutePath)
         // Any `claude` typed/spawned in a sandbox terminal resolves to the stub, never the real CLI.
@@ -197,6 +211,18 @@ tasks {
         // JDK 17+ that reflection is sealed and every such response throws JsonIOException in
         // the CLIENT (masking the real server-side error). Open java.lang for the test JVM.
         jvmArgs("--add-opens=java.base/java.lang=ALL-UNNAMED")
+        // Multi-generation cycle E2E wiring (E2eCycleTest). One IDE launch = one generation = one
+        // test JVM, so the generation index, the total and the run's RNG seed have to be handed
+        // DOWN from the driver: e2e/run-e2e.ps1 -Cycles N passes them as project properties, which
+        // become system properties for the test JVM here. Absent — i.e. every other uiTest
+        // invocation, including all four phases — nothing is set and the task is unchanged.
+        mapOf(
+            "claudetabsE2eCycle" to "claudetabs.e2e.cycle",
+            "claudetabsE2eCycles" to "claudetabs.e2e.cycles",
+            "claudetabsE2eSeed" to "claudetabs.e2e.seed",
+        ).forEach { (fromGradleProperty, toSystemProperty) ->
+            providers.gradleProperty(fromGradleProperty).orNull?.let { systemProperty(toSystemProperty, it) }
+        }
         include("**/ui/**")
         testClassesDirs = sourceSets["test"].output.classesDirs
         classpath = sourceSets["test"].runtimeClasspath

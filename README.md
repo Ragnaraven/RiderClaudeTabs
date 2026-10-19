@@ -22,7 +22,7 @@ Everything else (scripts, commands, CLAUDE.md section, permissions) is set up on
 | `/tabs-status` | Shows every active Claude session grouped by project, with session IDs. |
 | `/tabs-backup` | Writes currently-active sessions into history so you can resume them later, without waiting for the tab to close. |
 | `/tabs-history` | Numbered list of past closed/backed-up sessions (newest first). Pick one to resume. |
-| `/tabs-restore` | Shows what's in the auto-restore file (the set of tabs that will come back next Rider start). |
+| `/tabs-restore` | Lists recent sessions by name and reopens the ones you pick as tabs, within seconds — no commands to paste. |
 | `/tabs-recover` | Rebuilds the tab snapshot after a crash, so the plugin reopens the sessions that were really open. Dry-runs first; recovers the last 60 minutes by default (`/tabs-recover --within 180`). |
 | `/tabs-clear` | Clears the rename cache and per-project restore files. Doesn't touch history. |
 

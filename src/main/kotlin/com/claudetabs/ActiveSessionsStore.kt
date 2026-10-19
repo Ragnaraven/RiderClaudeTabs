@@ -45,6 +45,12 @@ internal class ActiveSessionsStore(val dir: File) {
          *  launcher are derived from it; identity never crosses roots. Files written by pre-3.1
          *  builds have no field → "windows". */
         val root: String = SessionRoot.Windows.ID,
+        /** When THIS session's CLI process started — the `startedAt` stamp the CLI writes into
+         *  its own `sessions/<pid>.json`, copied onto the record so it outlives the process.
+         *  Orders restore for entries that never had a tab position (see
+         *  [ClaudeTabsHelpers.restoreOrder]); without it those reopen in sid order, i.e. shuffled.
+         *  Null on files written by pre-3.3 builds and whenever the stamp was never observed. */
+        val startedAt: Long? = null,
     )
 
     /** Serialises read-modify-write cycles within this JVM: the poll loop and the title
@@ -56,19 +62,19 @@ internal class ActiveSessionsStore(val dir: File) {
     fun listAll(): List<Entry> {
         if (!dir.exists()) return emptyList()
         return dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }
-            ?.mapNotNull { f -> try { parse(f.readText()) } catch (_: Exception) { null } }
+            ?.mapNotNull { f -> try { parse(DurableIo.readText(f)) } catch (_: Exception) { null } }
             ?: emptyList()
     }
 
     fun read(sid: String): Entry? {
         val f = fileFor(sid)
-        if (!f.exists()) return null
-        return try { parse(f.readText()) } catch (_: Exception) { null }
+        // No exists() pre-check: it is a second racing syscall, and the read below answers it.
+        return try { parse(DurableIo.readText(f)) } catch (_: Exception) { null }
     }
 
-    /** Write or update the per-sid file. A non-null [name]/[userName] overwrites; null
-     *  preserves whatever was on disk (so callers without name knowledge can refresh
-     *  pid/lastSeen without clobbering cached names). */
+    /** Write or update the per-sid file. A non-null optional field ([name], [userName],
+     *  [ordinal], [root], [startedAt]) overwrites; null preserves whatever was on disk (so a
+     *  caller that only knows pid/lastSeen can refresh them without clobbering the rest). */
     fun writeOrUpdate(
         sid: String,
         cwd: String,
@@ -78,6 +84,7 @@ internal class ActiveSessionsStore(val dir: File) {
         userName: String? = null,
         ordinal: Int? = null,
         root: String? = null,
+        startedAt: Long? = null,
     ) = synchronized(rmwLock) {
         dir.mkdirs()
         val existing = read(sid)
@@ -89,7 +96,13 @@ internal class ActiveSessionsStore(val dir: File) {
         // Null preserves the recorded root (an update without root knowledge must never flip a
         // WSL session back to windows — that would resume it under the wrong account).
         val resolvedRoot = root ?: existing?.root ?: SessionRoot.Windows.ID
-        val entry = Entry(sid, cwd, pid, lastSeen, resolvedName, resolvedUserName, resolvedOrdinal, resolvedAttempts, resolvedRoot)
+        // A refresh that doesn't know the start stamp (most of them — only the scan reads it)
+        // must keep the recorded one, or restore order collapses back to sid order.
+        val resolvedStartedAt = startedAt ?: existing?.startedAt
+        val entry = Entry(
+            sid, cwd, pid, lastSeen, resolvedName, resolvedUserName, resolvedOrdinal,
+            resolvedAttempts, resolvedRoot, resolvedStartedAt,
+        )
         atomicWrite(fileFor(sid), serialise(entry))
     }
 
@@ -139,6 +152,7 @@ internal class ActiveSessionsStore(val dir: File) {
         append(",\"ordinal\":").append(e.ordinal?.toString() ?: "null")
         append(",\"restoreAttempts\":").append(e.restoreAttempts)
         append(",\"root\":\"").append(ClaudeTabsHelpers.esc(e.root)).append("\"")
+        append(",\"startedAt\":").append(e.startedAt?.toString() ?: "null")
         append("}")
     }
 
@@ -157,7 +171,10 @@ internal class ActiveSessionsStore(val dir: File) {
         val restoreAttempts = Regex(""""restoreAttempts"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         // Missing on pre-3.1 files → windows (the only root that existed).
         val root = ClaudeTabsHelpers.extractJsonString(text, "root") ?: SessionRoot.Windows.ID
-        return Entry(sid, cwd, pid, lastSeen, name, userName, ordinal, restoreAttempts, root)
+        // Missing on pre-3.3 files (and written as JSON null when never observed) → null, which
+        // restore ordering reads as "unknown start time", not as epoch 0.
+        val startedAt = ClaudeTabsHelpers.extractJsonLong(text, "startedAt")
+        return Entry(sid, cwd, pid, lastSeen, name, userName, ordinal, restoreAttempts, root, startedAt)
     }
 
     private fun atomicWrite(target: File, content: String) = DurableIo.writeAtomic(target, content)
