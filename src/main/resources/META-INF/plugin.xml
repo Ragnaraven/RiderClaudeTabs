@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>3.0.0</version>
+    <version>3.0.1</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -100,14 +100,15 @@
     <actions>
         <!-- The owned path: the plugin creates the terminal and launches Claude with an explicit,
              plugin-assigned session id, so tab-to-session identity is a stored fact from birth
-             (durable restore, no guessing). ToolsMenu is the entry point; the terminal's own
+             (durable restore, no guessing). The Tools menu and the terminal tab strip are the entry points; the terminal's own
              "Claude Code" agent button is captured via launch-time session-id injection. -->
         <action id="ClaudeTabs.NewSession"
                 class="com.claudetabs.NewClaudeSessionAction"
                 text="New Claude Session"
                 description="Open a new Claude Code session in a plugin-owned terminal tab (durable across restarts)."
-                icon="AllIcons.General.Add">
+                icon="/icons/claudeSession.svg">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <add-to-group group-id="TerminalToolwindowActionGroup" anchor="last"/>
         </action>
     </actions>
 </idea-plugin>
