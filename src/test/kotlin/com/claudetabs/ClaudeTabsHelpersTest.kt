@@ -477,6 +477,18 @@ class ClaudeTabsHelpersTest {
         assertTrue(!cmd.contains('$') && !cmd.contains('`'))
     }
 
+    @Test fun wslNewSessionCommand_mirrorsResume_withSessionIdInstead() {
+        val sid = "11111111-2222-4333-8444-555555555555"
+        val fresh = ClaudeTabsHelpers.buildWslNewSessionCommand("DistroA", sid, "UserA")
+        val resume = ClaudeTabsHelpers.buildWslResumeCommand("DistroA", sid, "UserA")
+        // Same distro, same user, same native-first executable chain — the only difference is
+        // the Claude verb: a new session under the minted id, never a resume.
+        assertEquals(resume.replace("--resume $sid", "--session-id $sid"), fresh)
+        assertTrue(fresh.contains("--session-id $sid"))
+        assertTrue(!fresh.contains("--resume"))
+        assertTrue(fresh.startsWith("wsl.exe -d \"DistroA\" -u \"UserA\" -- sh -lc \""))
+    }
+
     @Test fun safeWslToken_acceptsOrdinaryDistroAndUserNames() {
         assertTrue(ClaudeTabsHelpers.isSafeWslToken("DistroA"))
         assertTrue(ClaudeTabsHelpers.isSafeWslToken("Distro-1.2_x"))

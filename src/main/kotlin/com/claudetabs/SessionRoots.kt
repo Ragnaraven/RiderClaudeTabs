@@ -85,6 +85,10 @@ internal sealed class SessionRoot {
     /** The shell command typed into a spawned host terminal to resume [sid] in this root. */
     abstract fun resumeCommand(sid: String): String
 
+    /** The command that opens a NEW session with a plugin-minted id in this root — the
+     *  new-session twin of [resumeCommand], launched through the same installation. */
+    abstract fun newSessionCommand(sid: String): String
+
     /** Root-local cwd → Windows-comparable path ("d:/x/y" form for WSL /mnt paths; unchanged
      *  otherwise). Not normalised — feed through [ClaudeTabsHelpers.normalizeCwd] to compare. */
     open fun comparableCwd(cwd: String): String = cwd
@@ -113,6 +117,8 @@ internal sealed class SessionRoot {
 
         override fun resumeCommand(sid: String): String =
             OwnedTerminalSpawner.launchCommand(sid, OwnedTerminalSpawner.Mode.RESUME)
+        override fun newSessionCommand(sid: String): String =
+            OwnedTerminalSpawner.launchCommand(sid, OwnedTerminalSpawner.Mode.NEW)
     }
 
     /** One Linux [user]'s `~/.claude` inside [distro] — the read side ([claudeHome] over the UNC
@@ -152,6 +158,8 @@ internal sealed class SessionRoot {
 
         override fun resumeCommand(sid: String): String =
             ClaudeTabsHelpers.buildWslResumeCommand(distro, sid, user)
+        override fun newSessionCommand(sid: String): String =
+            ClaudeTabsHelpers.buildWslNewSessionCommand(distro, sid, user)
 
         override fun comparableCwd(cwd: String): String =
             ClaudeTabsHelpers.wslCwdToWindows(cwd) ?: cwd
@@ -197,6 +205,9 @@ internal sealed class SessionRoot {
         override fun resumeCommand(sid: String): String = try {
             File(claudeHome, "resume-command.txt").readText().trim().replace("{SID}", sid)
         } catch (_: Throwable) { "claude --resume $sid" }
+        override fun newSessionCommand(sid: String): String = try {
+            File(claudeHome, "new-session-command.txt").readText().trim().replace("{SID}", sid)
+        } catch (_: Throwable) { "claude --session-id $sid" }
     }
 
     companion object {
@@ -217,6 +228,12 @@ internal sealed class SessionRoot {
          *  user-less id takes the distro's first discovered root), or null while the distro is
          *  stopped (callers treat null as "quiet": no liveness, no title, but restore still
          *  proceeds through the id-derived launcher — `wsl.exe` boots the distro). */
+        /** Every root a new session can be opened into right now: Windows, each WSL root the
+         *  poll loop has discovered (no discovery is triggered here — see
+         *  [WslDiscovery.knownRoots]), and the E2E fakes. Cheap; safe from a toolbar update. */
+        fun launchable(): List<SessionRoot> =
+            listOf<SessionRoot>(Windows) + WslDiscovery.knownRoots() + FakeRoots.all
+
         fun byId(id: String?): SessionRoot? = when {
             id == null || id == Windows.ID -> Windows
             id.startsWith(WSL_PREFIX) -> splitWslId(id).let { (d, u) -> WslDiscovery.rootFor(d, u) }
@@ -305,6 +322,10 @@ internal object WslDiscovery {
         }
         return cached
     }
+
+    /** The roots as last discovered, WITHOUT refreshing — for callers on a UI-update path that
+     *  must never run `wsl.exe`. The poll loop refreshes through [runningRoots] every poll. */
+    fun knownRoots(): List<SessionRoot.Wsl> = if (disabled) emptyList() else cached
 
     /** The root for [distro] owned by [user]; a null [user] (legacy id) takes the distro's first
      *  discovered root — the pre-per-user behaviour, kept only for ids persisted back then. */

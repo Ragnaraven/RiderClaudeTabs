@@ -254,14 +254,22 @@ internal object ClaudeTabsHelpers {
      * `~` and `;`/`&&` left for the WSL-side `sh` to interpret. [distro]/[user] are expected to
      * have passed [isSafeWslToken] at discovery time.
      */
-    fun buildWslResumeCommand(distro: String, sid: String, user: String?): String {
+    fun buildWslResumeCommand(distro: String, sid: String, user: String?): String =
+        buildWslClaudeCommand(distro, user, "--resume $sid")
+
+    /** The new-session twin of [buildWslResumeCommand]: the same distro, user and native-first
+     *  executable chain, opening a fresh session under a plugin-minted id. */
+    fun buildWslNewSessionCommand(distro: String, sid: String, user: String?): String =
+        buildWslClaudeCommand(distro, user, "--session-id $sid")
+
+    private fun buildWslClaudeCommand(distro: String, user: String?, claudeArgs: String): String {
         val candidates = listOf(
             "~/.local/bin/claude", "~/.npm-global/bin/claude",
             "/usr/local/bin/claude", "/usr/bin/claude",
         )
-        val chain = candidates.joinToString("") { "test -x $it && exec $it --resume $sid; " }
+        val chain = candidates.joinToString("") { "test -x $it && exec $it $claudeArgs; " }
         val asUser = user?.let { " -u \"$it\"" } ?: ""
-        return "wsl.exe -d \"$distro\"$asUser -- sh -lc \"${chain}claude --resume $sid\""
+        return "wsl.exe -d \"$distro\"$asUser -- sh -lc \"${chain}claude $claudeArgs\""
     }
 
     /**

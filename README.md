@@ -1,12 +1,14 @@
 # Claude Terminal Tab Persistence
 
-A JetBrains Rider / IntelliJ plugin that persists [Claude Code](https://claude.com/claude-code) terminal sessions across IDE restarts — your tabs come back with their names and auto-resume their conversations.
+A JetBrains Rider / IntelliJ plugin that keeps your [Claude Code](https://claude.com/claude-code) terminal tabs across IDE restarts, crashes and reboots.
 
 ## What it does
 
-- Saves your tabs when Rider closes and restores them on reopen — each restored tab runs `claude --resume` for its session.
-- Names terminal tabs via a slash command or auto-naming so you can tell sessions apart.
-- Keeps a history of past sessions you can resume later.
+- **Your sessions restore automatically, right where you left off.** Every Claude tab that was open reopens in the same order, under the same name, and resumes its conversation. Close a tab with × and it stays closed.
+- **Works with more than one Claude subscription, with or without WSL.** On Windows, the Windows Claude and the Claude inside each WSL distro are each tracked and restored through their own installation and login, so each can be on a different account. With more than one, the terminal toolbar shows one Claude button per installation, marked with its platform. Without WSL, it simply uses your local Claude.
+
+![One New Claude Session button per installation](docs/images/new-session-buttons.png)
+![The WSL button names its distro](docs/images/new-session-wsl-tooltip.png)
 
 ## Install
 

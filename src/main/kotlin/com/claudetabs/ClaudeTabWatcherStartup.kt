@@ -315,7 +315,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         return@invokeLater
                     }
                     if (official is NewClaudeSessionAction) return@invokeLater
-                    val replacement = NewClaudeSessionAction()
+                    val replacement = NewClaudeSessionAction(styled = false)
                     replacement.templatePresentation.copyFrom(official.templatePresentation)
                     am.replaceAction(OFFICIAL_OPEN_CLAUDE_ACTION_ID, replacement)
                     LOG.info("[ClaudeTabs] Claude Code button taken over — it now opens an owned, durable session")
@@ -359,12 +359,15 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          * against every other spawn so the `~/.claude.json` startup write can't be raced.
          */
         @JvmStatic
-        fun requestNewSession(project: Project) {
+        /** Open a new owned session in [project] through the Claude installation [rootId] names
+         *  (null or unknown → the Windows one): a WSL button opens that distro's Claude. */
+        fun requestNewSession(project: Project, rootId: String? = null) {
+            val root = SessionRoot.byId(rootId) ?: SessionRoot.Windows
             appScope.launch {
                 try {
                     resumeSpawnMutex.withLock {
                         withContext(Dispatchers.Main) {
-                            if (!project.isDisposed) spawnNewSession(project)
+                            if (!project.isDisposed) spawnNewSession(project, root)
                         }
                         delay(RESTORE_STAGGER_MS)
                         awaitConfigSettled()
@@ -413,15 +416,19 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Mint a brand-new session in an owned tab. A provisional per-sid entry is written FIRST
          *  so the tab enters the open-tabs snapshot immediately (before Claude's own
          *  `sessions/<pid>.json` appears), protecting a quit within the first seconds. */
-        private fun spawnNewSession(project: Project) {
+        private fun spawnNewSession(project: Project, root: SessionRoot) {
             val cwd = project.basePath
             if (cwd.isNullOrBlank()) return
             val sid = java.util.UUID.randomUUID().toString()
-            storage.activeSessions.writeOrUpdate(sid, cwd, pid = null, lastSeen = System.currentTimeMillis())
-            val widget = spawnOwnedTab(project, sid, cwd, displayName = "Claude", mode = OwnedTerminalSpawner.Mode.NEW)
-                ?: return
-            ctxOf(project).pendingNew[sid] = ProjectCtx.PendingNew(widget, cwd, System.currentTimeMillis())
-            LOG.info("[ClaudeTabs] New Claude session sid=$sid cwd=$cwd (--session-id)")
+            storage.activeSessions.writeOrUpdate(sid, cwd, pid = null, lastSeen = System.currentTimeMillis(), root = root.id)
+            // The widget starts in the project's Windows directory for every root: `wsl.exe`
+            // enters the distro at that same directory's `/mnt` form on its own.
+            val widget = spawnOwnedTab(
+                project, sid, cwd, displayName = "Claude", mode = OwnedTerminalSpawner.Mode.NEW,
+                command = root.newSessionCommand(sid),
+            ) ?: return
+            ctxOf(project).pendingNew[sid] = ProjectCtx.PendingNew(widget, cwd, System.currentTimeMillis(), root.id)
+            LOG.info("[ClaudeTabs] New Claude session sid=$sid cwd=$cwd root=${root.id} (--session-id)")
         }
 
         /**
@@ -550,7 +557,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          *  appears the poll either confirms the minted id (--session-id honored) or, if Claude
          *  persisted a different id, [rebindOwnedTab] adopts the real one. Serialized spawns keep
          *  at most one pending per cwd, so the adoption is unambiguous. */
-        data class PendingNew(val widget: TerminalWidget, val cwd: String, val spawnedAt: Long)
+        data class PendingNew(val widget: TerminalWidget, val cwd: String, val spawnedAt: Long, val rootId: String)
 
         /** Terminal Content → sid, populated at spawn (birth-time fact) or by [bindSessions]'
          *  hand-open adoption. THE mapping the openness computation reads. */
@@ -1626,12 +1633,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 val pendCwd = ClaudeTabsHelpers.normalizeCwd(pending.cwd)
                 // freshSids gate: the readback target is a JUST-SPAWNED claude — a stale unowned
                 // session in the same cwd must neither be mistaken for it nor block the count.
-                // Root gate: the plugin's own spawner launches the WINDOWS claude, so the real
-                // sid can only ever appear in the windows root — a foreign-root session must
-                // never masquerade as a mint's readback.
+                // Root gate: the spawner launched ONE installation's claude, so the real sid can
+                // only ever appear in that root — a session in another root must never
+                // masquerade as this mint's readback.
                 val candidates = aliveByCwd.filter { (sid, cwd) ->
                     sid !in boundSids && sid !in c.pendingNew.keys && sid in freshSids &&
-                        (sidRoots[sid] ?: SessionRoot.Windows.ID) == SessionRoot.Windows.ID &&
+                        (sidRoots[sid] ?: SessionRoot.Windows.ID) == pending.rootId &&
                         ClaudeTabsHelpers.normalizeCwd(cwd) == pendCwd
                 }.keys
                 val pendingForCwd = c.pendingNew.values.count { ClaudeTabsHelpers.normalizeCwd(it.cwd) == pendCwd }

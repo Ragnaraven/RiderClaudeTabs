@@ -1,35 +1,31 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>3.0.1</version>
+    <version>3.0.2</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
-    <h2>Claude Terminal Tab Persistence for Rider / IntelliJ</h2>
+    <h2>Claude Terminal Tab Persistence</h2>
 
-    <p>Auto-restores your <a href="https://claude.com/claude-code">Claude Code</a> terminal sessions
-    across IDE restarts. The plugin tracks alive Claude sessions in <code>~/.claude/rider-plugin/active-sessions/</code>
-    and, on next project open, spawns one fresh terminal tab per saved session running
-    <code>claude --resume &lt;sid&gt;</code>.</p>
+    <p>Your <a href="https://claude.com/claude-code">Claude Code</a> terminal tabs survive IDE
+    restarts, crashes and reboots.</p>
 
-    <h3>3.0 redesign — own the terminal</h3>
-    <p>The plugin now creates every Claude tab itself and assigns its session id at launch, so
-    <code>tab ↔ session</code> identity is a stored fact from birth — no reflection, ancestry
-    walks, or title guessing. Openness is simply "the tab is present in the tool window"; only an
-    <b>×</b> closes a tab, while window-close, quit, crash, and reboot all reopen every open tab.</p>
     <ul>
-      <li><b>The plugin owns Claude tab titles.</b> Every tab hosting a Claude session shows
-        <code>✳ &lt;name&gt;</code>, and the glyph animates while the session is thinking
-        (mirroring Claude's own busy/idle status). Titles are continuously enforced — a tab
-        clobbered to "Local" self-heals within half a second.</li>
-      <li><b>Names that stick.</b> Display name priority: your explicit name (Rider's
-        "Rename Tab" or <code>/tab</code>) &gt; Claude's auto-generated topic name &gt; the
-        cached topic. Renames are adopted and persisted across restarts, never fought.</li>
-      <li><b>One file per alive session.</b> <code>active-sessions/&lt;sid&gt;.json</code> —
-        race-safe, no per-project file conflicts.</li>
-      <li><b>Bounded eviction backlog.</b> <code>session-backlog.json</code> keeps the last 50
-        evicted sessions so you can recover them with <code>/tabs-history</code>.</li>
+      <li><b>Your sessions restore automatically, right where you left off.</b> Every Claude tab
+        that was open reopens in the same order, under the same name, and resumes its
+        conversation. Close a tab with <b>×</b> and it stays closed.</li>
+      <li><b>Works with more than one Claude subscription, with or without WSL.</b> On Windows,
+        the Windows Claude and the Claude inside each WSL distro are each tracked and restored
+        through their own installation and login, so each can be on a different account. With
+        more than one, the terminal toolbar shows one Claude button per installation, marked with
+        its platform. Without WSL, it simply uses your local Claude.</li>
     </ul>
+
+    <p><img src="https://raw.githubusercontent.com/Ragnaraven/RiderClaudeTabs/main/docs/images/new-session-buttons.png" alt="One New Claude Session button per installation on the terminal toolbar"/>
+    <img src="https://raw.githubusercontent.com/Ragnaraven/RiderClaudeTabs/main/docs/images/new-session-wsl-tooltip.png" alt="The WSL button names its distro"/></p>
+
+    <p>Tabs show <code>✳ &lt;topic&gt;</code> and animate while Claude is thinking.
+    <code>/tab &lt;name&gt;</code> renames one for good.</p>
 
     <h3>Slash Commands</h3>
     <ul>
@@ -100,15 +96,20 @@
     <actions>
         <!-- The owned path: the plugin creates the terminal and launches Claude with an explicit,
              plugin-assigned session id, so tab-to-session identity is a stored fact from birth
-             (durable restore, no guessing). The Tools menu and the terminal tab strip are the entry points; the terminal's own
-             "Claude Code" agent button is captured via launch-time session-id injection. -->
+             (durable restore, no guessing). The Tools menu and the terminal tab strip show one
+             button per Claude installation (Windows, each running WSL distro) through the inline
+             group; the terminal's own "Claude Code" agent button is captured via launch-time
+             session-id injection. The action keeps its own id for the keymap and the takeover. -->
         <action id="ClaudeTabs.NewSession"
                 class="com.claudetabs.NewClaudeSessionAction"
                 text="New Claude Session"
                 description="Open a new Claude Code session in a plugin-owned terminal tab (durable across restarts)."
-                icon="/icons/claudeSession.svg">
+                icon="/icons/claudeSession.svg"/>
+        <group id="ClaudeTabs.NewSessionGroup"
+               class="com.claudetabs.NewClaudeSessionGroup"
+               popup="false">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
             <add-to-group group-id="TerminalToolwindowActionGroup" anchor="last"/>
-        </action>
+        </group>
     </actions>
 </idea-plugin>
