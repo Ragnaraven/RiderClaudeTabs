@@ -50,4 +50,4 @@ Parse `$ARGUMENTS`:
 
 - Never print `claude --resume` commands for the user to paste: the plugin owns reopening, and a pasted resume inside an existing Claude tab fails anyway.
 - This never launches Claude itself and never closes anything. Reopening a session that is already open is a no-op.
-- `/tabs-history` shows sessions the plugin evicted (a crash evicts everything at once) with their names; `/tabs-recover` rebuilds the whole pre-crash set in one go.
+- `/tabs-recover` rebuilds the whole pre-crash set in one go.

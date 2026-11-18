@@ -46,7 +46,7 @@ Parse `$ARGUMENTS`:
 3. **If the first pass finds nothing, widen before giving up.** The default hour is a guess about when the outage was, not a fact:
    - If the user said when things died ("an hour ago", "after lunch", "last night"), set `--within` from that directly, generously.
    - Otherwise re-run at `--within 240`, then `--within 1440`, and stop at the first window that returns sessions. Say which window you ended up using and why — a session found only at 24h probably ended on purpose, so let the user judge it rather than writing it silently.
-   - Still nothing at 24h with tabs genuinely missing means the transcripts are gone or the sessions belong to another project — check `/tabs-status` and `/tabs-history`, and say which one you checked.
+   - Still nothing at 24h with tabs genuinely missing means the transcripts are gone or the sessions belong to another project — check `/tabs-status` and `/tabs-restore` (which looks back two weeks), and say which one you checked.
 
 4. **Ask before writing**, unless the user's message already said to go ahead (e.g. "recover my tabs", "reopen them"). A dry run that found nothing needs no confirmation — there is nothing to ask about.
 

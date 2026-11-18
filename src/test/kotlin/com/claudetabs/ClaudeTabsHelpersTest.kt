@@ -417,21 +417,27 @@ class ClaudeTabsHelpersTest {
     // ── Bridge cwd normalisation: a tab cwd must live in the same space as session cwds ──
 
     @Test fun bridgeCwd_windowsShapedPathsPassThroughUnchanged() {
-        assertEquals("""D:\Dev\ProjectA""", ClaudeTabsHelpers.normalizeBridgeCwd("""D:\Dev\ProjectA"""))
-        assertEquals("D:/Dev/ProjectA", ClaudeTabsHelpers.normalizeBridgeCwd("D:/Dev/ProjectA"))
+        assertEquals("""D:\Dev\ProjectA""", ClaudeTabsHelpers.normalizeBridgeCwd("""D:\Dev\ProjectA""", hostIsWindows = true))
+        assertEquals("D:/Dev/ProjectA", ClaudeTabsHelpers.normalizeBridgeCwd("D:/Dev/ProjectA", hostIsWindows = true))
     }
 
     @Test fun bridgeCwd_wslMountPathsTranslateToTheirWindowsForm() {
         // Session cwds are stored Windows-translated at scan time, so tab cwds must match.
-        assertEquals("d:/Dev/ProjectA", ClaudeTabsHelpers.normalizeBridgeCwd("/mnt/d/Dev/ProjectA"))
+        assertEquals("d:/Dev/ProjectA", ClaudeTabsHelpers.normalizeBridgeCwd("/mnt/d/Dev/ProjectA", hostIsWindows = true))
     }
 
     @Test fun bridgeCwd_linuxNativePathsAreUnusable() {
         // No Windows equivalent → NULL, so the tab stays "undetermined" (and keeps its last-resort
         // eligibility) instead of forming a bucket no session can ever match.
-        assertNull(ClaudeTabsHelpers.normalizeBridgeCwd("/home/dev/project"))
-        assertNull(ClaudeTabsHelpers.normalizeBridgeCwd("/opt/work"))
-        assertNull(ClaudeTabsHelpers.normalizeBridgeCwd("   "))
+        assertNull(ClaudeTabsHelpers.normalizeBridgeCwd("/home/dev/project", hostIsWindows = true))
+        assertNull(ClaudeTabsHelpers.normalizeBridgeCwd("/opt/work", hostIsWindows = true))
+        assertNull(ClaudeTabsHelpers.normalizeBridgeCwd("   ", hostIsWindows = true))
+    }
+
+    @Test fun bridgeCwd_unixPathsPassThroughOnAMacOrLinuxHost() {
+        // Off Windows a `/`-rooted path IS the native form, and session cwds are stored as-is.
+        assertEquals("/home/dev/project", ClaudeTabsHelpers.normalizeBridgeCwd("/home/dev/project", hostIsWindows = false))
+        assertNull(ClaudeTabsHelpers.normalizeBridgeCwd("   ", hostIsWindows = false))
     }
 
     @Test fun wslDistroList_decodesUtf16leOutput() {

@@ -192,18 +192,20 @@ internal object ClaudeTabsHelpers {
      * cwds live in. Session cwds are stored Windows-TRANSLATED at scan time (see
      * [SessionRoot.comparableCwd]), so a tab cwd must be comparably translated or not used at all:
      *  - Windows-shaped (drive letter or a backslash present) → passed through unchanged;
-     *  - `/`-rooted → through [wslCwdToWindows], which yields NULL for a Linux-native path
-     *    (`/home/dev/project`) that simply has no Windows equivalent.
+     *  - `/`-rooted on a Windows host → through [wslCwdToWindows], which yields NULL for a
+     *    Linux-native path (`/home/dev/project`) that simply has no Windows equivalent;
+     *  - `/`-rooted on a macOS / Linux host → passed through: that is the native form, and
+     *    session cwds there are stored untranslated.
      *
      * Null means "cwd unreadable", NOT "some other cwd": an untranslatable path would otherwise
      * form a bucket no session can ever match, and the tab would silently lose the last-resort
      * eligibility it keeps while its cwd is merely unknown.
      */
-    fun normalizeBridgeCwd(raw: String): String? {
+    fun normalizeBridgeCwd(raw: String, hostIsWindows: Boolean): String? {
         val s = raw.trim()
         if (s.isEmpty()) return null
         if (s.contains('\\') || Regex("^[a-zA-Z]:").containsMatchIn(s)) return raw
-        if (s.startsWith("/")) return wslCwdToWindows(s)
+        if (s.startsWith("/")) return if (hostIsWindows) wslCwdToWindows(s) else raw
         return raw
     }
 

@@ -23,13 +23,11 @@ internal object SettingsPermissions {
      *  the other. */
     val CURRENT_ENTRIES: List<String> = listOf(
         "Bash(node ~/.claude/rider-plugin/current-project.js)",
-        "Bash(node ~/.claude/rider-plugin/backup-active.js)",
-        "Bash(node ~/.claude/rider-plugin/backup-active.js *)",
         "Bash(node ~/.claude/rider-plugin/tab-name.js *)",
         "Bash(node ~/.claude/rider-plugin/recover-tabs.js *)",
     )
 
-    /** Permission lines written by 1.x builds — removed on update AND on uninstall, never
+    /** Permission lines written by earlier builds — removed on update AND on uninstall, never
      *  re-added. Same single-source rationale as [CURRENT_ENTRIES]. */
     val LEGACY_ENTRIES: List<String> = listOf(
         "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)",
@@ -37,6 +35,8 @@ internal object SettingsPermissions {
         "Bash(node ~/.claude/rider-plugin/tab-backup.js *)",
         "Bash(node ~/.claude/rider-plugin/tab-now.js)",
         "Bash(node ~/.claude/rider-plugin/tab-now.js *)",
+        "Bash(node ~/.claude/rider-plugin/backup-active.js)",
+        "Bash(node ~/.claude/rider-plugin/backup-active.js *)",
     )
 
     /** Matches the `"allow": [ … ]` array and captures its body. The body is consumed as a

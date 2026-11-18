@@ -22,7 +22,7 @@ class SettingsPermissionsTest {
         "Bash(node ~/.claude/rider-plugin/tab-now.js)",
     )
     private val CURRENT = listOf(
-        "Bash(node ~/.claude/rider-plugin/backup-active.js)",
+        "Bash(node ~/.claude/rider-plugin/current-project.js)",
         "Bash(node ~/.claude/rider-plugin/tab-name.js *)",
     )
 
@@ -45,7 +45,7 @@ class SettingsPermissionsTest {
               "permissions": {
                 "allow": [
                   "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)",
-                  "Bash(node ~/.claude/rider-plugin/backup-active.js)"
+                  "Bash(node ~/.claude/rider-plugin/current-project.js)"
                 ]
               }
             }
@@ -61,7 +61,7 @@ class SettingsPermissionsTest {
         // Legacy entry is LAST — the case that strands a `,` before `]` under naive replacement.
         val input = """
             { "permissions": { "allow": [
-                "Bash(node ~/.claude/rider-plugin/backup-active.js)",
+                "Bash(node ~/.claude/rider-plugin/current-project.js)",
                 "Bash(node ~/.claude/rider-plugin/tab-name.js *)",
                 "Bash(node ~/.claude/rider-plugin/tab-now.js)"
             ] } }
@@ -79,7 +79,7 @@ class SettingsPermissionsTest {
             {
               "permissions": {
                 "allow": [
-                  "Bash(node ~/.claude/rider-plugin/backup-active.js)",
+                  "Bash(node ~/.claude/rider-plugin/current-project.js)",
                   "Bash(node ~/.claude/rider-plugin/tab-name.js *)",
                 ]
               }
@@ -110,7 +110,7 @@ class SettingsPermissionsTest {
     }
 
     @Test fun repairsDoubleComma() {
-        val input = """{ "permissions": { "allow": [ "Bash(node ~/.claude/rider-plugin/backup-active.js)", , "Bash(node ~/.claude/rider-plugin/tab-name.js *)" ] } }"""
+        val input = """{ "permissions": { "allow": [ "Bash(node ~/.claude/rider-plugin/current-project.js)", , "Bash(node ~/.claude/rider-plugin/tab-name.js *)" ] } }"""
         val out = SettingsPermissions.rewriteAllowArray(input, LEGACY, CURRENT)
         assertTrue(out != null)
         assertValidArray(out!!)
@@ -130,7 +130,7 @@ class SettingsPermissionsTest {
             {
               "permissions": {
                 "allow": [
-                  "Bash(node ~/.claude/rider-plugin/backup-active.js)",
+                  "Bash(node ~/.claude/rider-plugin/current-project.js)",
                   "Bash(node ~/.claude/rider-plugin/tab-name.js *)"
                 ]
               }
@@ -149,7 +149,7 @@ class SettingsPermissionsTest {
             { "permissions": { "allow": [
                 "$keep",
                 "Bash(node ~/.claude/rider-plugin/tab-now.js)",
-                "Bash(node ~/.claude/rider-plugin/backup-active.js)"
+                "Bash(node ~/.claude/rider-plugin/current-project.js)"
             ] } }
         """.trimIndent()
         val out = SettingsPermissions.rewriteAllowArray(input, LEGACY, CURRENT)!!
@@ -163,7 +163,7 @@ class SettingsPermissionsTest {
         val input = """
             { "permissions": { "allow": [
                 "$keep",
-                "Bash(node ~/.claude/rider-plugin/backup-active.js)",
+                "Bash(node ~/.claude/rider-plugin/current-project.js)",
                 "Bash(node ~/.claude/rider-plugin/tab-name.js *)"
             ] } }
         """.trimIndent()

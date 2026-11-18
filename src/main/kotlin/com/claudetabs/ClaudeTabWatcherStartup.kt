@@ -254,19 +254,24 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Node helpers copied into every `~/.claude/rider-plugin`. SINGLE SOURCE OF TRUTH —
          *  the deploy path writes these and uninstall removes the directory holding them. */
         internal val INTEGRATION_HELPERS = listOf(
-            "current-project.js", "backup-active.js", "tab-name.js", "recover-tabs.js",
+            "current-project.js", "tab-name.js", "recover-tabs.js",
         )
+
+        /** Helpers earlier builds deployed and this one no longer ships — deleted on deploy. */
+        private val RETIRED_HELPERS = listOf("backup-active.js")
 
         /** Slash commands copied into every `~/.claude/commands`. Same single-source rationale:
          *  a command added here is deployed AND uninstalled, never one without the other. */
         internal val INTEGRATION_COMMANDS = listOf(
-            "tab.md", "tabs-backup.md", "tabs-restore.md", "tabs-history.md",
-            "tabs-status.md", "tabs-clear.md", "tabs-recover.md",
+            "tab.md", "tabs-restore.md", "tabs-status.md", "tabs-recover.md",
         )
 
-        /** Command names written by 1.x builds — deleted on uninstall, never re-deployed. */
+        /** Command names earlier builds wrote — deleted on deploy and on uninstall, never
+         *  re-deployed. `/tabs-backup` duplicated the poll, `/tabs-clear` was undone by the next
+         *  poll, and `/tabs-history` is covered by `/tabs-restore`. */
         private val LEGACY_COMMANDS = listOf(
             "clear-tabs.md", "restore-tabs.md", "tab-history.md", "backup-tabs.md",
+            "tabs-backup.md", "tabs-clear.md", "tabs-history.md",
         )
 
         /** Singleton storage helper. */
@@ -1737,7 +1742,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 // treat an untranslatable path as unreadable rather than as a bucket of its own.
                 val cwd = currentDirectoryOf(w)
                     ?: bridgeInfo[content]?.cwd
-                        ?.let { ClaudeTabsHelpers.normalizeBridgeCwd(it) }
+                        ?.let { ClaudeTabsHelpers.normalizeBridgeCwd(it, com.intellij.openapi.util.SystemInfo.isWindows) }
                         ?.also { bridgeCwdTabs++ }
                 if (cwd == null) { undetermined.add(content to w); continue }
                 tabsByCwd.getOrPut(ClaudeTabsHelpers.normalizeCwd(cwd)) { mutableListOf() }.add(content to w)
@@ -2735,11 +2740,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val inStream = cl.getResourceAsStream("claude-integration/$name") ?: continue
             inStream.use { input -> File(target.stateDir, name).outputStream().use { input.copyTo(it) } }
         }
+        RETIRED_HELPERS.forEach { File(target.stateDir, it).delete() }
         target.commandsDir.mkdirs()
         for (name in INTEGRATION_COMMANDS) {
             val inStream = cl.getResourceAsStream("claude-integration/$name") ?: continue
             inStream.use { input -> File(target.commandsDir, name).outputStream().use { input.copyTo(it) } }
         }
+        LEGACY_COMMANDS.forEach { File(target.commandsDir, it).delete() }
         ensureSettingsPermissions(target)
         if (rootId != null) writeStateRootPointer(target, rootId)
     }

@@ -11,7 +11,7 @@ import org.junit.rules.TemporaryFolder
  * Regression coverage for the 2.0.1 fix: an [ActiveSessionsStore.Entry] with `pid=null`
  * (the migration seed shape) must NEVER be evicted by the dead-strike logic. It sits
  * indefinitely until either a real alive Claude lands with that sid OR the user clears
- * it via /tabs-clear.
+ * it by deleting its record.
  *
  * The actual eviction-loop logic lives in [ClaudeTabWatcherStartup.pollOnce] and depends
  * on a Project. This test exercises the policy at the [EvictionTracker] level — proving

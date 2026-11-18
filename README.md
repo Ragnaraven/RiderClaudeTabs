@@ -22,11 +22,8 @@ Everything else (scripts, commands, CLAUDE.md section, permissions) is set up on
 |---|---|
 | `/tab [name]` | Renames this tab and snapshots it to history. If no name is given, Claude picks one (3–5 words) based on the current conversation. |
 | `/tabs-status` | Shows every active Claude session grouped by project, with session IDs. |
-| `/tabs-backup` | Writes currently-active sessions into history so you can resume them later, without waiting for the tab to close. |
-| `/tabs-history` | Numbered list of past closed/backed-up sessions (newest first). Pick one to resume. |
 | `/tabs-restore` | Lists recent sessions by name and reopens the ones you pick as tabs, within seconds — no commands to paste. |
 | `/tabs-recover` | Rebuilds the tab snapshot after a crash, so the plugin reopens the sessions that were really open. Dry-runs first; recovers the last 60 minutes by default (`/tabs-recover --within 180`). |
-| `/tabs-clear` | Clears the rename cache and per-project restore files. Doesn't touch history. |
 
 ## Config
 
@@ -55,12 +52,14 @@ All under `~/.claude/rider-plugin/`:
 ```
 active-sessions/<sid>.json      # one file per alive session (name, order, cwd)
 open-tabs-<project>.json        # the open-tab snapshot restored on next launch
-session-backlog.json            # last 50 evicted sessions (for /tabs-history)
+session-backlog.json            # last 50 evicted sessions (for /tabs-restore)
 config.json                     # user overrides
 state-root.json                 # WSL homes only: where the Windows-side state dir lives
 ```
 
 ## Running the tests
+
+Run Gradle on JDK 17 or 21 (the Gradle 8.13 wrapper does not start on JDK 25 or later).
 
 ```bash
 ./gradlew test        # Unit + storage + slash-command scripts (fast, no IDE needed)

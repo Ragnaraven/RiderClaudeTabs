@@ -295,10 +295,11 @@ internal object WslDiscovery {
     @Volatile private var unsafeLogged = false
     @Volatile private var lastLoggedRoots: List<String>? = null
 
-    /** E2E-only kill-switch: the sandbox harness isolates the Windows home via
+    /** Off on macOS / Linux (WSL is Windows-only), and an E2E-only kill-switch: the sandbox harness isolates the Windows home via
      *  `claudetabs.home` but real WSL distros would still be discovered and scanned —
      *  a real WSL claude in a matching cwd could contaminate a hermetic test run. */
-    private val disabled = System.getProperty("claudetabs.disableWslDiscovery") == "true"
+    private val disabled = System.getProperty("claudetabs.disableWslDiscovery") == "true" ||
+        !com.intellij.openapi.util.SystemInfo.isWindows
 
     fun runningRoots(): List<SessionRoot.Wsl> {
         if (disabled) return emptyList()
@@ -333,7 +334,8 @@ internal object WslDiscovery {
         runningRoots().firstOrNull { it.distro == distro && (user == null || it.user == user) }
 
     private fun discover(): List<SessionRoot.Wsl> {
-        val exe = File(System.getenv("SystemRoot") ?: "C:\\Windows", "System32\\wsl.exe")
+        val systemRoot = System.getenv("SystemRoot") ?: return emptyList()
+        val exe = File(systemRoot, "System32\\wsl.exe")
         if (!exe.exists()) return emptyList()
         val proc = ProcessBuilder(exe.absolutePath, "-l", "-q", "--running")
             .redirectErrorStream(true)

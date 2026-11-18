@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>3.0.2</version>
+    <version>3.0.3</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -31,10 +31,7 @@
     <ul>
       <li><code>/tab</code> — set this session's tab name explicitly (persists across restarts)</li>
       <li><code>/tabs-status</code> — live sessions + recent eviction backlog for the current project</li>
-      <li><code>/tabs-backup</code> — explicit sync: write per-sid files for every alive Claude process</li>
-      <li><code>/tabs-history</code> — browse the eviction backlog and print a resume command</li>
       <li><code>/tabs-restore</code> — pick recent sessions by name and reopen them as tabs</li>
-      <li><code>/tabs-clear</code> — clear <code>active-sessions/</code> for the current project</li>
       <li><code>/tabs-recover</code> — after a crash, rebuild the restore list from what survived and let the plugin reopen the tabs</li>
     </ul>
 
@@ -57,8 +54,8 @@
         thinking. <code>/tab &lt;name&gt;</code> renames one for good.</li>
       <li><b>WSL included.</b> Sessions running inside a distro are tracked and restored like
         local ones.</li>
-      <li><b>Slash commands</b> — <code>/tabs-status</code>, <code>/tabs-history</code>,
-        <code>/tabs-recover</code> and friends, installed automatically.</li>
+      <li><b>Slash commands</b> — <code>/tabs-restore</code>, <code>/tabs-recover</code>
+        and <code>/tabs-status</code>, installed automatically.</li>
     </ul>
     ]]></change-notes>
 
